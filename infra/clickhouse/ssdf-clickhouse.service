@@ -8,8 +8,8 @@ Documentation=https://clickhouse.com/docs
 Type=simple
 User=clickhouse
 Group=clickhouse
-CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_NICE CAP_IPC_LOCK CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_DAC_OVERRIDE CAP_SYS_NICE CAP_IPC_LOCK CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -21,8 +21,12 @@ RuntimeDirectory=clickhouse
 RuntimeDirectoryMode=0750
 Environment=CLICKHOUSE_CONFIG=/etc/clickhouse-server/config.xml
 
-# Listen address (0.0.0.0 for all interfaces)
-Environment=CLICKHOUSE_HOST=0.0.0.0
+# Listen address is config.xml-controlled, not an env var clickhouse-server
+# reads (CLICKHOUSE_HOST has no effect here). Default posture is
+# localhost-only for plain HTTP/native, matching ct104's hardening
+# (infra/clickhouse/config.d/ssdf-tls.xml): wide binds are closed off by the
+# host firewall, not opened by this unit. Edit config.xml's <listen_host> if
+# a deployment genuinely needs a non-default bind.
 
 # HTTP port (default: 8123)
 Environment=CLICKHOUSE_HTTP_PORT=8123
@@ -37,8 +41,9 @@ ExecStart=/usr/bin/clickhouse-server --config-file=/etc/clickhouse-server/config
 Restart=on-failure
 RestartSec=3
 
-# Resource limits
-LimitCORE=infinity
+# Resource limits. Core dumps are disabled: a crash dump of a process
+# holding security logs and plaintext credentials is its own leak path.
+LimitCORE=0
 LimitNOFILE=262144
 
 # Directory permissions

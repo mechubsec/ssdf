@@ -1,0 +1,38 @@
+[Unit]
+Description=SSDF ClickHouse migration runner (idempotent, one-shot)
+Documentation=file:/opt/ssdf/infra/clickhouse/README.md
+After=ssdf-clickhouse.service
+Requires=ssdf-clickhouse.service
+Before=ssdf-mcp-query.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+DynamicUser=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+Environment=CH_HOST=127.0.0.1
+Environment=CH_NATIVE_PORT=9000
+Environment=CH_USER=default
+# Password file is root-owned 0600; LoadCredential exposes it read-only to
+# the dynamic service user under $CREDENTIALS_DIRECTORY instead of requiring
+# a group-readable secret on disk.
+LoadCredential=ch-password:/etc/ssdf/ch-migrate-password
+# Bounded readiness wait (~60s). The old single-host unit's wait loop had no
+# bound and hung until TimeoutStartSec with no diagnostic.
+ExecStartPre=/bin/sh -c "\
+  tries=0; \
+  until clickhouse-client --host \"$CH_HOST\" --port \"$CH_NATIVE_PORT\" --query 'SELECT 1' >/dev/null 2>&1; do \
+    tries=$((tries + 1)); \
+    if [ \"$tries\" -ge 60 ]; then echo 'clickhouse-client not reachable after 60s' >&2; exit 1; fi; \
+    sleep 1; \
+  done"
+ExecStart=/bin/sh -c 'CH_PASSWORD="$(cat "${CREDENTIALS_DIRECTORY}/ch-password" 2>/dev/null || true)" exec /opt/ssdf/bin/python3 /opt/ssdf/scripts/run_migrations.py'
+TimeoutStartSec=120
+
+[Install]
+WantedBy=ssdf-single-host.target
