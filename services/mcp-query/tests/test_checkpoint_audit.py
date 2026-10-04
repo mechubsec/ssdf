@@ -427,8 +427,11 @@ def test_run_self_verifies_past_an_expired_genesis_via_the_evidence_bridge(monke
     # Anchors the now-expired genesis; old enough to stand in for it.
     anchor_checkpoint = _sign(genesis_hash, 1, "2026-01-01T00:00:00.000Z", "k1")
     # The most recent checkpoint, used by compute_next_checkpoint's forward
-    # walk -- unrelated to the self-verification bridge above.
-    recent_checkpoint = _sign(s1_hash, 3, "2026-05-28T00:00:00.000Z", "k2")
+    # walk -- unrelated to the self-verification bridge above. Dated within
+    # a day of `now` (rather than further back) so MEC-1634's
+    # stale_checkpoint check does not fire on this fixture's rows, which are
+    # all hardcoded to ts=2026-06-10 regardless of `now` (see _audit_row).
+    recent_checkpoint = _sign(s1_hash, 3, "2026-05-31T00:00:00.000Z", "k2")
 
     client = _FakeClient(
         audit_rows=[s1_tuple, s2_tuple],
