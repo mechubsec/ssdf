@@ -157,10 +157,7 @@ class AlertTools:
             if norm is None or norm[1] < floor:
                 continue
 
-            # Signature: UniFi has ext.unifi.ips.signature, else rule_name, else event_kind.
-            # All three are log-derived (attacker-influenceable via the traffic a sensor
-            # observed), so this is the boundary where that text becomes UntrustedText --
-            # downstream code works with .value/.truncated, never a bare trusted str.
+            # log-derived; wrapped as UntrustedText
             sig = ext.get("unifi.ips.signature") or r.get("rule_name") or r.get("event_kind")
 
             rows.append(

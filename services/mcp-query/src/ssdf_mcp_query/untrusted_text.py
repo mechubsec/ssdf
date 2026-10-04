@@ -1,31 +1,24 @@
-"""Typed wrapper for untrusted, log-derived free text (MEC-568).
+"""Typed wrapper for untrusted, log-derived free text.
 
-Fields like an IPS/IDS signature name or a raw `ext` value come from traffic
-a sensor observed, not from the operator's own configuration -- an attacker
-who controls the traffic a device logs also controls substrings of what gets
-written there (a crafted DNS query name, a crafted HTTP Host header, a
-crafted alert signature). Carrying that text as plain `str` makes it
-indistinguishable, at the type level, from operator/system text such as a
-configured rule name or a zone name.
+Text sourced from observed traffic is distinct, at the type level, from
+operator/system-configured text: carrying both as plain `str` makes that
+distinction invisible to callers. `UntrustedText` is the boundary type: raw
+values are converted here, once, where they are read off the data store, and
+nothing downstream reaches for a bare `str` at that call site without going
+through `from_raw()`.
 
-`UntrustedText` is the boundary type: raw log/alert text is converted here,
-once, where it is read off the ClickHouse row, and nothing downstream may
-reach for a bare `str` at that call site without going through
-`from_raw()`. It is a data container only -- it caps length deterministically
-and never executes, interprets, or templates its contents. The capped value
-still goes into the tool's JSON response (an LLM-backed tool like
-`explain_rule` or `explain_access` summarizes it), but every untrusted field
-in that response carries its `truncated` flag alongside it, so truncation is
-visible to the caller rather than a silent cut.
+It is a data container only -- it caps length deterministically and never
+executes, interprets, or templates its contents. The response shape carries
+an explicit `untrusted` marker alongside the value and its `truncated` flag,
+so a consumer of the tool output can tell this field apart from a trusted
+one without re-deriving that from context.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Generous enough for a real signature/ext value, small enough that a
-# multi-kilobyte crafted payload (e.g. a stuffed DNS TXT record relayed into
-# a log field) can't balloon a tool response or a downstream prompt.
+# Bounds response size for oversized values.
 DEFAULT_MAX_LEN = 512
 
 
@@ -47,5 +40,7 @@ class UntrustedText:
         return cls(value=text, truncated=False)
 
     def to_response(self) -> dict:
-        """JSON-safe shape for a tool response: value + explicit truncation flag."""
-        return {"value": self.value, "truncated": self.truncated}
+        """JSON-safe shape for a tool response: value, truncation flag, and an
+        explicit `untrusted` marker so the label survives JSON serialization
+        instead of ending at the type boundary."""
+        return {"value": self.value, "truncated": self.truncated, "untrusted": True}

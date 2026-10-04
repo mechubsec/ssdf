@@ -13,7 +13,11 @@ def test_short_value_is_not_truncated():
     wrapped = UntrustedText.from_raw("ET POLICY Suspicious TLS")
     assert wrapped.value == "ET POLICY Suspicious TLS"
     assert wrapped.truncated is False
-    assert wrapped.to_response() == {"value": "ET POLICY Suspicious TLS", "truncated": False}
+    assert wrapped.to_response() == {
+        "value": "ET POLICY Suspicious TLS",
+        "truncated": False,
+        "untrusted": True,
+    }
 
 
 def test_none_becomes_empty_untruncated_string():

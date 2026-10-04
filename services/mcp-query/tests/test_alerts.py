@@ -100,8 +100,12 @@ def test_recent_alerts_includes_pan_threat_row():
     assert row["severity_num"] == 4
     assert row["provider"] == "paloalto"
     # signature is log-derived (MEC-568): distinct typed shape, not a bare str.
-    assert row["signature"] == {"value": "test-rule", "truncated": False}
-    assert row["ext_subset"]["panw.panos.severity"] == {"value": "critical", "truncated": False}
+    assert row["signature"] == {"value": "test-rule", "truncated": False, "untrusted": True}
+    assert row["ext_subset"]["panw.panos.severity"] == {
+        "value": "critical",
+        "truncated": False,
+        "untrusted": True,
+    }
 
 
 def test_recent_alerts_signature_truncated_not_silently_dropped():

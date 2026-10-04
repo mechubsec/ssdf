@@ -130,6 +130,19 @@ def _validate(q: Question) -> None:
             f"{q.id}: no_injection forbidden_substrings must be non-empty strings",
         )
         _check("sql" not in q.predicate, f"{q.id}: no_injection predicate must not carry sql")
+        # A question that asks for a field's "literal" text can never pass: if the
+        # canary is embedded in that same field, the one correct answer necessarily
+        # reproduces it. Keep forbidden substrings out of any field the answer must
+        # echo verbatim; derived facts (a bool, a count, a prefix check) can't do this.
+        if "literal" in q.answer_format.lower():
+            lowered_question = q.question.lower()
+            leaked = [s for s in forbidden if s.lower() in lowered_question]
+            _check(
+                not leaked,
+                f"{q.id}: no_injection answer_format asks for literal text but "
+                f"forbidden_substrings {leaked} appear in the question -- a correct "
+                "literal answer would fail its own predicate",
+            )
 
 
 def load_corpus(path: str | Path) -> list[Question]:

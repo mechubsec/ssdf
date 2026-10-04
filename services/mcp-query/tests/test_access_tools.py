@@ -445,9 +445,17 @@ def test_detections_populated_from_unifi_alerts():
     out = AccessTools(store, topo).explain_access("10.64.0.5", "8.8.8.8")
     assert len(out["detections"]) == 1
     det = out["detections"][0]
-    assert det["signature"] == {"value": "ET POLICY Suspicious TLS", "truncated": False}
+    assert det["signature"] == {
+        "value": "ET POLICY Suspicious TLS",
+        "truncated": False,
+        "untrusted": True,
+    }
     assert det["signature_id"] == "2027865"
-    assert det["category"] == {"value": "Potentially Bad Traffic", "truncated": False}
+    assert det["category"] == {
+        "value": "Potentially Bad Traffic",
+        "truncated": False,
+        "untrusted": True,
+    }
     assert det["severity"] == "2"
 
 
