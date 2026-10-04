@@ -156,6 +156,12 @@ if err != null {
         event_outcome = "unknown"
     }
 
+    # Bound event_action to a fixed vocabulary before it reaches storage/query
+    # layers that treat this column as normalizer-controlled. Reject rather
+    # than truncate/sanitize: an out-of-vocabulary value is a signal, not a
+    # formatting problem.
+    if !match(event_action, r'^[a-z0-9_-]{1,64}$') { event_action = "unknown" }
+
     proto_id = to_int(fields."protocol-id")
     transport = "unknown"
     if proto_id == 6 {
@@ -324,6 +330,9 @@ if action == "allow" {
 # network_transport
 transport = downcase(protocol)
 if transport == "" { transport = "unknown" }
+# Bound to a fixed vocabulary before it reaches storage/query layers that
+# treat this column as normalizer-controlled.
+if !match(transport, r'^[a-z0-9_-]{1,64}$') { transport = "unknown" }
 
 # --- base event; only safe defaults, branch fills the rest ---
 ev = {}
@@ -362,6 +371,7 @@ if nat_dst_ip != "" && nat_dst_ip != "0.0.0.0" { ext = set!(ext, ["panw.panos.na
 if log_type == "TRAFFIC" {
     ev.event_category = ["network"]
     ev.event_action = "flow_" + downcase(subtype)
+    if !match(ev.event_action, r'^[a-z0-9_-]{1,64}$') { ev.event_action = "unknown" }
     ev.event_outcome = outcome
     ev.network_transport = transport
     ev.rule_name = rule_name
@@ -391,6 +401,7 @@ if log_type == "TRAFFIC" {
 } else if log_type == "THREAT" {
     ev.event_category = ["network", "intrusion_detection"]
     ev.event_action = "threat_" + downcase(subtype)
+    if !match(ev.event_action, r'^[a-z0-9_-]{1,64}$') { ev.event_action = "unknown" }
     ev.event_outcome = outcome
     ev.network_transport = transport
     ev.rule_name = rule_name
@@ -427,6 +438,7 @@ if log_type == "TRAFFIC" {
     # SYSTEM (short): 9 EventID, 13 Module, 14 Severity, 15 Description
     ev.event_category = ["host"]
     ev.event_action = "system_" + downcase(subtype)
+    if !match(ev.event_action, r'^[a-z0-9_-]{1,64}$') { ev.event_action = "unknown" }
     if length(f) > 8 {
         sysev = string(f[8]) ?? ""
         if sysev != "" { ext = set!(ext, ["panw.panos.event_id_str"], sysev) }
@@ -443,6 +455,7 @@ if log_type == "TRAFFIC" {
     # CONFIG (short): 10 Command, 11 Admin, 12 Client, 13 Result
     ev.event_category = ["configuration"]
     ev.event_action = "config_" + downcase(subtype)
+    if !match(ev.event_action, r'^[a-z0-9_-]{1,64}$') { ev.event_action = "unknown" }
     if length(f) > 10 {
         adminv = string(f[10]) ?? ""
         if adminv != "N/A" { ev.user_name = adminv }
@@ -468,6 +481,7 @@ if log_type == "TRAFFIC" {
         } else {
             ev.event_action = downcase(log_type)
         }
+        if !match(ev.event_action, r'^[a-z0-9_-]{1,64}$') { ev.event_action = "unknown" }
     } else {
         # Malformed / short: no log_type at all
         ev.event_action = "unknown"
@@ -557,6 +571,7 @@ if cerr != null {
         } else {
             ev.event_action = "alert"
         }
+        if !match(ev.event_action, r'^[a-z0-9_-]{1,64}$') { ev.event_action = "unknown" }
 
         # Detection vs prevention: act=blocked/dropped is an enforced block.
         act = downcase(string(doc.act) ?? "")
@@ -568,6 +583,7 @@ if cerr != null {
 
         proto = downcase(string(doc.proto) ?? "")
         if proto != "" { ev.network_transport = proto }
+        if !match(ev.network_transport, r'^[a-z0-9_-]{1,64}$') { ev.network_transport = "unknown" }
 
         sp = to_int(doc.spt) ?? null
         if sp != null { ev.source_port = sp }
@@ -807,6 +823,7 @@ if perr != null {
             } else {
                 ev.event_action = "task_" + dtype
             }
+            if !match(ev.event_action, r'^[a-z0-9_-]{1,64}$') { ev.event_action = "unknown" }
         } else {
             # pvedaemon/pveproxy auth failure: "authentication failure; rhost=<ip> user=<u> msg=..."
             afm, aferr = parse_regex(msg, r'authentication failure;\s*rhost=(?P<ip>\S+)\s+user=(?P<user>\S+)')
@@ -2495,4 +2512,170 @@ type = "vrl"
 source = '''
 assert_eq!(.source_ip, "10.65.1.10")
 assert_eq!(.destination_ip, "10.66.2.20")
+'''
+
+# --- out-of-vocabulary derived-field bounds (clamp to a fixed sentinel) ---
+# Each case below feeds a value through an upstream-controlled field that
+# would otherwise land in a normalizer-derived column unbounded.
+
+[[tests]]
+name = "srx_rt_generic_fallback_bounds_invalid_chars_to_unknown"
+[[tests.inputs]]
+insert_at = "srx_ecs"
+type = "raw"
+value = '<14>1 2026-07-01T12:00:00.000Z vsrx-isp-b RT_IDS - RT_IDP!INJECTED [junos@2636.1.1.1.2.36 source-address="10.65.1.10" destination-address="10.66.2.20"]'
+[[tests.outputs]]
+extract_from = "srx_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "unknown")
+'''
+
+[[tests]]
+name = "panos_traffic_subtype_with_space_bounds_event_action_to_unknown"
+[[tests.inputs]]
+insert_at = "panos_ecs"
+type = "raw"
+value = '<14>Jun 06 23:20:00 panosvm.example.com ,2026/06/06 23:20:00,007054000012345,TRAFFIC,end bad,,2026/06/06 23:20:00,203.0.113.50,198.51.100.20,0.0.0.0,0.0.0.0,allow-trust-to-untrust,,,ssl,vsys1,trust,untrust,ethernet1/2,ethernet1/1,,,40001,1,52344,443,0,0,0x0,tcp,allow,8000,3000,5000,40,2026/06/06 23:19:30,30,any,,1001,0x0,203.0.113.0-203.0.113.255,US,,22,18,tcp-fin'
+[[tests.outputs]]
+extract_from = "panos_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "unknown")
+assert_eq!(.network_transport, "tcp")
+'''
+
+[[tests]]
+name = "panos_threat_subtype_over_length_bound_becomes_unknown"
+[[tests.inputs]]
+insert_at = "panos_ecs"
+type = "raw"
+value = '<14>Jun 06 23:22:00 panosvm.example.com ,2026/06/06 23:22:00,007054000012345,THREAT,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,,2026/06/06 23:22:00,198.51.100.77,203.0.113.8,0.0.0.0,0.0.0.0,allow-untrust-to-trust,,,web-browsing,vsys1,untrust,trust,ethernet1/1,ethernet1/2,,,40003,1,44012,80,0,0,0x0,tcp,reset-both,exploit.example/path,30001,code-execution,critical,client-to-server,1003,0x0,US,US'
+[[tests.outputs]]
+extract_from = "panos_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "unknown")
+'''
+
+[[tests]]
+name = "panos_generic_fallback_subtype_with_delimiter_bounds_to_unknown"
+[[tests.inputs]]
+insert_at = "panos_ecs"
+type = "raw"
+value = '<14>Jun 06 23:28:00 panosvm.example.com ,2026/06/06 23:28:00,007054000012345,HIPMATCH,match bad value,,2026/06/06 23:28:00,203.0.113.50,198.51.100.20,0.0.0.0,0.0.0.0,,,,,vsys1,,,,,,,,,,,,,,,,,,,,,,,,,'
+[[tests.outputs]]
+extract_from = "panos_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "unknown")
+assert_eq!(.ext."panw.panos.type", "HIPMATCH")
+'''
+
+[[tests]]
+name = "panos_traffic_protocol_with_delimiter_bounds_transport_to_unknown"
+[[tests.inputs]]
+insert_at = "panos_ecs"
+type = "raw"
+value = '<14>Jun 06 23:21:00 panosvm.example.com ,2026/06/06 23:21:00,007054000012345,TRAFFIC,deny,,2026/06/06 23:21:00,198.51.100.99,203.0.113.5,0.0.0.0,0.0.0.0,default-deny,,,incomplete,vsys1,untrust,trust,ethernet1/1,ethernet1/2,,,40002,1,51000,3389,0,0,0x0,tcp bad,deny,200,200,0,2,2026/06/06 23:20:30,0,any,,1002,0x0,198.51.100.0-198.51.100.255,US,,2,0,policy-deny'
+[[tests.outputs]]
+extract_from = "panos_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "flow_deny")
+assert_eq!(.network_transport, "unknown")
+'''
+
+[[tests]]
+name = "unifi_cef_policy_name_with_delimiters_bounds_event_action_to_unknown"
+[[tests.inputs]]
+insert_at = "unifi_ips"
+type = "raw"
+value = 'Jun 14 19:49:59 UCK-G2-Plus-site-controller CEF:0|Ubiquiti|UniFi Network|10.68.57|200|Threat Detected|7|UNIFIcategory=Security UNIFIsite=Default UNIFIhost=UCK G2 Plus site-controller proto=TCP spt=38738 dpt=22 act=allowed app=SSH UNIFIrisk=medium UNIFIpolicyName=Scanning; bad value UNIFIpolicyType=IDS/IPS UNIFIdirection=outgoing UNIFIdeviceMac=02:00:01:27:fb:2b UNIFIdeviceName=Gateway Max UNIFIdeviceIp=198.51.100.1 UNIFIsrcClientAlias=ssdf-vector UNIFIsrcClientMac=02:01:01:02:a1:46 UNIFIsrcZone=Internal UNIFIdstClientMac=02:00:01:27:fb:2c UNIFIdstZone=External UNIFIipsSessionId=1190371755462149 UNIFIipsSignature=ET SCAN Potential SSH Scan OUTBOUND UNIFIipsSignatureId=2003068 UNIFIutcTime=2026-06-14T19:49:59.858Z msg=A network intrusion attempt has been detected.'
+[[tests.outputs]]
+extract_from = "unifi_ips"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "unknown")
+'''
+
+[[tests]]
+name = "unifi_cef_protocol_with_space_bounds_transport_to_unknown"
+[[tests.inputs]]
+insert_at = "unifi_ips"
+type = "raw"
+value = 'Jun 14 19:49:59 UCK-G2-Plus-site-controller CEF:0|Ubiquiti|UniFi Network|10.68.57|200|Threat Detected|7|UNIFIcategory=Security UNIFIsite=Default UNIFIhost=UCK G2 Plus site-controller proto=TCP bad spt=38738 dpt=22 act=allowed app=SSH UNIFIrisk=medium UNIFIpolicyName=Scanning Activity UNIFIpolicyType=IDS/IPS UNIFIdirection=outgoing UNIFIdeviceMac=02:00:01:27:fb:2b UNIFIdeviceName=Gateway Max UNIFIdeviceIp=198.51.100.1 UNIFIsrcClientAlias=ssdf-vector UNIFIsrcClientMac=02:01:01:02:a1:46 UNIFIsrcZone=Internal UNIFIdstClientMac=02:00:01:27:fb:2c UNIFIdstZone=External UNIFIipsSessionId=1190371755462149 UNIFIipsSignature=ET SCAN Potential SSH Scan OUTBOUND UNIFIipsSignatureId=2003068 UNIFIutcTime=2026-06-14T19:49:59.858Z msg=A network intrusion attempt has been detected.'
+[[tests.outputs]]
+extract_from = "unifi_ips"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "alert_scanning-activity")
+assert_eq!(.network_transport, "unknown")
+'''
+
+[[tests]]
+name = "panos_system_subtype_with_space_bounds_event_action_to_unknown"
+[[tests.inputs]]
+insert_at = "panos_ecs"
+type = "raw"
+value = '<14>Jun 06 23:25:00 panosvm.example.com ,2026/06/06 23:25:00,007054000012345,SYSTEM,general bad,,2026/06/06 23:25:00,vsys1,general,,,,general,informational,System started successfully'
+[[tests.outputs]]
+extract_from = "panos_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "unknown")
+assert_eq!(.event_category, ["host"])
+'''
+
+[[tests]]
+name = "panos_config_subtype_with_space_bounds_event_action_to_unknown"
+[[tests.inputs]]
+insert_at = "panos_ecs"
+type = "raw"
+value = '<14>Jun 06 23:27:00 panosvm.example.com ,2026/06/06 23:27:00,007054000012345,CONFIG,set bad,,2026/06/06 23:27:00,198.51.100.225,vsys1,set,admin,198.51.100.199,Succeeded,vsys vsys1 rulebase security'
+[[tests.outputs]]
+extract_from = "panos_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "unknown")
+assert_eq!(.event_category, ["configuration"])
+'''
+
+[[tests]]
+name = "proxmox_task_start_dtype_uppercase_bounds_event_action_to_unknown"
+[[tests.inputs]]
+insert_at = "proxmox_ecs"
+type = "raw"
+value = "<86>1 2026-06-14T20:05:00.000000+00:00 pve3 pvedaemon 1234 - - <root@pam> starting task UPID:pve3:00001A2B:0000ABCD:686D1234:QMSTART:210:root@pam:"
+[[tests.outputs]]
+extract_from = "proxmox_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "unknown")
+assert_eq!(.event_category, ["configuration"])
+'''
+
+[[tests]]
+name = "proxmox_task_end_dtype_uppercase_bounds_event_action_to_unknown"
+[[tests.inputs]]
+insert_at = "proxmox_ecs"
+type = "raw"
+value = "<86>1 2026-06-14T20:05:05.000000+00:00 pve3 pvedaemon 1234 - - <root@pam> end task UPID:pve3:00001A2B:0000ABCD:686D1234:QMSTART:210:root@pam: OK"
+[[tests.outputs]]
+extract_from = "proxmox_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "unknown")
+assert_eq!(.event_outcome, "success")
 '''
