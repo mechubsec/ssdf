@@ -29,13 +29,15 @@ This directory contains ClickHouse DDL and configuration for SSDF.
 - `023_audit_evidence.sql` - Long-retention evidence tier
 - `024_audit_ocsf_export.sql` - OCSF export for the audit chain
 - `025_flow_tuples_daily.sql` - Daily flow-tuple rollup
+- `026_events_ocsf_export.sql` - OCSF Network Activity export for events
+- `027_events_ocsf_authentication.sql` - OCSF Authentication export for events
 
 Run migrations with: `python3 ../scripts/run_migrations.py` (see
 `scripts/MIGRATION_RUNNER.md`). The `ssdf.migrations_applied` tracking table
 is created by the runner itself, not by a numbered migration file, so a
 fresh install always has somewhere to record migration 1's completion.
 Migrations that create `CREATE USER ... BY '${VAR}'` service accounts (003,
-005, 007, 008, 009, 011, 013, 015, 018, 019, 022-025) need the matching
+005, 007, 008, 009, 011, 013, 015, 018, 019, 022-027) need the matching
 `*_PW` environment variable set; the runner substitutes `${VAR}` /
 `${VAR:-default}` placeholders itself and refuses to run if a required
 variable is unset or empty. The full set of required variables (every
@@ -43,10 +45,16 @@ placeholder with no `:-default` across `infra/clickhouse/*.sql`) is:
 
 ```
 ARCHIVER_PW, AUDIT_EXPORT_PW, AUDIT_PW, AUDIT_VERIFY_PW, CHECKPOINT_PW,
-DEFINER_PW, ENTITY_MAINT_PW, ENTITY_PW, FLOWTUPLES_PW, HEALTH_PW,
-OCSF_DEFINER_PW, PUBLIC_PW, PUBMETRICS_PW, RO_PW, RULEUSAGE_PW, TOPO_PW,
-VIEW_PSEUDONYM_KEY_HI, VIEW_PSEUDONYM_KEY_LO
+DEFINER_PW, ENTITY_MAINT_PW, ENTITY_PW, EVENTS_EXPORT_PW,
+EVENTS_OCSF_DEFINER_PW, FLOWTUPLES_PW, HEALTH_PW, OCSF_DEFINER_PW, PUBLIC_PW,
+PUBMETRICS_PW, RO_PW, RULEUSAGE_PW, TOPO_PW, VIEW_PSEUDONYM_KEY_HI,
+VIEW_PSEUDONYM_KEY_LO
 ```
+
+`EVENTS_OCSF_DEFINER_PW` (026, 027) is deliberately a separate variable from
+`OCSF_DEFINER_PW` (024): the two `*_ocsf_definer` users sit over different
+base tables (`events` vs. `audit_evidence`/`audit_checkpoints`) and must not
+share a credential across those privilege domains.
 
 (`HEALTH_TTL_DAYS` has a default of 30 and is optional.)
 `services/mcp-query/tests/test_run_migrations.py::test_readme_lists_every_required_placeholder`
@@ -97,6 +105,8 @@ DEFINER_PW=<password>
 CHECKPOINT_PW=<password>
 ARCHIVER_PW=<password>
 OCSF_DEFINER_PW=<password>
+EVENTS_OCSF_DEFINER_PW=<password>
+EVENTS_EXPORT_PW=<password>
 FLOWTUPLES_PW=<password>
 VIEW_PSEUDONYM_KEY_HI=<password>
 VIEW_PSEUDONYM_KEY_LO=<password>

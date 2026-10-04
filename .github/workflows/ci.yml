@@ -115,7 +115,7 @@ jobs:
           CH_CONTRACT_PORT: "8123"
           CH_PASSWORD: unused-by-contract-suite
           MCP_AUTH_TOKEN: unused-by-contract-suite
-        run: uv run pytest tests/test_sql_contract.py tests/test_public_views_migration.py tests/test_audit_ttl_contract.py -m contract -q
+        run: uv run pytest tests/test_sql_contract.py tests/test_public_views_migration.py tests/test_audit_ttl_contract.py tests/test_events_ocsf_views_contract.py -m contract -q
 
   vector-test:
     # MEC-219 N3: infra/vector/vector.toml carries the F1/F4/F5/MEC-186/
