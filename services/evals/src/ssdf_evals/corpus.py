@@ -84,6 +84,35 @@ def _check(condition: bool, message: str) -> None:
         raise CorpusError(message)
 
 
+def _validate_predicate_shape(qid: str, predicate: dict) -> None:
+    """Shared shape checks for a reference_sql/expected_json predicate -- used both
+    for a question's top-level predicate and for a no_injection predicate's nested
+    `correctness` check."""
+    ptype = predicate.get("type")
+    if ptype == "reference_sql":
+        sql = predicate.get("sql", "")
+        _check(bool(_SELECT_ONLY.match(sql)), f"{qid}: reference_sql must be a SELECT")
+        _check(
+            predicate.get("match") in MATCH_MODES,
+            f"{qid}: bad match mode {predicate.get('match')!r}",
+        )
+        _check(bool(predicate.get("answer_key")), f"{qid}: reference_sql needs answer_key")
+        match = predicate.get("match")
+        if match == "set_overlap":
+            _check(
+                isinstance(predicate.get("params", {}).get("min_overlap"), int),
+                f"{qid}: set_overlap needs integer params.min_overlap",
+            )
+        elif match == "numeric_tolerance":
+            params = predicate.get("params", {})
+            _check(
+                ("tolerance" in params) != ("tolerance_pct" in params),
+                f"{qid}: numeric_tolerance needs exactly one of params.tolerance / params.tolerance_pct",
+            )
+    elif ptype == "expected_json":
+        _check("expected" in predicate, f"{qid}: expected_json needs 'expected'")
+
+
 def _validate(q: Question) -> None:
     _check(q.tier in TIERS, f"{q.id}: bad tier {q.tier!r}")
     _check(q.category in CATEGORIES, f"{q.id}: bad category {q.category!r}")
@@ -95,28 +124,8 @@ def _validate(q: Question) -> None:
 
     ptype = q.predicate.get("type")
     _check(ptype in PREDICATE_TYPES, f"{q.id}: bad predicate type {ptype!r}")
-    if ptype == "reference_sql":
-        sql = q.predicate.get("sql", "")
-        _check(bool(_SELECT_ONLY.match(sql)), f"{q.id}: reference_sql must be a SELECT")
-        _check(
-            q.predicate.get("match") in MATCH_MODES,
-            f"{q.id}: bad match mode {q.predicate.get('match')!r}",
-        )
-        _check(bool(q.predicate.get("answer_key")), f"{q.id}: reference_sql needs answer_key")
-        match = q.predicate.get("match")
-        if match == "set_overlap":
-            _check(
-                isinstance(q.predicate.get("params", {}).get("min_overlap"), int),
-                f"{q.id}: set_overlap needs integer params.min_overlap",
-            )
-        elif match == "numeric_tolerance":
-            params = q.predicate.get("params", {})
-            _check(
-                ("tolerance" in params) != ("tolerance_pct" in params),
-                f"{q.id}: numeric_tolerance needs exactly one of params.tolerance / params.tolerance_pct",
-            )
-    elif ptype == "expected_json":
-        _check("expected" in q.predicate, f"{q.id}: expected_json needs 'expected'")
+    if ptype in ("reference_sql", "expected_json"):
+        _validate_predicate_shape(q.id, q.predicate)
     elif ptype == "refusal":
         _check("sql" not in q.predicate, f"{q.id}: refusal predicate must not carry sql")
     elif ptype == "no_injection":
@@ -143,6 +152,23 @@ def _validate(q: Question) -> None:
                 f"forbidden_substrings {leaked} appear in the question -- a correct "
                 "literal answer would fail its own predicate",
             )
+        # `correctness` is optional: refusing the canary is necessary but not
+        # sufficient -- a model that answers garbage (or refuses to engage at
+        # all) while merely avoiding the forbidden substring still passed with
+        # no evidence it handled the underlying question correctly. When
+        # present, it is itself a reference_sql/expected_json predicate (not
+        # no_injection/refusal, to avoid recursion) and must pass alongside
+        # the canary check.
+        correctness = q.predicate.get("correctness")
+        if correctness is not None:
+            _check(
+                isinstance(correctness, dict), f"{q.id}: no_injection correctness must be a dict"
+            )
+            _check(
+                correctness.get("type") in ("reference_sql", "expected_json"),
+                f"{q.id}: no_injection correctness.type must be reference_sql or expected_json",
+            )
+            _validate_predicate_shape(q.id, correctness)
 
 
 def load_corpus(path: str | Path) -> list[Question]:
