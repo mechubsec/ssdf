@@ -1,0 +1,15 @@
+[Unit]
+Description=SSDF Single-Host Profile (ClickHouse + migrations + MCP Query)
+After=network-online.target
+Wants=network-online.target
+# Ordering between the three units is carried by each unit's own
+# After=/Before=/Requires= (clickhouse -> migrate -> mcp-query), so pulling
+# them in here with Requires= is enough for `systemctl start
+# ssdf-single-host.target` to bring them up in the right order. A .target
+# unit (unlike the old Type=forking wrapper service it replaces) has no
+# ExecStart/ExecStop of its own, so there is no single process whose exit
+# can be mistaken for "the profile is done" and tear the other two down.
+Requires=ssdf-clickhouse.service ssdf-migrate.service ssdf-mcp-query.service
+
+[Install]
+WantedBy=multi-user.target
