@@ -17,6 +17,7 @@ from ssdf_policy.change_impact.delta import (
     apply_delta,
     apply_junos_text_delta,
     parse_json_delta,
+    renumber_positions,
 )
 
 from .change_impact_builders import (
@@ -30,9 +31,29 @@ from .timeparse import parse_time
 
 DEFAULT_WINDOW_DAYS = 14  # doc §4: raw-events default until flow_tuples_daily (task B) lands
 
+# `event_action` values the candidate pull's own query already filters on
+# (see change_impact_builders.build_candidate_pull_sql) that represent a
+# logged deny/drop, as opposed to a session close.
+_DENY_ACTIONS = frozenset({"flow_session_deny", "flow_deny", "flow_drop"})
+
 
 class ChangeImpactError(ValueError):
     pass
+
+
+def _deny_logging_observed(rows: list[dict]) -> dict[tuple[str, str], bool]:
+    """Per zone-pair: was any deny/drop logged in-window? (doc §6 deny-side
+    blindness input.) Computed here, from the same candidate rows the
+    evaluator already scores, rather than taken as an MCP caller argument --
+    a model-supplied value for this would let model output decide whether a
+    widened rule's newly-allowed traffic is reported as a number or
+    "unknown" (MEC-1765 F4)."""
+    observed: dict[tuple[str, str], bool] = {}
+    for row in rows:
+        if row.get("event_action") in _DENY_ACTIONS:
+            zp = (row.get("observer_ingress_zone"), row.get("observer_egress_zone"))
+            observed[zp] = True
+    return observed
 
 
 def _aggregate_candidates(rows: list[dict]) -> list[dict]:
@@ -95,7 +116,12 @@ class ChangeImpactTools:
 
     def _configured_rules(self, device_name: str, provider: str) -> list[dict]:
         items = self._store.configured_policies_for_firewalls([device_name])
-        return [policy_entity_to_rule(item["policy"], device_name, provider) for item in items]
+        rules = [policy_entity_to_rule(item["policy"], device_name, provider) for item in items]
+        # `configured_policies_for_firewalls` returns entities in SQL join
+        # order, not rulebase order -- `renumber_positions` puts P onto the
+        # same position scale `apply_delta` produces for P' (MEC-1765 F1),
+        # trusting each policy's stored `attrs["position"]`, not list order.
+        return renumber_positions(rules)
 
     def _object_book(self, provider: str, device_name: str) -> dict:
         sql, params = build_latest_object_book_sql(provider, device_name)
@@ -120,13 +146,13 @@ class ChangeImpactTools:
         junos_current_text: str | None = None,
         since: str | None = None,
         until: str | None = None,
-        deny_logging_observed: dict | None = None,
     ) -> dict:
         """`delta` is either the vendor-neutral JSON op list (a list of op
         dicts) or, for Junos text form, a dict `{"lines": [...]}` -- requires
         `junos_current_text` (the device's current `| display set` output)
         since that form diffs text, not the stored rule list.
         """
+        since_was_default = since is None
         since = since or f"now-{DEFAULT_WINDOW_DAYS}d"
         until = until or "now"
         since_iso = parse_time(since).isoformat()
@@ -177,6 +203,7 @@ class ChangeImpactTools:
         if truncated:
             raw_rows = raw_rows[:DEFAULT_CANDIDATE_LIMIT]
         candidates = _aggregate_candidates(raw_rows)
+        deny_logging_observed = _deny_logging_observed(raw_rows)
 
         cutoff_by_zone_pair = {zp: cutoff for zp in zone_pairs} if cutoff else {}
 
@@ -191,8 +218,8 @@ class ChangeImpactTools:
             window_until=until_iso,
             delta_payload=delta_payload,
             cutoff_by_zone_pair=cutoff_by_zone_pair,
-            deny_logging_observed=deny_logging_observed or {},
-            coverage={"window_default_days": DEFAULT_WINDOW_DAYS if since is None else None},
+            deny_logging_observed=deny_logging_observed,
+            coverage={"window_default_days": DEFAULT_WINDOW_DAYS if since_was_default else None},
             truncated=truncated,
             truncated_at=DEFAULT_CANDIDATE_LIMIT if truncated else None,
         )

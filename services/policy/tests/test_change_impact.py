@@ -15,8 +15,11 @@ import pytest
 from ssdf_policy.change_impact import (
     CONFIG_ONLY_NO_IMPACT,
     NO_SESSIONS_OBSERVED,
+    apply_delta,
     evaluate_change_impact,
+    parse_json_delta,
 )
+from ssdf_policy.change_impact.rulemodel import compile_rulebase
 from ssdf_policy.collectors.junos import parse_security_policies
 
 EMPTY_BOOK = {"address_books": {"global": {"addresses": {}, "address_sets": {}}}}
@@ -25,6 +28,39 @@ NOW = "2026-10-03T00:00:00"
 
 def _junos_rules(text: str) -> list[dict]:
     return parse_security_policies(text.strip(), "vsrx-ci", NOW)
+
+
+def _json_rule(name: str, action: str, position: int, **overrides) -> dict:
+    """A NormalizedRule-shaped dict for the JSON-delta form (mirrors
+    test_change_impact_delta.py's `_rule`, duplicated here since that's a
+    different test module)."""
+    rule = {
+        "provider": "juniper",
+        "device_name": "vsrx-ci",
+        "rule_name": name,
+        "action": action,
+        "from_zone": ["trust"],
+        "to_zone": ["untrust"],
+        "source_addresses": [],
+        "dest_addresses": [],
+        "application": [],
+        "service": [],
+        "position": position,
+        "enabled": True,
+        "vendor_extras": {},
+        "collected_at": NOW,
+        "is_global": False,
+        "source_address_excluded": False,
+        "dest_address_excluded": False,
+        "source_identity": [],
+        "dynamic_application": [],
+        "url_category": [],
+        "source_end_user_profile": [],
+        "scheduler_name": "",
+        "match_unknown": False,
+    }
+    rule.update(overrides)
+    return rule
 
 
 def _candidate(
@@ -513,6 +549,77 @@ def test_multi_rule_change_reports_per_rule_even_when_aggregate_cancels_out():
     # not a fabricated zero.
     assert by_name["CLOSE-B"]["result"] == NO_SESSIONS_OBSERVED
     _assert_honesty_contract(report)
+
+
+# ---------------------------------------------------------------------------
+# F1 regression: a JSON-delta `move` must be visible to the diff and the
+# evaluator. `apply_delta` used to reorder the Python list but never touch
+# the stale `position` field those rules carried, so `diff_rulebases`
+# (which compares `position`, not list order) saw no reorder at all and the
+# config-only pre-check stamped the move CONFIG_ONLY_NO_IMPACT even though
+# it silently blocks every session that used to match the allowed rule.
+# ---------------------------------------------------------------------------
+
+
+def test_json_delta_move_to_front_is_reported_not_hidden():
+    p_rules = [
+        _json_rule("ALLOW-ANY", "allow", 0),
+        _json_rule("DENY-ALL", "deny", 1),
+    ]
+    delta = parse_json_delta([{"op": "move", "rule_name": "DENY-ALL", "before": "ALLOW-ANY"}])
+    pprime_rules = apply_delta(p_rules, delta)
+    assert [r["rule_name"] for r in pprime_rules] == ["DENY-ALL", "ALLOW-ANY"]
+
+    candidates = [_candidate(sessions=500, logged_rules=["ALLOW-ANY"])]
+    report = evaluate_change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        p_rules=p_rules,
+        pprime_rules=pprime_rules,
+        object_book=EMPTY_BOOK,
+        candidates=candidates,
+        window_since="2026-09-20T00:00:00",
+        window_until="2026-10-03T00:00:00",
+        delta_payload={"kind": "f1-json-move-regression"},
+        calibration_min_sample=1,
+    )
+    by_name = {s["rule_name"]: s for s in report["changed_rules"]}
+    assert set(by_name) == {"ALLOW-ANY", "DENY-ALL"}
+    for section in by_name.values():
+        assert section.get("result") != CONFIG_ONLY_NO_IMPACT, (
+            "a move that reorders a deny ahead of an allow must never report as provably no impact"
+        )
+    # DENY-ALL now matches first on this zone-pair and blocks the 500
+    # sessions that used to be permitted by ALLOW-ANY -- the real,
+    # unhidden verdict change.
+    assert "verdict_change_breaks" in by_name["DENY-ALL"]["classes"]
+    assert by_name["DENY-ALL"]["classes"]["verdict_change_breaks"]["sessions"] == 500
+    _assert_honesty_contract(report)
+
+
+def test_json_delta_add_after_lands_at_its_list_position_not_caller_default():
+    """F1 regression, 'add' side: a new rule's `position` must come from
+    where `apply_delta` actually inserted it in the list, not from whatever
+    the caller's rule dict said (or didn't say -- a missing key used to
+    default to 0, i.e. "evaluated first", no matter what 'before'/'after'
+    requested)."""
+    p_rules = [
+        _json_rule("A", "allow", 0),
+        _json_rule("B", "deny", 1),
+        _json_rule("C", "allow", 2),
+    ]
+    new_rule = _json_rule("NEW", "deny", 0)
+    del new_rule["position"]
+    delta = parse_json_delta([{"op": "add", "rule": new_rule, "after": "B"}])
+    pprime_rules = apply_delta(p_rules, delta)
+    assert [r["rule_name"] for r in pprime_rules] == ["A", "B", "NEW", "C"]
+
+    compiled = compile_rulebase(pprime_rules, EMPTY_BOOK)
+    positions = {c.rule_name: c.position for c in compiled}
+    # Before the fix, NEW's position defaulted to 0 and tied with A's,
+    # sorting NEW ahead of B -- exactly the "evaluated first regardless of
+    # before/after" bug the review called out.
+    assert positions["A"] < positions["B"] < positions["NEW"] < positions["C"]
 
 
 # ---------------------------------------------------------------------------

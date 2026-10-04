@@ -10,6 +10,8 @@ than only in isolation.
 
 import json
 
+import pytest
+
 from ssdf_mcp_query.change_impact_builders import policy_entity_to_rule
 from ssdf_mcp_query.change_impact_tools import ChangeImpactTools
 
@@ -121,6 +123,94 @@ def test_change_impact_json_delta_end_to_end_with_fakes():
     # (deny -> allow) is reported, not downgraded to unknown.
     assert "verdict_change_opens" in section["classes"]
     assert section["classes"]["verdict_change_opens"]["sessions"] == 150
+
+
+def test_policy_entity_to_rule_reads_is_global_from_attrs_not_from_zone_heuristic():
+    """MEC-1765 F6: a global policy with an explicit `match from-zone X`
+    (from_zone != 'any') must still read back as global -- re-deriving it
+    from from_zone would misclassify it as a zone-pair rule."""
+    entity = _policy_entity("GLOBAL-RULE", action="deny")
+    entity["attrs"]["is_global"] = "true"
+    rule = policy_entity_to_rule(entity, "vsrx-ci", "juniper")
+    assert rule["is_global"] is True
+
+    entity2 = _policy_entity("ZONEPAIR-RULE", action="deny")
+    entity2["attrs"]["is_global"] = "false"
+    rule2 = policy_entity_to_rule(entity2, "vsrx-ci", "juniper")
+    assert rule2["is_global"] is False
+
+
+def test_change_impact_deny_logging_observed_is_computed_from_candidate_rows():
+    """F4 regression: whether a zone-pair had any logged deny must come from
+    the candidate rows the evaluator itself already scored, never a
+    caller-supplied argument (a model-controlled value could otherwise turn
+    an honest "unknown" into a fabricated count)."""
+    policies = [_policy_entity("NARROW", action="deny")]
+    store = FakeEntityStore(policies)
+    object_book = {"address_books": {"global": {"addresses": {}, "address_sets": {}}}}
+    event_rows = [
+        {
+            "observer_ingress_zone": "trust",
+            "observer_egress_zone": "untrust",
+            "source_ip": "10.1.1.5",
+            "destination_ip": "10.2.2.5",
+            "network_transport": "tcp",
+            "destination_port": 443,
+            "ext": {},
+            "rule_name": "NARROW",
+            "event_action": "flow_session_deny",
+            "timestamp": "2026-09-25T00:00:00",
+        }
+        for _ in range(150)
+    ]
+    ch = FakeChClient(object_book=object_book, event_rows=event_rows)
+    tools = ChangeImpactTools(ch, store)
+
+    report = tools.change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        delta=[{"op": "modify", "rule_name": "NARROW", "fields": {"action": "allow"}}],
+        since="2026-09-20T00:00:00",
+        until="2026-10-03T00:00:00",
+    )
+    blindness = report["deny_side_blindness"]
+    assert blindness, "expected a deny-side-blindness entry for an opens class"
+    for entry in blindness.values():
+        assert entry["deny_logging_observed"] is True
+        assert entry["newly_allowed_sessions"] == 150
+
+    # The tool no longer accepts a caller-supplied value for this at all.
+    with pytest.raises(TypeError):
+        tools.change_impact(
+            device_name="vsrx-ci",
+            provider="juniper",
+            delta=[{"op": "modify", "rule_name": "NARROW", "fields": {"action": "allow"}}],
+            deny_logging_observed={("trust", "untrust"): True},
+        )
+
+
+def test_change_impact_reports_default_window_only_when_since_omitted():
+    """F7 regression: `coverage.window_default_days` must say whether the
+    14-day default was actually used, not always read None because `since`
+    had already been defaulted by the time the check ran."""
+    policies = [_policy_entity("RULE-A", action="deny")]
+    store = FakeEntityStore(policies)
+    object_book = {"address_books": {"global": {"addresses": {}, "address_sets": {}}}}
+    ch = FakeChClient(object_book=object_book, event_rows=[])
+    tools = ChangeImpactTools(ch, store)
+    delta = [{"op": "modify", "rule_name": "RULE-A", "fields": {"action": "allow"}}]
+
+    default_report = tools.change_impact(device_name="vsrx-ci", provider="juniper", delta=delta)
+    assert default_report["coverage"]["window_default_days"] == 14
+
+    explicit_report = tools.change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        delta=delta,
+        since="2026-09-20T00:00:00",
+        until="2026-10-03T00:00:00",
+    )
+    assert explicit_report["coverage"]["window_default_days"] is None
 
 
 def test_change_impact_truncated_pull_is_reported_not_hidden():

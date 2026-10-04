@@ -86,6 +86,13 @@ def resolve_policies(rules: list[dict], tenant: str) -> tuple[list[dict], list[d
             attrs["negate_source"] = "true" if rule["negate_source"] else "false"
             attrs["negate_destination"] = "true" if rule["negate_destination"] else "false"
             attrs["schedule"] = rule["schedule"]
+        if "is_global" in rule:
+            # Persist the collector's own classification rather than making
+            # change_impact re-derive it from from_zone later: a Junos global
+            # policy can carry an explicit `match from-zone X`, which an
+            # `from_zone == "any"` heuristic would misclassify as a zone-pair
+            # rule (MEC-1765 F6).
+            attrs["is_global"] = "true" if rule["is_global"] else "false"
         attrs.update(rule.get("vendor_extras") or {})
         policy = {
             "entity_id": pol_eid,

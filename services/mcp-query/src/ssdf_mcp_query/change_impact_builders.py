@@ -77,7 +77,11 @@ def policy_entity_to_rule(policy: dict, device_name: str, provider: str) -> dict
     rule["scheduler_name"] = attrs.get("scheduler_name", "")
     rule["schedule"] = attrs.get("schedule", "")
     if provider == "juniper":
-        rule["is_global"] = "any" in rule["from_zone"] and attrs.get("from_zone", "") == "any"
+        # Read the collector's own classification back rather than
+        # re-deriving it from from_zone -- a global policy with an explicit
+        # `match from-zone X` would otherwise misclassify as a zone-pair
+        # rule (MEC-1765 F6). `resolve_policies.py` persists this attr.
+        rule["is_global"] = attrs.get("is_global", "false") == "true"
     return rule
 
 

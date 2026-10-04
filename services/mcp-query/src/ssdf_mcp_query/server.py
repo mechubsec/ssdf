@@ -316,7 +316,6 @@ def build_app(tier: str = "sovereign") -> FastMCP:
         junos_current_text: str | None = None,
         since: str | None = None,
         until: str | None = None,
-        deny_logging_observed: dict | None = None,
     ) -> dict:
         """Read-only pre-change impact analysis (MEC-570): replays historical flows
         against the current rulebase and a proposed change, and reports which
@@ -329,11 +328,13 @@ def build_app(tier: str = "sovereign") -> FastMCP:
         analysable scope", or "provably no impact (config-only)" when the change
         provably can't touch any flow without looking at traffic at all. A
         deny-widening count with no logged denies in-window is reported "unknown",
-        never 0 (deny-side blindness). Per-zone-pair calibration against the
-        device's own logged `rule_name` gates every verdict: if the evaluator
-        doesn't reproduce what the device actually logged for a zone-pair, that
-        zone-pair's verdicts are "unknown: model does not reproduce device
-        behaviour" instead of a guess. Default window 14 days over raw events."""
+        never 0 (deny-side blindness), computed from the same candidate pull the
+        evaluator scores -- not a caller-supplied input. Per-zone-pair calibration
+        against the device's own logged `rule_name` gates every verdict: if the
+        evaluator doesn't reproduce what the device actually logged for a
+        zone-pair, that zone-pair's verdicts are "unknown: model does not
+        reproduce device behaviour" instead of a guess. Default window 14 days
+        over raw events."""
         return change_impact_tools.change_impact(
             device_name,
             provider,
@@ -341,7 +342,6 @@ def build_app(tier: str = "sovereign") -> FastMCP:
             junos_current_text=junos_current_text,
             since=since,
             until=until,
-            deny_logging_observed=deny_logging_observed,
         )
 
     raw_tools = {

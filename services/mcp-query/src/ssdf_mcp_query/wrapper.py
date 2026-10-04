@@ -29,18 +29,31 @@ REDACTED_ARGS: dict[str, frozenset[str]] = {
 }
 
 
+def _hash_summary(value: str) -> dict:
+    return {
+        "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        "length": len(value),
+    }
+
+
 def _redact_for_audit(tool_name: str, kwargs: dict) -> dict:
     redact_keys = REDACTED_ARGS.get(tool_name)
-    if not redact_keys:
-        return kwargs
-    redacted = dict(kwargs)
-    for key in redact_keys:
+    redacted = dict(kwargs) if redact_keys or tool_name == "change_impact" else kwargs
+    for key in redact_keys or ():
         value = redacted.get(key)
         if isinstance(value, str) and value:
-            redacted[key] = {
-                "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
-                "length": len(value),
-            }
+            redacted[key] = _hash_summary(value)
+    if tool_name == "change_impact":
+        # The Junos text-delta form's `delta["lines"]` is, like
+        # `junos_current_text`, the caller's pasted material -- a rejected
+        # line (not yet vetted against the security-policies allowlist) must
+        # not reach ssdf.audit verbatim via `args` even though the rejection
+        # itself is reported by line number only (MEC-1765 F5).
+        delta = redacted.get("delta")
+        if isinstance(delta, dict) and isinstance(delta.get("lines"), list):
+            lines = delta["lines"]
+            joined = "\n".join(str(line) for line in lines)
+            redacted["delta"] = {**_hash_summary(joined), "line_count": len(lines)}
     return redacted
 
 

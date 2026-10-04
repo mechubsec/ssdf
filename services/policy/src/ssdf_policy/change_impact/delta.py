@@ -80,6 +80,16 @@ def parse_json_delta(ops: list[dict]) -> Delta:
             rule = raw.get("rule")
             if not isinstance(rule, dict) or not rule.get("rule_name"):
                 raise DeltaError(f"delta op {i}: 'add' requires a full rule dict with rule_name")
+            if "position" in rule:
+                # `position` is assigned by `apply_delta` from the final list
+                # order (see below), never trusted from caller input -- a
+                # caller-supplied value here would otherwise either silently
+                # win (0 == "evaluated first") or crash `int(None)` before the
+                # renumbering pass ever runs.
+                raise DeltaError(
+                    f"delta op {i}: 'add' must not set 'position'; it is assigned by "
+                    "list order ('before'/'after')"
+                )
             parsed.append(
                 DeltaOp(
                     kind="add",
@@ -97,6 +107,11 @@ def parse_json_delta(ops: list[dict]) -> Delta:
             fields = raw.get("fields")
             if not isinstance(fields, dict) or not fields:
                 raise DeltaError(f"delta op {i}: 'modify' requires non-empty 'fields'")
+            if "position" in fields:
+                raise DeltaError(
+                    f"delta op {i}: 'modify' must not set 'position' directly; use 'move' "
+                    "to change order"
+                )
             parsed.append(
                 DeltaOp(
                     kind="modify",
@@ -131,9 +146,37 @@ def parse_json_delta(ops: list[dict]) -> Delta:
     return Delta(ops=tuple(parsed), source="json")
 
 
+def renumber_positions(rules: list[dict]) -> list[dict]:
+    """Return a copy of `rules` reordered by the existing `position` field
+    (stable, so ties keep their input order) and renumbered 0..n-1 in that
+    order -- the single scale every caller of `compile_rulebase` must agree
+    on. The caller-supplied list order for P is not trustworthy on its own
+    (e.g. `configured_policies_for_firewalls` returns entities in SQL join
+    order, not rulebase order); this normalizes P onto the same scale
+    `apply_delta` produces for P', so a before/after position comparison
+    (`diff.diff_rulebases`, `evaluator.firstmatch3`) is never comparing a
+    trusted value against a stale one.
+    """
+    ordered = sorted(copy.deepcopy(rules), key=lambda r: int(r.get("position", 0) or 0))
+    for i, rule in enumerate(ordered):
+        rule["position"] = i
+    return ordered
+
+
 def apply_delta(rules: list[dict], delta: Delta) -> list[dict]:
-    """P' = apply(P, Delta) for the JSON-op form. Pure: `rules` is not mutated."""
-    result = copy.deepcopy(rules)
+    """P' = apply(P, Delta) for the JSON-op form. Pure: `rules` is not mutated.
+
+    The working list is first ordered by each rule's existing `position` (so
+    an "insert at index N" / "move before/after" op lands relative to the
+    rulebase's *true* order, not whatever order the caller's list happened to
+    be in), then every op is applied via list index, and finally `position`
+    is reassigned from the resulting list order. Without this, a `move` (or
+    an `add` with no explicit `position`) changed the list's order without
+    ever updating the stale `position` field those ops leave behind, so
+    `diff_rulebases`/`firstmatch3` -- which trust `position`, not list order
+    -- never saw the reorder at all.
+    """
+    result = renumber_positions(rules)
     for op in delta.ops:
         if op.kind == "add":
             new_rule = copy.deepcopy(op.rule)
@@ -163,6 +206,8 @@ def apply_delta(rules: list[dict], delta: Delta) -> list[dict]:
             result.insert(dest, moved)
         else:  # pragma: no cover - exhaustive OpKind
             raise DeltaError(f"unhandled op kind {op.kind!r}")
+    for i, rule in enumerate(result):
+        rule["position"] = i
     return result
 
 
@@ -173,7 +218,32 @@ def apply_delta(rules: list[dict], delta: Delta) -> list[dict]:
 _POLICY_PREFIX_RE = re.compile(
     r"^(security policies from-zone \S+ to-zone \S+ policy \S+|security policies global policy \S+)"
 )
-_INSERT_RE = re.compile(r"^insert\s+(\S+)\s+(before|after)\s+(\S+)\s*$")
+# Short form: a bare policy name on each side. Ambiguous whenever that name
+# exists in more than one from-zone/to-zone context -- `_resolve_insert`
+# below refuses to guess and raises instead of silently taking the first
+# match, which is what real Junos `insert security policies ... policy X
+# before|after policy Y` syntax (the full form, also accepted below) exists
+# to disambiguate.
+_INSERT_SHORT_RE = re.compile(r"^insert\s+(\S+)\s+(before|after)\s+(\S+)\s*$")
+_INSERT_FULL_ZONEPAIR_RE = re.compile(
+    r"^insert\s+security policies from-zone (\S+) to-zone (\S+) policy (\S+)\s+"
+    r"(before|after)\s+policy\s+(\S+)\s*$"
+)
+_INSERT_FULL_GLOBAL_RE = re.compile(
+    r"^insert\s+security policies global policy (\S+)\s+(before|after)\s+policy\s+(\S+)\s*$"
+)
+# Sub-statement clause prefixes that are meaningless without a trailing
+# value -- a `delete ... policy X match source-address` line with nothing
+# after it is not "delete this one source-address entry", it is a truncated
+# paste of a delete the caller meant to qualify further. Silently matching
+# zero lines (today's behaviour) reads as "nothing to delete" when it's
+# really "the caller's delta line is incomplete".
+_VALUE_REQUIRED_CLAUSES = (
+    "match source-address",
+    "match destination-address",
+    "match application",
+    "match",
+)
 
 
 def _policy_key_for_line(line: str) -> str | None:
@@ -208,11 +278,75 @@ def _flatten(groups: list[tuple[str, list[str]]]) -> str:
     return "\n".join(line for _key, lines in groups for line in lines)
 
 
+def _find_group_by_short_name(groups: list[tuple[str, list[str]]], name: str, lineno: int) -> int:
+    """Resolve a bare policy name to exactly one group, or fail closed.
+
+    A name match against more than one group (the same policy name used in
+    two different from-zone/to-zone contexts, or alongside a `global`
+    policy) is ambiguous: silently taking the first match -- the previous
+    behaviour -- can reorder the wrong context's policy. Raise instead and
+    tell the caller to use the fully-qualified form.
+    """
+    matches = [i for i, (k, _l) in enumerate(groups) if k.endswith(f"policy {name}")]
+    if len(matches) > 1:
+        raise DeltaError(
+            f"delta line {lineno}: policy name is ambiguous across from-zone/to-zone "
+            "contexts; use the full 'insert security policies from-zone A to-zone B "
+            "policy X before|after policy Y' form to disambiguate"
+        )
+    if not matches:
+        raise DeltaError(f"delta line {lineno}: insert references unknown policy")
+    return matches[0]
+
+
+def _resolve_insert(
+    line: str, groups: list[tuple[str, list[str]]], lineno: int
+) -> tuple[int, int, str] | None:
+    """Return (moved_idx, sibling_idx, where) if `line` is any supported
+    `insert` form, else None. The full Junos form resolves both sides to a
+    fully zone-qualified key, so there's never ambiguity; the short bare-name
+    form must resolve to exactly one group on each side."""
+    full_zp = _INSERT_FULL_ZONEPAIR_RE.match(line)
+    if full_zp:
+        fz, tz, name, where, sibling = full_zp.groups()
+        moved_key = f"security policies from-zone {fz} to-zone {tz} policy {name}"
+        sibling_key = f"security policies from-zone {fz} to-zone {tz} policy {sibling}"
+        index = {key: i for i, (key, _lines) in enumerate(groups)}
+        if moved_key not in index or sibling_key not in index:
+            raise DeltaError(f"delta line {lineno}: insert references unknown policy")
+        return index[moved_key], index[sibling_key], where
+
+    full_global = _INSERT_FULL_GLOBAL_RE.match(line)
+    if full_global:
+        name, where, sibling = full_global.groups()
+        moved_key = f"security policies global policy {name}"
+        sibling_key = f"security policies global policy {sibling}"
+        index = {key: i for i, (key, _lines) in enumerate(groups)}
+        if moved_key not in index or sibling_key not in index:
+            raise DeltaError(f"delta line {lineno}: insert references unknown policy")
+        return index[moved_key], index[sibling_key], where
+
+    short = _INSERT_SHORT_RE.match(line)
+    if short:
+        name, where, sibling = short.groups()
+        moved_idx = _find_group_by_short_name(groups, name, lineno)
+        sibling_idx = _find_group_by_short_name(groups, sibling, lineno)
+        return moved_idx, sibling_idx, where
+
+    return None
+
+
 def apply_junos_set_delta(current_text: str, delta_lines: list[str]) -> str:
     """Apply `set`/`delete`/`insert ... before|after`/`activate`/`deactivate`
     lines to `current_text` (the current `| display set` output) and return
     the resulting display-set text. The caller re-parses it with
     `parse_security_policies` to get P'.
+
+    Every `DeltaError` raised here identifies the offending line by index
+    only, never by echoing its text: `apply_junos_text_delta`'s caller
+    (services/mcp-query's `audited_tool` wrapper) records `str(exc)` in
+    `ssdf.audit` verbatim on the error path, so embedding the line itself
+    would make a rejected (and therefore unvetted) delta line the leak.
     """
     groups = _group_lines(current_text)
     index = {key: i for i, (key, _lines) in enumerate(groups)}
@@ -223,27 +357,16 @@ def apply_junos_set_delta(current_text: str, delta_lines: list[str]) -> str:
             groups.append((key, []))
         return groups[index[key]][1]
 
-    for raw_line in delta_lines:
+    for lineno, raw_line in enumerate(delta_lines, start=1):
         line = raw_line.strip()
         if not line:
             continue
-        insert_match = _INSERT_RE.match(line)
-        if insert_match:
-            name, where, sibling = insert_match.groups()
-            moved_idx = next(
-                (i for i, (k, _l) in enumerate(groups) if k.endswith(f"policy {name}")), None
-            )
-            sibling_idx = next(
-                (i for i, (k, _l) in enumerate(groups) if k.endswith(f"policy {sibling}")), None
-            )
-            if moved_idx is None or sibling_idx is None:
-                raise DeltaError(f"insert references unknown policy: {line!r}")
+        resolved = _resolve_insert(line, groups, lineno)
+        if resolved is not None:
+            moved_idx, sibling_idx, where = resolved
+            sibling_key = groups[sibling_idx][0]
             moved = groups.pop(moved_idx)
-            if sibling_idx > moved_idx:
-                sibling_idx -= 1
-            sibling_idx = next(
-                i for i, (k, _l) in enumerate(groups) if k.endswith(f"policy {sibling}")
-            )
+            sibling_idx = next(i for i, (k, _l) in enumerate(groups) if k == sibling_key)
             dest = sibling_idx if where == "before" else sibling_idx + 1
             groups.insert(dest, moved)
             index = {key: i for i, (key, _lines) in enumerate(groups)}
@@ -254,11 +377,11 @@ def apply_junos_set_delta(current_text: str, delta_lines: list[str]) -> str:
                 remainder = line[len(verb) + 1 :]
                 break
         else:
-            raise DeltaError(f"unrecognized delta line: {line!r}")
+            raise DeltaError(f"delta line {lineno}: unrecognized delta line")
 
         key = _policy_key_for_line(remainder)
         if key is None:
-            raise DeltaError(f"delta line does not target a security policy: {line!r}")
+            raise DeltaError(f"delta line {lineno}: does not target a security policy")
         is_whole_policy = remainder.strip() == key
 
         if verb == "set":
@@ -273,6 +396,13 @@ def apply_junos_set_delta(current_text: str, delta_lines: list[str]) -> str:
                 groups.pop(index[key])
                 index = {k: i for i, (k, _l) in enumerate(groups)}
             else:
+                tail = remainder[len(key) :].strip()
+                if tail in _VALUE_REQUIRED_CLAUSES:
+                    raise DeltaError(
+                        f"delta line {lineno}: sub-statement delete is missing its value "
+                        "(e.g. the address/application name) -- a prefix-style delete that "
+                        "removes every entry under a clause is not supported in v1"
+                    )
                 target = groups[index[key]][1]
                 prefix_plain = f"set {remainder}"
                 prefix_inactive = f"inactive: set {remainder}"
@@ -282,7 +412,12 @@ def apply_junos_set_delta(current_text: str, delta_lines: list[str]) -> str:
                 )
         elif verb in ("activate", "deactivate"):
             if key not in index:
-                raise DeltaError(f"{verb} references unknown policy: {line!r}")
+                raise DeltaError(f"delta line {lineno}: {verb} references unknown policy")
+            if not is_whole_policy:
+                raise DeltaError(
+                    f"delta line {lineno}: sub-statement {verb} is not supported in v1 -- "
+                    "only a whole policy can be activated/deactivated"
+                )
             target_idx = index[key]
             new_lines = []
             for existing in groups[target_idx][1]:

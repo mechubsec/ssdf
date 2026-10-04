@@ -65,9 +65,20 @@ def _rule(name, **overrides):
 
 def test_json_add_inserts_before_named_rule():
     rules = [_rule("A"), _rule("B")]
-    delta = parse_json_delta([{"op": "add", "rule": _rule("NEW"), "before": "B"}])
+    new_rule = _rule("NEW")
+    del new_rule["position"]  # assigned by list order ('before'/'after'), not caller input
+    delta = parse_json_delta([{"op": "add", "rule": new_rule, "before": "B"}])
     result = apply_delta(rules, delta)
     assert [r["rule_name"] for r in result] == ["A", "NEW", "B"]
+
+
+def test_json_add_rejects_caller_supplied_position():
+    """A new rule's position is derived from list order ('before'/'after'),
+    never from the caller's dict -- the caller-supplied value used to win
+    silently (defaulting to 0, evaluated first, regardless of 'before'), or
+    crash `int(None)` if the dict explicitly set it to None."""
+    with pytest.raises(DeltaError):
+        parse_json_delta([{"op": "add", "rule": _rule("NEW"), "before": "B"}])
 
 
 def test_json_delete_removes_rule():
@@ -248,3 +259,110 @@ def test_junos_set_delta_rejects_unrecognized_line():
 def test_junos_set_delta_rejects_insert_of_unknown_policy():
     with pytest.raises(DeltaError):
         apply_junos_set_delta(BASE_TEXT, ["insert GHOST before ALLOW-WEB"])
+
+
+def test_apply_junos_set_delta_error_never_contains_rejected_line_text():
+    """F5 regression: `apply_junos_text_delta`'s caller (the mcp-query
+    wrapper) records `str(exc)` in `ssdf.audit` verbatim, so a rejection
+    raised here must identify the bad line by position only."""
+    secret = "frobnicate pre-shared-key REDACTED-NOT-REAL"
+    with pytest.raises(DeltaError) as excinfo:
+        apply_junos_set_delta(BASE_TEXT, [secret])
+    assert secret not in str(excinfo.value)
+    assert "REDACTED-NOT-REAL" not in str(excinfo.value)
+    assert "line 1" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# F2: Junos `insert` ambiguity -- a bare policy name used in more than one
+# from-zone/to-zone context must be refused, never silently resolved to the
+# first match. The full Junos form resolves by the fully zone-qualified key
+# and so is never ambiguous.
+# ---------------------------------------------------------------------------
+
+_AMBIGUOUS_NAME_TEXT = """
+set security policies from-zone trust to-zone untrust policy X then permit
+set security policies from-zone trust to-zone untrust policy Y then permit
+set security policies from-zone dmz to-zone untrust policy X then deny
+""".strip()
+
+
+def test_junos_insert_short_form_ambiguous_name_is_rejected():
+    with pytest.raises(DeltaError):
+        apply_junos_set_delta(_AMBIGUOUS_NAME_TEXT, ["insert X before Y"])
+
+
+def test_junos_insert_full_form_disambiguates_by_zone_pair():
+    new_text = apply_junos_set_delta(
+        _AMBIGUOUS_NAME_TEXT,
+        ["insert security policies from-zone trust to-zone untrust policy X before policy Y"],
+    )
+    rules = parse_security_policies(new_text, "vsrx-ci", "2026-10-03T00:00:00")
+    trust_rules = sorted(
+        (r for r in rules if r["from_zone"] == ["trust"]), key=lambda r: r["position"]
+    )
+    assert [r["rule_name"] for r in trust_rules] == ["X", "Y"]
+    # The unrelated dmz->untrust policy also named X is untouched.
+    dmz_x = next(r for r in rules if r["from_zone"] == ["dmz"])
+    assert dmz_x["action"] == "deny"
+
+
+def test_junos_insert_full_form_global_policy():
+    text = """
+    set security policies global policy X then permit
+    set security policies global policy Y then permit
+    """.strip()
+    new_text = apply_junos_set_delta(
+        text, ["insert security policies global policy Y before policy X"]
+    )
+    rules = parse_security_policies(new_text, "vsrx-ci", "2026-10-03T00:00:00")
+    by_position = sorted(rules, key=lambda r: r["position"])
+    assert [r["rule_name"] for r in by_position] == ["Y", "X"]
+
+
+# ---------------------------------------------------------------------------
+# F3: sub-statement activate/deactivate and prefix-style sub-statement delete
+# must be refused, not silently mis-applied to the whole policy / silently
+# dropped as a no-op.
+# ---------------------------------------------------------------------------
+
+
+def test_junos_deactivate_sub_statement_is_rejected():
+    """Deactivating one clause of a policy is not the same as deactivating
+    the whole policy -- Junos narrows the match, this code must not pretend
+    the whole rule went inactive."""
+    with pytest.raises(DeltaError):
+        apply_junos_set_delta(
+            BASE_TEXT,
+            [
+                "deactivate security policies from-zone trust to-zone untrust policy "
+                "ALLOW-WEB match application junos-http"
+            ],
+        )
+
+
+def test_junos_activate_sub_statement_is_rejected():
+    with pytest.raises(DeltaError):
+        apply_junos_set_delta(
+            BASE_TEXT,
+            [
+                "activate security policies from-zone trust to-zone untrust policy "
+                "ALLOW-WEB match application junos-http"
+            ],
+        )
+
+
+def test_junos_delete_prefix_style_sub_statement_with_no_value_is_rejected():
+    """`delete ... policy X match source-address` with no trailing value is a
+    truncated paste of a Junos hierarchical delete, not a request to remove
+    one specific address entry. Silently matching nothing (the old
+    behaviour) reads as "nothing to delete" when the real problem is an
+    incomplete delta line."""
+    with pytest.raises(DeltaError):
+        apply_junos_set_delta(
+            BASE_TEXT,
+            [
+                "delete security policies from-zone trust to-zone untrust policy "
+                "ALLOW-WEB match source-address"
+            ],
+        )

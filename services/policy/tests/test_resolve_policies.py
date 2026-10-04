@@ -62,3 +62,15 @@ def test_idempotent_ids_across_runs():
 def test_no_asset_entities_emitted():
     entities, _ = resolve_policies([_rule("panosvm", "allow-web")], "t_main")
     assert not any(e["kind"] == ASSET for e in entities)
+
+
+def test_is_global_is_persisted_on_the_policy_entity():
+    """MEC-1765 F6: change_impact reads `is_global` back from the entity
+    rather than re-deriving it from `from_zone`, so the collector's own
+    classification must survive the round-trip through resolve_policies."""
+    global_rule = {**_rule("vsrx-ci", "GLOBAL-RULE", provider="juniper"), "is_global": True}
+    zonepair_rule = {**_rule("vsrx-ci", "ZONEPAIR-RULE", provider="juniper"), "is_global": False}
+    entities, _ = resolve_policies([global_rule, zonepair_rule], "t_main")
+    attrs_by_name = {e["name"]: e["attrs"] for e in entities if e["kind"] == POLICY}
+    assert attrs_by_name["GLOBAL-RULE"]["is_global"] == "true"
+    assert attrs_by_name["ZONEPAIR-RULE"]["is_global"] == "false"
