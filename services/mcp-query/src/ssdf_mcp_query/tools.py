@@ -11,8 +11,17 @@ from typing import Any
 from .builders import build_query_flows, build_top_talkers, BuilderError, MAX_LIMIT
 from .sql_guard import guard_sql, GuardError
 from .timeparse import TimeParseError
+from .untrusted_text import UntrustedText
 
 logger = logging.getLogger("ssdf_mcp_query.tools")
+
+# FLOW_COLUMNS fields that carry attacker-reachable free text: both are written
+# from unauthenticated syslog ingest (see docs/security/2026-06-10-vulnerability-
+# review.md H1) and, unlike event_action/event_outcome/event_provider/
+# network_transport/zones (fixed, normalizer-controlled vocabularies), can hold
+# arbitrary text. Everything else in FLOW_COLUMNS is numeric/IP/port/timestamp or
+# one of those bounded-vocabulary fields, so it is returned as-is.
+_FLOW_UNTRUSTED_COLUMNS = ("rule_name", "user_name")
 
 
 def _ok(result: dict, requested_limit: int) -> dict:
@@ -24,6 +33,15 @@ def _ok(result: dict, requested_limit: int) -> dict:
         "truncated": result["row_count"] >= requested_limit,
         "elapsed_ms": result.pop("_elapsed_ms", 0),
     }
+
+
+def _wrap_untrusted_columns(rows: list[dict], columns: tuple[str, ...]) -> list[dict]:
+    """Replace known log-echoed free-text columns in-place with UntrustedText responses."""
+    for row in rows:
+        for col in columns:
+            if col in row:
+                row[col] = UntrustedText.from_raw(row[col]).to_response()
+    return rows
 
 
 class Tools:
@@ -67,7 +85,10 @@ class Tools:
             )
         except (BuilderError, TimeParseError, ValueError) as exc:
             return {"error": "validation", "detail": str(exc)}
-        return self._safe_execute(sql, params, min(int(limit), self._max_rows))
+        result = self._safe_execute(sql, params, min(int(limit), self._max_rows))
+        if "rows" in result:
+            _wrap_untrusted_columns(result["rows"], _FLOW_UNTRUSTED_COLUMNS)
+        return result
 
     def top_talkers(self, by="bytes", side="src", since=None, until=None, limit=10) -> dict:
         try:
@@ -109,6 +130,18 @@ class Tools:
             return {"error": "upstream", "detail": "query failed", "correlation_id": cid}
 
     def run_sql(self, query: str) -> dict:
+        """Run an operator-authored, read-only SQL query (guarded by sql_guard).
+
+        Contract: unlike the purpose-built tools above, the row shape here is
+        whatever columns the caller's own SELECT names, so there is no fixed
+        allowlist of free-text columns to wrap. Rows are returned RAW -- every
+        string-typed cell must be treated by the caller as untrusted,
+        log-derived free text (same threat model as UntrustedText) unless the
+        caller's own query is known to select only structural/numeric columns.
+        This tool is for operators composing their own SQL, a different trust
+        tier from the fixed-shape tools, so unsanitized-raw is the documented
+        contract rather than an oversight.
+        """
         try:
             safe_sql = guard_sql(query, max_limit=self._max_rows)
         except GuardError as exc:

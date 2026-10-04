@@ -81,6 +81,12 @@ class RuleTools:
     def rule_history(self, device_name: str, rule_name: str, limit: int = 50) -> dict:
         sql, params = build_rule_history_sql(device_name, rule_name, limit=limit)
         result = self._ch.run(sql, params)
+        # `versions` rows come from ssdf.policy_versions (valid_from,
+        # content_hash, action, from_zone, to_zone, enabled, position) -- a
+        # device config-history snapshot collected via NETCONF get-config, the
+        # same provenance as the `config`/`configured_controls` fields in
+        # access_tools.py. Not log-ingest output, so none of it is untrusted
+        # free text in the UntrustedText sense.
         return {
             "device_name": device_name,
             "rule_name": rule_name,
@@ -213,6 +219,10 @@ class RuleTools:
         # code decides, the model explains, and this tool's job stops at citing
         # the data a downstream model would explain.
         status = verdict["status"] if verdict else "unknown"
+        # attrs (action/enabled/from_zone/to_zone/position) come from
+        # configured_policies_for_firewalls -- NETCONF-pulled device config,
+        # not log-ingest output -- so `summary` and `config` below cite
+        # operator-authored text, not untrusted free text.
         summary = (
             f"{rule_name} on {device_name}: action={attrs.get('action', '')}, "
             f"enabled={attrs.get('enabled', '')}, "
