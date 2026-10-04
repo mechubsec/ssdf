@@ -166,6 +166,117 @@ def test_reorder_with_unrelated_enabled_insert_is_not_config_only():
 
 
 # ---------------------------------------------------------------------------
+# MEC-1650 R1 repro: a rule that is both modified AND reordered must not ride
+# the reorder branch's pairwise check -- that check only proves equivalence
+# for a pure position swap of otherwise-unchanged rules.
+# ---------------------------------------------------------------------------
+
+
+def test_reorder_with_unrelated_enabled_insert_is_not_config_only_modified_in_pair():
+    text_before = """
+    set security policies from-zone trust to-zone untrust policy A match source-address any
+    set security policies from-zone trust to-zone untrust policy A match destination-address any
+    set security policies from-zone trust to-zone untrust policy A match application any
+    set security policies from-zone trust to-zone untrust policy A then permit
+    set security policies from-zone trust to-zone untrust policy B match source-address any
+    set security policies from-zone trust to-zone untrust policy B match destination-address any
+    set security policies from-zone trust to-zone untrust policy B match application any
+    set security policies from-zone trust to-zone untrust policy B then deny
+    """
+    # B and A swap order AND A's own action changes (permit -> deny). Before
+    # the R1 fix, A was in `reordered_names` (it took part in the swap) so it
+    # was excluded from the "must be disabled in both" check entirely, and
+    # the pairwise check only compared actions *within P'*, never noticing
+    # that A used to be the rule that let this traffic through.
+    text_after = """
+    set security policies from-zone trust to-zone untrust policy B match source-address any
+    set security policies from-zone trust to-zone untrust policy B match destination-address any
+    set security policies from-zone trust to-zone untrust policy B match application any
+    set security policies from-zone trust to-zone untrust policy B then deny
+    set security policies from-zone trust to-zone untrust policy A match source-address any
+    set security policies from-zone trust to-zone untrust policy A match destination-address any
+    set security policies from-zone trust to-zone untrust policy A match application any
+    set security policies from-zone trust to-zone untrust policy A then deny
+    """
+    candidates = [_candidate(sessions=500, logged_rules=["A"])]
+    report = evaluate_change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        p_rules=_junos_rules(text_before),
+        pprime_rules=_junos_rules(text_after),
+        object_book=EMPTY_BOOK,
+        candidates=candidates,
+        window_since="2026-09-20T00:00:00",
+        window_until="2026-10-03T00:00:00",
+        delta_payload={"kind": "r1-modified-and-reordered"},
+    )
+    by_name = {s["rule_name"]: s for s in report["changed_rules"]}
+    assert set(by_name) == {"A", "B"}
+    for section in by_name.values():
+        assert section.get("result") != CONFIG_ONLY_NO_IMPACT, (
+            "a rule that is both modified and reordered must force full "
+            "candidate evaluation, never ride its own reorder"
+        )
+    # A used to permit this traffic; now B (deny, any/any/any) matches first.
+    assert "verdict_change_breaks" in by_name["A"]["classes"]
+    assert by_name["A"]["classes"]["verdict_change_breaks"]["sessions"] == 500
+    _assert_honesty_contract(report)
+
+
+# ---------------------------------------------------------------------------
+# MEC-1650 R2 repro: the same rule name in two different zone-pair contexts
+# must never be treated as one rule by the config-only pre-check or the
+# report's per-rule bucketing.
+# ---------------------------------------------------------------------------
+
+
+def test_same_rule_name_in_two_contexts_is_not_config_only_or_merged():
+    text_before = """
+    set security policies from-zone trust to-zone untrust policy A match source-address any
+    set security policies from-zone trust to-zone untrust policy A match destination-address any
+    set security policies from-zone trust to-zone untrust policy A match application any
+    set security policies from-zone trust to-zone untrust policy A then permit
+    inactive: set security policies from-zone dmz to-zone untrust policy X match source-address any
+    inactive: set security policies from-zone dmz to-zone untrust policy X match destination-address any
+    inactive: set security policies from-zone dmz to-zone untrust policy X match application any
+    inactive: set security policies from-zone dmz to-zone untrust policy X then deny
+    """
+    # A new, enabled policy also named X is added to trust->untrust. A
+    # bare-name lookup (MEC-1650 R2) lands on the long-inactive dmz->untrust
+    # X instead, so the pre-check (and, separately, per-rule report
+    # bucketing) would answer about the wrong rule entirely.
+    text_after = (
+        text_before
+        + """
+    set security policies from-zone trust to-zone untrust policy X match source-address any
+    set security policies from-zone trust to-zone untrust policy X match destination-address any
+    set security policies from-zone trust to-zone untrust policy X match application any
+    set security policies from-zone trust to-zone untrust policy X then deny
+    """
+    )
+    candidates = [_candidate(sessions=500, logged_rules=["X"])]
+    report = evaluate_change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        p_rules=_junos_rules(text_before),
+        pprime_rules=_junos_rules(text_after),
+        object_book=EMPTY_BOOK,
+        candidates=candidates,
+        window_since="2026-09-20T00:00:00",
+        window_until="2026-10-03T00:00:00",
+        delta_payload={"kind": "r2-ambiguous-name"},
+    )
+    by_name = {s["rule_name"]: s for s in report["changed_rules"]}
+    assert set(by_name) == {"X"}
+    assert by_name["X"]["result"] != CONFIG_ONLY_NO_IMPACT
+    # Must refuse to attribute traffic to either same-named rule rather than
+    # silently merging them, and must not guess a session count either way.
+    assert by_name["X"].get("classes") is None
+    assert "unknown" in by_name["X"]["result"]
+    _assert_honesty_contract(report)
+
+
+# ---------------------------------------------------------------------------
 # Golden case 2: editing a rule that stays disabled, no impact
 # ---------------------------------------------------------------------------
 

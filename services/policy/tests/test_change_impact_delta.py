@@ -173,6 +173,20 @@ def test_apply_junos_text_delta_rejects_full_config_dump():
         apply_junos_text_delta(tainted, [], "vsrx-ci", "2026-10-03T00:00:00")
 
 
+def test_validate_security_policies_only_error_never_contains_rejected_line_text():
+    """MEC-1650 R3: the refusal used to copy the offending line verbatim into
+    `str(exc)`, which the mcp-query wrapper then records in `ssdf.audit`
+    unredacted. A caller who pastes a filtered `| match ike` paste or a full
+    config dump puts a PSK or community string directly in the audit table.
+    The error must identify the line by position only."""
+    secret = "set security ike policy P pre-shared-key ascii-text REDACTED-NOT-REAL"
+    tainted = BASE_TEXT + "\n" + secret
+    with pytest.raises(DeltaError) as excinfo:
+        validate_security_policies_only(tainted)
+    assert secret not in str(excinfo.value)
+    assert "REDACTED-NOT-REAL" not in str(excinfo.value)
+
+
 def test_junos_delete_one_clause_leaves_the_rest():
     new_text = apply_junos_set_delta(
         BASE_TEXT,

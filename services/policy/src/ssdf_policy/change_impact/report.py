@@ -24,6 +24,10 @@ TOP_N_DEFAULT = 10
 
 NO_SESSIONS_OBSERVED = "no historical sessions observed in the analysable scope"
 CONFIG_ONLY_NO_IMPACT = "provably no impact (config-only)"
+AMBIGUOUS_RULE_NAME = (
+    "unknown: rule name is not unique across contexts in P/P'; cannot attribute "
+    "candidate traffic to a single rule by name alone"
+)
 
 
 def content_hash(payload: Any) -> str:
@@ -85,9 +89,16 @@ def build_rule_section(
     config_only: bool = False,
     top_n: int = TOP_N_DEFAULT,
     truncated_at: int | None = None,
+    ambiguous: bool = False,
 ) -> dict:
     if config_only:
         return {"rule_name": rule_name, "result": CONFIG_ONLY_NO_IMPACT}
+    if ambiguous:
+        # MEC-1650 R2: this bare name resolves to more than one rule across
+        # P/P' contexts. `_rule_relevant` below matches by bare name, so
+        # bucketing `evaluated` here would silently merge two unrelated
+        # rules' traffic. Refuse rather than attribute it to either.
+        return {"rule_name": rule_name, "result": AMBIGUOUS_RULE_NAME}
     relevant = [item for item in evaluated if _rule_relevant(rule_name, item)]
     if not relevant:
         if truncated_at is not None:

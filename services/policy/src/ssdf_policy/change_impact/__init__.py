@@ -35,6 +35,7 @@ from .evaluator import (
 from .calibration import CalibrationResult, apply_calibration_gate, calibration_gate
 from .pipeline import evaluate_change_impact
 from .report import (
+    AMBIGUOUS_RULE_NAME,
     CONFIG_ONLY_NO_IMPACT,
     NO_SESSIONS_OBSERVED,
     build_calibration_section,
@@ -83,4 +84,5 @@ __all__ = [
     "content_hash",
     "CONFIG_ONLY_NO_IMPACT",
     "NO_SESSIONS_OBSERVED",
+    "AMBIGUOUS_RULE_NAME",
 ]

@@ -308,15 +308,22 @@ def validate_security_policies_only(text: str) -> None:
     reaches the evaluator or the audit trail, rather than silently dropping
     the unrecognized lines the way `_group_lines` does internally.
     """
-    for raw in text.splitlines():
+    for lineno, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
         if not line:
             continue
         body = line[len("inactive:") :].strip() if line.startswith("inactive:") else line
         if not body.startswith("set ") or _policy_key_for_line(body[len("set ") :]) is None:
+            # MEC-1650 R3: never put the line's own text in the error. This
+            # text ends up verbatim in the ssdf.audit error column (see
+            # services/mcp-query wrapper.py), and `current_text` is meant to
+            # be scoped to `security policies | display set`; a caller who
+            # pastes a broader config dump by mistake has secrets on
+            # unrelated lines (IKE PSKs, SNMP communities). Position only.
             raise DeltaError(
                 "junos_current_text must contain only 'security policies' set/inactive-set "
-                f"lines (from 'show configuration security policies | display set'): {line!r}"
+                f"lines (from 'show configuration security policies | display set'): "
+                f"line {lineno} is not a 'security policies' statement"
             )
 
 

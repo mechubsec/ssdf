@@ -54,6 +54,8 @@ def evaluate_change_impact(
         p_by_name,
         pprime_by_name,
         reordered_pairs=diff_result.reordered_pairs,
+        content_changed_names=diff_result.added | diff_result.deleted | diff_result.modified,
+        ambiguous_names=diff_result.ambiguous_names,
     )
 
     rule_sections = []
@@ -93,7 +95,12 @@ def evaluate_change_impact(
 
     for name in sorted(diff_result.changed_rule_names):
         rule_sections.append(
-            build_rule_section(name, evaluated, truncated_at=truncated_at if truncated else None)
+            build_rule_section(
+                name,
+                evaluated,
+                truncated_at=truncated_at if truncated else None,
+                ambiguous=name in diff_result.ambiguous_names,
+            )
         )
 
     deny_side_blindness = build_deny_side_blindness(evaluated, deny_logging_observed or {})

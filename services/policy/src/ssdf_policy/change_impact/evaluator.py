@@ -172,6 +172,8 @@ def config_only_precheck(
     p_by_name: dict[str, CompiledRule],
     pprime_by_name: dict[str, CompiledRule],
     reordered_pairs: list[tuple[str, str]] | None = None,
+    content_changed_names: set[str] | None = None,
+    ambiguous_names: set[str] | None = None,
 ) -> str | None:
     """Return the doc §1.4 "provably no impact (config-only)" wording if either
     config-only condition holds, else None (meaning: must evaluate candidates
@@ -183,18 +185,45 @@ def config_only_precheck(
     reorder (MEC-1644 F1): every name in `changed_rule_names` that isn't part
     of a `reordered_pairs` entry must be disabled in both P and P' before the
     reorder branch is even considered.
+
+    `content_changed_names` (added | deleted | modified, MEC-1650 R1) must be
+    disabled in both P and P' unconditionally, even when the same name is
+    *also* part of a `reordered_pairs` entry: a rule that both changed content
+    and swapped position is not a benign reorder, and the pairwise
+    same-action/disjoint check below only proves equivalence for a pure
+    position swap of otherwise-unchanged rules.
+
+    `ambiguous_names` (MEC-1650 R2) are names that resolve to more than one
+    `(context, name)` rule across P/P'; `p_by_name`/`pprime_by_name` can only
+    ever hold one rule per bare name, so a config-only verdict for an
+    ambiguous name would be answering about the wrong rule. Fail closed.
     """
     if not changed_rule_names:
         return None
 
-    reordered_pairs = reordered_pairs or []
-    reordered_names = {name for pair in reordered_pairs for name in pair}
-
-    non_reorder_names = changed_rule_names - reordered_names
-    if not all(_disabled_in_both(name, p_by_name, pprime_by_name) for name in non_reorder_names):
+    ambiguous_names = ambiguous_names or set()
+    if changed_rule_names & ambiguous_names:
         return None
 
-    for name_a, name_b in reordered_pairs:
+    content_changed_names = (
+        content_changed_names if content_changed_names is not None else changed_rule_names
+    )
+    if not all(
+        _disabled_in_both(name, p_by_name, pprime_by_name) for name in content_changed_names
+    ):
+        return None
+
+    reordered_pairs = reordered_pairs or []
+    pure_reorder_pairs = [
+        (name_a, name_b)
+        for name_a, name_b in reordered_pairs
+        if name_a not in content_changed_names and name_b not in content_changed_names
+    ]
+
+    accounted_names = set(content_changed_names)
+    for name_a, name_b in pure_reorder_pairs:
+        accounted_names.add(name_a)
+        accounted_names.add(name_b)
         rule_a = pprime_by_name.get(name_a) or p_by_name.get(name_a)
         rule_b = pprime_by_name.get(name_b) or p_by_name.get(name_b)
         if rule_a is None or rule_b is None:
@@ -202,6 +231,11 @@ def config_only_precheck(
         same_action = rule_a.action == rule_b.action
         if not (same_action or _match_sets_disjoint(rule_a, rule_b)):
             return None
+
+    if changed_rule_names - accounted_names:
+        # Defence in depth: every changed name must be accounted for by
+        # either the content-changed check above or a pure reorder pair.
+        return None
 
     return "provably no impact (config-only)"
 

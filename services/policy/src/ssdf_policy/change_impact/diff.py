@@ -25,6 +25,11 @@ class DiffResult:
     added: set[str] = field(default_factory=set)
     deleted: set[str] = field(default_factory=set)
     modified: set[str] = field(default_factory=set)
+    # Names that identify more than one distinct `(context, name)` rule across
+    # P and P' combined (MEC-1650 R2): Junos policy names are unique only per
+    # context, so a bare-name lookup against these is answering about the
+    # wrong rule. The config-only pre-check must fail closed on these.
+    ambiguous_names: set[str] = field(default_factory=set)
 
 
 def _content_equal(a: dict, b: dict) -> bool:
@@ -65,10 +70,16 @@ def diff_rulebases(p_rules: list[CompiledRule], pprime_rules: list[CompiledRule]
                     changed_names.add(name_a)
                     changed_names.add(name_b)
 
+    contexts_by_name: dict[str, set] = {}
+    for key in set(p_by_key) | set(pprime_by_key):
+        contexts_by_name.setdefault(key[1], set()).add(key[0])
+    ambiguous_names = {name for name, contexts in contexts_by_name.items() if len(contexts) > 1}
+
     return DiffResult(
         changed_rule_names=changed_names,
         reordered_pairs=reordered_pairs,
         added=added,
         deleted=deleted,
         modified=modified,
+        ambiguous_names=ambiguous_names,
     )

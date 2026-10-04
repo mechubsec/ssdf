@@ -69,6 +69,34 @@ def test_change_impact_junos_current_text_is_hashed_not_stored_in_audit():
     }
 
 
+def test_change_impact_refusal_error_never_contains_rejected_line_text():
+    """MEC-1650 R3: `validate_security_policies_only`'s refusal used to copy
+    the offending line verbatim into `DeltaError`'s message, and this wrapper
+    records `error=f"{type(exc).__name__}: {exc}"` in `ssdf.audit`
+    unconditionally (M16f) -- even on the deny/refusal path, not just the
+    happy path F4 already covers. A secret-bearing line in `current_text`
+    must never reach the audit table via the error column either."""
+    from ssdf_policy.change_impact import DeltaError, validate_security_policies_only
+
+    rec = _Recorder()
+    secret = "set security ike policy P pre-shared-key ascii-text REDACTED-NOT-REAL"
+    tainted_text = (
+        "set security policies from-zone trust to-zone untrust policy X then deny\n" + secret
+    )
+
+    def fn(junos_current_text=None, delta=None):
+        validate_security_policies_only(junos_current_text)
+        return {"changed_rules": []}
+
+    wrapped = audited_tool("change_impact", fn, rec, caller=lambda: ("p", None))
+    with pytest.raises(DeltaError):
+        wrapped(junos_current_text=tainted_text, delta={"lines": []})
+
+    audited_error = rec.calls[0]["error"]
+    assert secret not in audited_error
+    assert "REDACTED-NOT-REAL" not in audited_error
+
+
 def test_redaction_leaves_other_tools_args_untouched():
     rec = _Recorder()
 
