@@ -20,13 +20,23 @@ Environment=CH_NATIVE_PORT=9000
 Environment=CH_USER=default
 # Password file is root-owned 0600; LoadCredential exposes it read-only to
 # the dynamic service user under $CREDENTIALS_DIRECTORY instead of requiring
-# a group-readable secret on disk.
+# a group-readable secret on disk. Credentials loaded this way are available
+# to ExecStartPre= as well as ExecStart=, not just the main process.
 LoadCredential=ch-password:/etc/ssdf/ch-migrate-password
+# Per-migration secrets (the *_PW / VIEW_PSEUDONYM_KEY_* variables the SQL
+# files reference, see infra/clickhouse/README.md). Root-owned 0600, read by
+# PID 1 before DynamicUser= drops privileges, so this works without a
+# group-readable secret on disk.
+EnvironmentFile=/etc/ssdf/migrate-secrets.env
 # Bounded readiness wait (~60s). The old single-host unit's wait loop had no
-# bound and hung until TimeoutStartSec with no diagnostic.
+# bound and hung until TimeoutStartSec with no diagnostic. Authenticated: a
+# deployment that requires a password for CH_USER (the same requirement as
+# the admin user the runner itself connects as) would otherwise fail every
+# probe and never start.
 ExecStartPre=/bin/sh -c "\
+  CH_PASSWORD=\"$(cat \"${CREDENTIALS_DIRECTORY}/ch-password\" 2>/dev/null || true)\"; \
   tries=0; \
-  until clickhouse-client --host \"$CH_HOST\" --port \"$CH_NATIVE_PORT\" --query 'SELECT 1' >/dev/null 2>&1; do \
+  until CLICKHOUSE_PASSWORD=\"$CH_PASSWORD\" clickhouse-client --host \"$CH_HOST\" --port \"$CH_NATIVE_PORT\" --user \"$CH_USER\" --query 'SELECT 1' >/dev/null 2>&1; do \
     tries=$((tries + 1)); \
     if [ \"$tries\" -ge 60 ]; then echo 'clickhouse-client not reachable after 60s' >&2; exit 1; fi; \
     sleep 1; \

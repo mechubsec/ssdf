@@ -38,7 +38,19 @@ Migrations that create `CREATE USER ... BY '${VAR}'` service accounts (003,
 005, 007, 008, 009, 011, 013, 015, 018, 019, 022-025) need the matching
 `*_PW` environment variable set; the runner substitutes `${VAR}` /
 `${VAR:-default}` placeholders itself and refuses to run if a required
-variable is unset or empty.
+variable is unset or empty. The full set of required variables (every
+placeholder with no `:-default` across `infra/clickhouse/*.sql`) is:
+
+```
+ARCHIVER_PW, AUDIT_EXPORT_PW, AUDIT_PW, AUDIT_VERIFY_PW, CHECKPOINT_PW,
+DEFINER_PW, ENTITY_MAINT_PW, ENTITY_PW, FLOWTUPLES_PW, HEALTH_PW,
+OCSF_DEFINER_PW, PUBLIC_PW, PUBMETRICS_PW, RO_PW, RULEUSAGE_PW, TOPO_PW,
+VIEW_PSEUDONYM_KEY_HI, VIEW_PSEUDONYM_KEY_LO
+```
+
+(`HEALTH_TTL_DAYS` has a default of 30 and is optional.)
+`services/mcp-query/tests/test_run_migrations.py::test_readme_lists_every_required_placeholder`
+fails if a new migration adds a placeholder without a matching README entry.
 
 ## systemd
 
@@ -63,6 +75,32 @@ sudo cp services/mcp-query/infra/ssdf-mcp-query.service /etc/systemd/system/
 # from an env file or argv.
 sudo mkdir -p /etc/ssdf
 sudo install -m 0600 /dev/stdin /etc/ssdf/ch-migrate-password <<< "<your-password>"
+
+# Per-migration secrets: every *_PW / VIEW_PSEUDONYM_KEY_* variable listed
+# above, root-owned 0600. ssdf-migrate.service loads this via
+# EnvironmentFile= before DynamicUser= drops privileges. Without it, a fresh
+# install applies 001-002 and then aborts on the first migration that needs
+# a service-account password (fail closed, by design).
+sudo install -m 0600 /dev/stdin /etc/ssdf/migrate-secrets.env <<'EOF'
+RO_PW=<password>
+TOPO_PW=<password>
+ENTITY_PW=<password>
+ENTITY_MAINT_PW=<password>
+AUDIT_PW=<password>
+AUDIT_VERIFY_PW=<password>
+AUDIT_EXPORT_PW=<password>
+PUBLIC_PW=<password>
+HEALTH_PW=<password>
+PUBMETRICS_PW=<password>
+RULEUSAGE_PW=<password>
+DEFINER_PW=<password>
+CHECKPOINT_PW=<password>
+ARCHIVER_PW=<password>
+OCSF_DEFINER_PW=<password>
+FLOWTUPLES_PW=<password>
+VIEW_PSEUDONYM_KEY_HI=<password>
+VIEW_PSEUDONYM_KEY_LO=<password>
+EOF
 
 # Configure MCP query secrets (see services/mcp-query/infra/ssdf-mcp-query.service)
 sudo tee /etc/ssdf-mcp/secrets.env <<EOF

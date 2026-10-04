@@ -214,6 +214,26 @@ def test_ensure_tracking_table_keys_on_migration_file(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_readme_lists_every_required_placeholder():
+    """MEC-1672 re-review finding B: the systemd profile's EnvironmentFile=
+    must supply every *_PW / VIEW_PSEUDONYM_KEY_* variable the migrations
+    reference, and the README documents that list by name. A new migration
+    that adds a placeholder with no default must fail this test rather than
+    silently breaking a fresh systemd install at the first unset variable."""
+    sql_dir = Path(__file__).resolve().parents[3] / "infra" / "clickhouse"
+    readme = (sql_dir / "README.md").read_text()
+
+    required: set[str] = set()
+    for sql_file in sql_dir.glob("*.sql"):
+        for match in run_migrations._PLACEHOLDER_RE.finditer(sql_file.read_text()):
+            if match.group(2) is None:  # no ${VAR:-default} fallback
+                required.add(match.group(1))
+
+    assert required, "expected at least one required placeholder across infra/clickhouse/*.sql"
+    missing = {name for name in required if name not in readme}
+    assert not missing, f"infra/clickhouse/README.md does not document: {sorted(missing)}"
+
+
 def test_mark_baseline_only_records_migrations_at_or_below_baseline(tmp_path, monkeypatch):
     recorded = []
 
