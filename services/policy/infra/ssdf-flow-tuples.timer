@@ -1,0 +1,12 @@
+# services/policy/infra/ssdf-flow-tuples.timer
+[Unit]
+Description=Run SSDF MEC-1639 flow-tuples rollup daily
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1d
+AccuracySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
