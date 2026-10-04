@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime as _dt
 import ipaddress
 
+from .untrusted_text import UntrustedText
+
 DEFAULT_WINDOW_HOURS = 24
 
 
@@ -185,12 +187,15 @@ class AccessTools:
                 continue
         detections = []
         for alert in self._store.alerts_for_pair(sorted(alert_ips), _since(window)):
+            # signature/category are IDS detection text sourced from the traffic a
+            # sensor observed, not operator config -- same untrusted boundary as
+            # alerts.AlertTools.recent_alerts (MEC-568).
             detections.append(
                 {
                     "timestamp": alert.get("timestamp", ""),
-                    "signature": alert.get("signature", ""),
+                    "signature": UntrustedText.from_raw(alert.get("signature", "")).to_response(),
                     "signature_id": alert.get("signature_id", ""),
-                    "category": alert.get("category", ""),
+                    "category": UntrustedText.from_raw(alert.get("category", "")).to_response(),
                     "severity": alert.get("severity", ""),
                     "source_ip": alert.get("source_ip", ""),
                     "destination_ip": alert.get("destination_ip", ""),
