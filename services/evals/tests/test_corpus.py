@@ -142,6 +142,78 @@ def test_no_injection_accepted(tmp_path):
     assert questions[0].predicate["forbidden_substrings"] == ["CANARY"]
 
 
+def test_no_injection_correctness_expected_json_accepted(tmp_path):
+    good = make_question(
+        predicate={
+            "type": "no_injection",
+            "forbidden_substrings": ["CANARY"],
+            "correctness": {"type": "expected_json", "expected": {"severity": "high"}},
+        }
+    )
+    questions = load_corpus(write_corpus(tmp_path, [good]))
+    assert questions[0].predicate["correctness"]["expected"] == {"severity": "high"}
+
+
+def test_no_injection_correctness_reference_sql_accepted(tmp_path):
+    good = make_question(
+        predicate={
+            "type": "no_injection",
+            "forbidden_substrings": ["CANARY"],
+            "correctness": {
+                "type": "reference_sql",
+                "sql": "SELECT severity FROM ssdf.events WHERE event_id = 'x'",
+                "match": "exact",
+                "answer_key": "severity",
+            },
+        }
+    )
+    questions = load_corpus(write_corpus(tmp_path, [good]))
+    assert questions[0].predicate["correctness"]["match"] == "exact"
+
+
+def test_no_injection_correctness_must_be_dict(tmp_path):
+    bad = make_question(
+        predicate={
+            "type": "no_injection",
+            "forbidden_substrings": ["CANARY"],
+            "correctness": "not a dict",
+        }
+    )
+    with pytest.raises(CorpusError):
+        load_corpus(write_corpus(tmp_path, [bad]))
+
+
+def test_no_injection_correctness_rejects_refusal_type(tmp_path):
+    """correctness must itself be reference_sql/expected_json -- no_injection or
+    refusal there would be recursive/meaningless."""
+    bad = make_question(
+        predicate={
+            "type": "no_injection",
+            "forbidden_substrings": ["CANARY"],
+            "correctness": {"type": "refusal"},
+        }
+    )
+    with pytest.raises(CorpusError):
+        load_corpus(write_corpus(tmp_path, [bad]))
+
+
+def test_no_injection_correctness_reference_sql_must_be_select(tmp_path):
+    bad = make_question(
+        predicate={
+            "type": "no_injection",
+            "forbidden_substrings": ["CANARY"],
+            "correctness": {
+                "type": "reference_sql",
+                "sql": "DELETE FROM ssdf.events",
+                "match": "exact",
+                "answer_key": "severity",
+            },
+        }
+    )
+    with pytest.raises(CorpusError):
+        load_corpus(write_corpus(tmp_path, [bad]))
+
+
 def test_numeric_tolerance_with_both_params_rejected(tmp_path):
     bad = make_question(
         predicate={
