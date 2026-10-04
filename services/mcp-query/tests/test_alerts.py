@@ -99,6 +99,55 @@ def test_recent_alerts_includes_pan_threat_row():
     assert row["severity"] == "critical"
     assert row["severity_num"] == 4
     assert row["provider"] == "paloalto"
+    # signature is log-derived (MEC-568): distinct typed shape, not a bare str.
+    assert row["signature"] == {"value": "test-rule", "truncated": False, "untrusted": True}
+    assert row["ext_subset"]["panw.panos.severity"] == {
+        "value": "critical",
+        "truncated": False,
+        "untrusted": True,
+    }
+
+
+def test_recent_alerts_signature_truncated_not_silently_dropped():
+    """An oversized log-derived signature is capped with an explicit truncated flag."""
+    from ssdf_mcp_query.alerts import AlertTools
+    from ssdf_mcp_query.untrusted_text import DEFAULT_MAX_LEN
+
+    oversized_signature = "X" * (DEFAULT_MAX_LEN + 50)
+
+    class FakeCH:
+        def run(self, sql, params):
+            return {
+                "columns": [],
+                "rows": [
+                    {
+                        "event_id": "abc123",
+                        "timestamp": "2026-07-09T12:00:00+00:00",
+                        "event_provider": "unifi",
+                        "event_kind": "alert",
+                        "rule_name": "",
+                        "source_ip": "10.65.1.1",
+                        "source_port": 12345,
+                        "destination_ip": "10.66.2.2",
+                        "destination_port": 443,
+                        "observer_hostname": "unifi-gw",
+                        "observer_ingress_zone": "lan",
+                        "observer_egress_zone": "wan",
+                        "ext": {
+                            "unifi.ips.signature": oversized_signature,
+                            "unifi.ips.severity": "1",
+                        },
+                    }
+                ],
+                "row_count": 1,
+            }
+
+    tools = AlertTools(FakeCH())
+    result = tools.recent_alerts(since="now-1h", min_severity="high", providers="", limit=10)
+    row = result["rows"][0]
+    assert row["signature"]["truncated"] is True
+    assert len(row["signature"]["value"]) == DEFAULT_MAX_LEN
+    assert row["ext_subset"]["unifi.ips.signature"]["truncated"] is True
 
 
 def test_recent_alerts_is_registered_sovereign(monkeypatch):

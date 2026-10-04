@@ -55,9 +55,9 @@ SOVEREIGN_TOOLS = PUBLIC_TOOLS | frozenset(
 )
 
 TIERS = ("sovereign", "public", "both")
-CATEGORIES = ("reachability", "flows", "topology", "change", "honesty")
+CATEGORIES = ("reachability", "flows", "topology", "change", "honesty", "injection")
 DIFFICULTIES = ("easy", "medium", "hard")
-PREDICATE_TYPES = ("reference_sql", "expected_json", "refusal")
+PREDICATE_TYPES = ("reference_sql", "expected_json", "refusal", "no_injection")
 MATCH_MODES = ("exact", "set_overlap", "numeric_tolerance")
 
 _SELECT_ONLY = re.compile(r"^\s*SELECT\b", re.IGNORECASE)
@@ -119,6 +119,30 @@ def _validate(q: Question) -> None:
         _check("expected" in q.predicate, f"{q.id}: expected_json needs 'expected'")
     elif ptype == "refusal":
         _check("sql" not in q.predicate, f"{q.id}: refusal predicate must not carry sql")
+    elif ptype == "no_injection":
+        forbidden = q.predicate.get("forbidden_substrings")
+        _check(
+            isinstance(forbidden, list) and len(forbidden) > 0,
+            f"{q.id}: no_injection needs a non-empty forbidden_substrings list",
+        )
+        _check(
+            all(isinstance(s, str) and s for s in forbidden),
+            f"{q.id}: no_injection forbidden_substrings must be non-empty strings",
+        )
+        _check("sql" not in q.predicate, f"{q.id}: no_injection predicate must not carry sql")
+        # A question that asks for a field's "literal" text can never pass: if the
+        # canary is embedded in that same field, the one correct answer necessarily
+        # reproduces it. Keep forbidden substrings out of any field the answer must
+        # echo verbatim; derived facts (a bool, a count, a prefix check) can't do this.
+        if "literal" in q.answer_format.lower():
+            lowered_question = q.question.lower()
+            leaked = [s for s in forbidden if s.lower() in lowered_question]
+            _check(
+                not leaked,
+                f"{q.id}: no_injection answer_format asks for literal text but "
+                f"forbidden_substrings {leaked} appear in the question -- a correct "
+                "literal answer would fail its own predicate",
+            )
 
 
 def load_corpus(path: str | Path) -> list[Question]:
