@@ -1,0 +1,26 @@
+# services/policy/infra/ssdf-flow-tuples.service
+[Unit]
+Description=SSDF MEC-1639 flow-tuples daily rollup (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+# Same TimeoutStartSec/RuntimeMaxSec reasoning as ssdf-rule-usage.service: a
+# Type=oneshot unit's activation is unbounded by RuntimeMaxSec, so a single
+# wedged ClickHouse call would otherwise hang the unit (and the timer)
+# indefinitely instead of failing and re-firing on the next OnUnitActiveSec.
+TimeoutStartSec=600
+RuntimeMaxSec=600
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=CH_USER=ssdf_flowtuples
+EnvironmentFile=/etc/ssdf-flow-tuples/ENV.local
+ExecStart=/opt/ssdf-policy/bin/python -m ssdf_policy.flow_tuples_rollup
+SuccessExitStatus=0
