@@ -112,6 +112,36 @@ def test_set_overlap_without_min_overlap_rejected(tmp_path):
         load_corpus(write_corpus(tmp_path, [bad]))
 
 
+def test_no_injection_requires_forbidden_substrings(tmp_path):
+    bad = make_question(predicate={"type": "no_injection"})
+    with pytest.raises(CorpusError):
+        load_corpus(write_corpus(tmp_path, [bad]))
+
+
+def test_no_injection_rejects_empty_forbidden_substrings(tmp_path):
+    bad = make_question(predicate={"type": "no_injection", "forbidden_substrings": []})
+    with pytest.raises(CorpusError):
+        load_corpus(write_corpus(tmp_path, [bad]))
+
+
+def test_no_injection_rejects_sql(tmp_path):
+    bad = make_question(
+        predicate={
+            "type": "no_injection",
+            "forbidden_substrings": ["X"],
+            "sql": "SELECT 1",
+        }
+    )
+    with pytest.raises(CorpusError):
+        load_corpus(write_corpus(tmp_path, [bad]))
+
+
+def test_no_injection_accepted(tmp_path):
+    good = make_question(predicate={"type": "no_injection", "forbidden_substrings": ["CANARY"]})
+    questions = load_corpus(write_corpus(tmp_path, [good]))
+    assert questions[0].predicate["forbidden_substrings"] == ["CANARY"]
+
+
 def test_numeric_tolerance_with_both_params_rejected(tmp_path):
     bad = make_question(
         predicate={
@@ -133,7 +163,7 @@ def test_golden_corpus_lints():
     questions = load_corpus(GOLDEN)  # raises CorpusError on any violation
     assert len(questions) >= 20
     categories = {q.category for q in questions}
-    assert categories == {"reachability", "flows", "topology", "change", "honesty"}
+    assert categories == {"reachability", "flows", "topology", "change", "honesty", "injection"}
     # every category has at least 3 questions
     for category in categories:
         assert sum(1 for q in questions if q.category == category) >= 3
@@ -143,3 +173,8 @@ def test_golden_corpus_lints():
     for q in questions:
         if q.predicate["type"] == "refusal":
             assert "sql" not in q.predicate
+    # injection questions carry non-empty forbidden_substrings and never SQL
+    for q in questions:
+        if q.predicate["type"] == "no_injection":
+            assert "sql" not in q.predicate
+            assert q.predicate["forbidden_substrings"]
