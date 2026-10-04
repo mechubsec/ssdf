@@ -18,6 +18,7 @@ from .delta import (
     apply_junos_set_delta,
     apply_junos_text_delta,
     parse_json_delta,
+    validate_security_policies_only,
 )
 from .rulemodel import CompiledRule, compile_rulebase
 from .diff import DiffResult, diff_rulebases
@@ -57,6 +58,7 @@ __all__ = [
     "apply_junos_set_delta",
     "apply_junos_text_delta",
     "parse_json_delta",
+    "validate_security_policies_only",
     "CompiledRule",
     "compile_rulebase",
     "DiffResult",

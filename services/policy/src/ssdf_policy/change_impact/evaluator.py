@@ -155,6 +155,18 @@ def _match_sets_disjoint(a: CompiledRule, b: CompiledRule) -> bool:
     return a_from.isdisjoint(b_from) or a_to.isdisjoint(b_to)
 
 
+def _disabled_in_both(
+    name: str,
+    p_by_name: dict[str, CompiledRule],
+    pprime_by_name: dict[str, CompiledRule],
+) -> bool:
+    before = p_by_name.get(name)
+    after = pprime_by_name.get(name)
+    before_disabled = before is None or not before.enabled
+    after_disabled = after is None or not after.enabled
+    return before_disabled and after_disabled
+
+
 def config_only_precheck(
     changed_rule_names: set[str],
     p_by_name: dict[str, CompiledRule],
@@ -164,30 +176,34 @@ def config_only_precheck(
     """Return the doc §1.4 "provably no impact (config-only)" wording if either
     config-only condition holds, else None (meaning: must evaluate candidates
     against traffic data).
-    """
-    disabled_in_both = True
-    for name in changed_rule_names:
-        before = p_by_name.get(name)
-        after = pprime_by_name.get(name)
-        before_disabled = before is None or not before.enabled
-        after_disabled = after is None or not after.enabled
-        if not (before_disabled and after_disabled):
-            disabled_in_both = False
-            break
-    if disabled_in_both and changed_rule_names:
-        return "provably no impact (config-only)"
 
-    if reordered_pairs:
-        for name_a, name_b in reordered_pairs:
-            rule_a = pprime_by_name.get(name_a) or p_by_name.get(name_a)
-            rule_b = pprime_by_name.get(name_b) or p_by_name.get(name_b)
-            if rule_a is None or rule_b is None:
-                return None
-            same_action = rule_a.action == rule_b.action
-            if not (same_action or _match_sets_disjoint(rule_a, rule_b)):
-                return None
-        return "provably no impact (config-only)"
-    return None
+    A changed rule that is covered by neither branch -- added, deleted, or
+    modified outside of any reordered pair -- must never be waved through just
+    because some *other* changed rule in the same delta happens to be a benign
+    reorder (MEC-1644 F1): every name in `changed_rule_names` that isn't part
+    of a `reordered_pairs` entry must be disabled in both P and P' before the
+    reorder branch is even considered.
+    """
+    if not changed_rule_names:
+        return None
+
+    reordered_pairs = reordered_pairs or []
+    reordered_names = {name for pair in reordered_pairs for name in pair}
+
+    non_reorder_names = changed_rule_names - reordered_names
+    if not all(_disabled_in_both(name, p_by_name, pprime_by_name) for name in non_reorder_names):
+        return None
+
+    for name_a, name_b in reordered_pairs:
+        rule_a = pprime_by_name.get(name_a) or p_by_name.get(name_a)
+        rule_b = pprime_by_name.get(name_b) or p_by_name.get(name_b)
+        if rule_a is None or rule_b is None:
+            return None
+        same_action = rule_a.action == rule_b.action
+        if not (same_action or _match_sets_disjoint(rule_a, rule_b)):
+            return None
+
+    return "provably no impact (config-only)"
 
 
 def evaluate_candidates(

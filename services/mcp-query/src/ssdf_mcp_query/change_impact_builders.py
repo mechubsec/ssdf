@@ -124,6 +124,18 @@ def build_candidate_pull_sql(
     proves every tuple's verdict), just not yet as tight as it can be at
     scale. Flagged for Percy and for a MEC-570 follow-up once `flow_tuples_daily`
     (task B) lands and the real predicate can be pushed down with it.
+
+    A zone of `"any"` (an `any`-zone rule, or a Junos global policy) drops that
+    side of the predicate entirely rather than binding the literal string
+    `"any"` -- `observer_ingress_zone = 'any'` never matches a real zone name,
+    which silently excluded every session on a zone-pair covered only through
+    an `any` rule (MEC-1644 F3).
+
+    The query asks for `limit + 1` rows ordered newest-first: the caller uses
+    the extra row to detect truncation and report it (MEC-1644 F2), and
+    ordering by `timestamp DESC` means a truncated pull favours sessions near
+    the end of the window (closest to the proposed change) over the oldest
+    sessions in it.
     """
     since_dt = parse_time(since) if since else parse_time("now-14d")
     until_dt = parse_time(until) if until else parse_time("now")
@@ -136,12 +148,14 @@ def build_candidate_pull_sql(
     if zone_pairs:
         pair_clauses = []
         for i, (ingress, egress) in enumerate(zone_pairs):
-            params[f"ingress_{i}"] = ingress
-            params[f"egress_{i}"] = egress
-            pair_clauses.append(
-                f"(observer_ingress_zone = {{ingress_{i}:String}} "
-                f"AND observer_egress_zone = {{egress_{i}:String}})"
-            )
+            side_clauses = []
+            if ingress != "any":
+                params[f"ingress_{i}"] = ingress
+                side_clauses.append(f"observer_ingress_zone = {{ingress_{i}:String}}")
+            if egress != "any":
+                params[f"egress_{i}"] = egress
+                side_clauses.append(f"observer_egress_zone = {{egress_{i}:String}}")
+            pair_clauses.append("(" + " AND ".join(side_clauses) + ")" if side_clauses else "1=1")
         zone_clause = "(" + " OR ".join(pair_clauses) + ")"
     sql = (
         "SELECT observer_ingress_zone, observer_egress_zone, source_ip, destination_ip, "
@@ -154,6 +168,6 @@ def build_candidate_pull_sql(
         "AND event_action IN ("
         "'flow_session_close','flow_session_deny','flow_end','flow_deny','flow_drop') "
         f"AND {zone_clause} "
-        f"ORDER BY timestamp LIMIT {int(limit)}"
+        f"ORDER BY timestamp DESC LIMIT {int(limit) + 1}"
     )
     return sql, params

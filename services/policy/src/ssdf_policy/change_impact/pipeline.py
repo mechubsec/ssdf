@@ -35,6 +35,7 @@ def evaluate_change_impact(
     calibration_threshold: float = 0.99,
     calibration_min_sample: int = 100,
     truncated: bool = False,
+    truncated_at: int | None = None,
 ) -> dict:
     """`candidates` rows are the stage-1 pull: each a dict with `tuple` (a raw
     event-row dict suitable for `effective_tuple`, or already a `FlowTuple`),
@@ -91,7 +92,9 @@ def evaluate_change_impact(
     evaluated = apply_calibration_gate(evaluated, calibration)
 
     for name in sorted(diff_result.changed_rule_names):
-        rule_sections.append(build_rule_section(name, evaluated))
+        rule_sections.append(
+            build_rule_section(name, evaluated, truncated_at=truncated_at if truncated else None)
+        )
 
     deny_side_blindness = build_deny_side_blindness(evaluated, deny_logging_observed or {})
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 
-from ssdf_policy.change_impact import evaluate_change_impact
+from ssdf_policy.change_impact import compile_rulebase, diff_rulebases, evaluate_change_impact
 from ssdf_policy.change_impact.delta import (
     apply_delta,
     apply_junos_text_delta,
@@ -20,6 +20,7 @@ from ssdf_policy.change_impact.delta import (
 )
 
 from .change_impact_builders import (
+    DEFAULT_CANDIDATE_LIMIT,
     build_candidate_pull_sql,
     build_latest_object_book_sql,
     build_policy_version_cutoff_sql,
@@ -156,11 +157,26 @@ class ChangeImpactTools:
         cutoff_rows = self._ch.run(cutoff_sql, cutoff_params)["rows"]
         cutoff = cutoff_rows[0]["cutoff"] if cutoff_rows and cutoff_rows[0].get("cutoff") else None
 
-        zone_pairs = self._zone_pairs(p_rules) + self._zone_pairs(pprime_rules)
+        # Restrict the candidate pull's zone-pairs to C, the rules that
+        # actually differ between P and P' (MEC-1644 F2): pulling the
+        # zone-pairs of the whole rulebase pulled the device's entire flow
+        # log, which then truncated at DEFAULT_CANDIDATE_LIMIT long before the
+        # window closed.
+        diff_result = diff_rulebases(
+            compile_rulebase(p_rules, object_book), compile_rulebase(pprime_rules, object_book)
+        )
+        changed_names = diff_result.changed_rule_names
+        p_changed = [r for r in p_rules if r["rule_name"] in changed_names]
+        pprime_changed = [r for r in pprime_rules if r["rule_name"] in changed_names]
+        zone_pairs = sorted(set(self._zone_pairs(p_changed) + self._zone_pairs(pprime_changed)))
+
         candidate_sql, candidate_params = build_candidate_pull_sql(
             device_name, zone_pairs, since_iso, until_iso
         )
         raw_rows = self._ch.run(candidate_sql, candidate_params)["rows"]
+        truncated = len(raw_rows) > DEFAULT_CANDIDATE_LIMIT
+        if truncated:
+            raw_rows = raw_rows[:DEFAULT_CANDIDATE_LIMIT]
         candidates = _aggregate_candidates(raw_rows)
 
         cutoff_by_zone_pair = {zp: cutoff for zp in zone_pairs} if cutoff else {}
@@ -178,4 +194,6 @@ class ChangeImpactTools:
             cutoff_by_zone_pair=cutoff_by_zone_pair,
             deny_logging_observed=deny_logging_observed or {},
             coverage={"window_default_days": DEFAULT_WINDOW_DAYS if since is None else None},
+            truncated=truncated,
+            truncated_at=DEFAULT_CANDIDATE_LIMIT if truncated else None,
         )

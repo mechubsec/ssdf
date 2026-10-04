@@ -102,6 +102,70 @@ def test_reorder_of_same_action_rules_is_provably_no_impact():
 
 
 # ---------------------------------------------------------------------------
+# MEC-1644 F1 repro: a benign reorder must not launder an unrelated, enabled
+# rule insertion into "provably no impact".
+# ---------------------------------------------------------------------------
+
+
+def test_reorder_with_unrelated_enabled_insert_is_not_config_only():
+    text_before = """
+    set security policies from-zone trust to-zone untrust policy A match source-address any
+    set security policies from-zone trust to-zone untrust policy A match destination-address any
+    set security policies from-zone trust to-zone untrust policy A match application any
+    set security policies from-zone trust to-zone untrust policy A then permit
+    set security policies from-zone trust to-zone untrust policy B match source-address any
+    set security policies from-zone trust to-zone untrust policy B match destination-address any
+    set security policies from-zone trust to-zone untrust policy B match application any
+    set security policies from-zone trust to-zone untrust policy B then permit
+    """
+    # A and B swap order (a benign reorder: both permit) AND a new, enabled
+    # DENY-ALL is inserted ahead of both. Before the F1 fix, the precheck only
+    # ever inspected the reordered pair (A, B) once reordered_pairs was
+    # non-empty, so it never noticed DENY-ALL at all and stamped
+    # CONFIG_ONLY_NO_IMPACT on every changed rule -- including DENY-ALL, which
+    # now intercepts all zone-pair traffic ahead of A.
+    text_after = """
+    set security policies from-zone trust to-zone untrust policy DENY-ALL match source-address any
+    set security policies from-zone trust to-zone untrust policy DENY-ALL match destination-address any
+    set security policies from-zone trust to-zone untrust policy DENY-ALL match application any
+    set security policies from-zone trust to-zone untrust policy DENY-ALL then deny
+    set security policies from-zone trust to-zone untrust policy B match source-address any
+    set security policies from-zone trust to-zone untrust policy B match destination-address any
+    set security policies from-zone trust to-zone untrust policy B match application any
+    set security policies from-zone trust to-zone untrust policy B then permit
+    set security policies from-zone trust to-zone untrust policy A match source-address any
+    set security policies from-zone trust to-zone untrust policy A match destination-address any
+    set security policies from-zone trust to-zone untrust policy A match application any
+    set security policies from-zone trust to-zone untrust policy A then permit
+    """
+    candidates = [_candidate(sessions=500, logged_rules=["A"])]
+    report = evaluate_change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        p_rules=_junos_rules(text_before),
+        pprime_rules=_junos_rules(text_after),
+        object_book=EMPTY_BOOK,
+        candidates=candidates,
+        window_since="2026-09-20T00:00:00",
+        window_until="2026-10-03T00:00:00",
+        delta_payload={"kind": "f1-reorder-plus-insert"},
+    )
+    by_name = {s["rule_name"]: s for s in report["changed_rules"]}
+    assert set(by_name) == {"A", "B", "DENY-ALL"}
+    for section in by_name.values():
+        assert section.get("result") != CONFIG_ONLY_NO_IMPACT, (
+            "an enabled, unrelated rule insertion must force full candidate "
+            "evaluation, never ride a sibling rule's benign reorder"
+        )
+    # DENY-ALL now matches first on this zone-pair and blocks what A used to
+    # permit -- the real, unhidden verdict change.
+    deny_all_classes = by_name["DENY-ALL"]["classes"]
+    assert "verdict_change_breaks" in deny_all_classes
+    assert deny_all_classes["verdict_change_breaks"]["sessions"] == 500
+    _assert_honesty_contract(report)
+
+
+# ---------------------------------------------------------------------------
 # Golden case 2: editing a rule that stays disabled, no impact
 # ---------------------------------------------------------------------------
 

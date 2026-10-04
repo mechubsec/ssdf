@@ -84,11 +84,20 @@ def build_rule_section(
     *,
     config_only: bool = False,
     top_n: int = TOP_N_DEFAULT,
+    truncated_at: int | None = None,
 ) -> dict:
     if config_only:
         return {"rule_name": rule_name, "result": CONFIG_ONLY_NO_IMPACT}
     relevant = [item for item in evaluated if _rule_relevant(rule_name, item)]
     if not relevant:
+        if truncated_at is not None:
+            # The candidate pull was cut off before the window closed (MEC-1644
+            # F2): "no sessions observed" would read as evidence this rule saw
+            # no traffic, when it's really an artefact of the row cap. Say so.
+            return {
+                "rule_name": rule_name,
+                "result": f"unknown: candidate pull truncated at {truncated_at} rows",
+            }
         return {"rule_name": rule_name, "result": NO_SESSIONS_OBSERVED}
     return {
         "rule_name": rule_name,

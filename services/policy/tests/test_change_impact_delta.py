@@ -12,6 +12,7 @@ from ssdf_policy.change_impact.delta import (
     apply_junos_set_delta,
     apply_junos_text_delta,
     parse_json_delta,
+    validate_security_policies_only,
 )
 from ssdf_policy.collectors.junos import parse_security_policies
 
@@ -145,6 +146,31 @@ def test_junos_delete_whole_policy_removes_it():
     )
     rules = parse_security_policies(new_text, "vsrx-ci", "2026-10-03T00:00:00")
     assert {r["rule_name"] for r in rules} == {"ALLOW-WEB"}
+
+
+# ---------------------------------------------------------------------------
+# MEC-1644 F4: junos_current_text must be security-policies-only
+# ---------------------------------------------------------------------------
+
+
+def test_validate_security_policies_only_accepts_pure_policy_text():
+    validate_security_policies_only(BASE_TEXT)  # must not raise
+
+
+def test_validate_security_policies_only_rejects_non_policy_lines():
+    """A full `show configuration | display set` dump (as opposed to the
+    requested `security policies` subtree) can carry IKE PSKs or SNMP
+    communities. The tool must refuse it outright rather than silently
+    dropping the unrecognized lines the way the internal grouping does."""
+    tainted = BASE_TEXT + "\nset system root-authentication encrypted-password REDACTED-NOT-REAL"
+    with pytest.raises(DeltaError):
+        validate_security_policies_only(tainted)
+
+
+def test_apply_junos_text_delta_rejects_full_config_dump():
+    tainted = BASE_TEXT + "\nset snmp community public authorization read-only"
+    with pytest.raises(DeltaError):
+        apply_junos_text_delta(tainted, [], "vsrx-ci", "2026-10-03T00:00:00")
 
 
 def test_junos_delete_one_clause_leaves_the_rest():

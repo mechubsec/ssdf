@@ -123,6 +123,90 @@ def test_change_impact_json_delta_end_to_end_with_fakes():
     assert section["classes"]["verdict_change_opens"]["sessions"] == 150
 
 
+def test_change_impact_truncated_pull_is_reported_not_hidden():
+    """MEC-1644 F2: when the candidate pull returns more rows than the cap,
+    the report must say so instead of reading as a real 'no sessions
+    observed'."""
+    policies = [_policy_entity("RULE-A", action="deny")]
+    store = FakeEntityStore(policies)
+    object_book = {"address_books": {"global": {"addresses": {}, "address_sets": {}}}}
+    # These rows sit on a zone-pair RULE-A's rule never covers, and are never
+    # logged against RULE-A -- firstmatch3 can neither match nor touch RULE-A
+    # for them (before/after both fall through to default-deny with no rule
+    # name), so the only question this test asks is whether the resulting
+    # empty section reads as "no sessions" or "truncated".
+    event_rows = [
+        {
+            "observer_ingress_zone": "dmz",
+            "observer_egress_zone": "other",
+            "source_ip": f"10.1.1.{i % 200}",
+            "destination_ip": "10.2.2.5",
+            "network_transport": "tcp",
+            "destination_port": 443,
+            "ext": {},
+            "rule_name": "SOME-OTHER-RULE",
+            "timestamp": "2026-09-25T00:00:00",
+        }
+        for i in range(3)
+    ]
+    ch = FakeChClient(object_book=object_book, event_rows=event_rows)
+    tools = ChangeImpactTools(ch, store)
+    import ssdf_mcp_query.change_impact_tools as cit_module
+
+    original_limit = cit_module.DEFAULT_CANDIDATE_LIMIT
+    cit_module.DEFAULT_CANDIDATE_LIMIT = 2  # force the fake 3-row pull to look truncated
+    try:
+        report = tools.change_impact(
+            device_name="vsrx-ci",
+            provider="juniper",
+            delta=[{"op": "modify", "rule_name": "RULE-A", "fields": {"action": "allow"}}],
+            since="2026-09-20T00:00:00",
+            until="2026-10-03T00:00:00",
+        )
+    finally:
+        cit_module.DEFAULT_CANDIDATE_LIMIT = original_limit
+
+    assert report["truncated"] is True
+    [section] = report["changed_rules"]
+    assert section["result"] == "unknown: candidate pull truncated at 2 rows"
+
+
+def test_change_impact_zone_pairs_restricted_to_changed_rules():
+    """MEC-1644 F2: the candidate pull's zone-pair filter must come from the
+    rules that actually differ (C), not the whole rulebase -- an unrelated
+    zone-pair with no changed rule must not widen (or narrow) the pull."""
+    policies = [
+        _policy_entity("RULE-A", action="deny"),
+        {
+            **_policy_entity("RULE-UNRELATED", action="deny"),
+            "attrs": {
+                **_policy_entity("RULE-UNRELATED")["attrs"],
+                "from_zone": "dmz",
+                "to_zone": "trust",
+            },
+        },
+    ]
+    store = FakeEntityStore(policies)
+    object_book = {"address_books": {"global": {"addresses": {}, "address_sets": {}}}}
+    ch = FakeChClient(object_book=object_book, event_rows=[])
+    tools = ChangeImpactTools(ch, store)
+
+    tools.change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        delta=[{"op": "modify", "rule_name": "RULE-A", "fields": {"action": "allow"}}],
+        since="2026-09-20T00:00:00",
+        until="2026-10-03T00:00:00",
+    )
+    [events_call] = [call for call in ch.calls if "ssdf.events" in call[0]]
+    _sql, params = events_call
+    # Only RULE-A (trust->untrust) changed; RULE-UNRELATED's dmz->trust
+    # zone-pair must not appear in the candidate pull's predicate.
+    assert params.get("ingress_0") == "trust"
+    assert params.get("egress_0") == "untrust"
+    assert "ingress_1" not in params
+
+
 def test_change_impact_junos_text_delta_requires_current_text():
     store = FakeEntityStore([])
     ch = FakeChClient()

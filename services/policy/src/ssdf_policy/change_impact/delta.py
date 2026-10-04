@@ -297,11 +297,35 @@ def apply_junos_set_delta(current_text: str, delta_lines: list[str]) -> str:
     return _flatten(groups)
 
 
+def validate_security_policies_only(text: str) -> None:
+    """Refuse any line outside a `security policies ...` stanza (MEC-1644 F4).
+
+    The tool only ever asks the caller for
+    `show configuration security policies | display set`. A caller who pastes
+    a full `show configuration | display set` instead would otherwise put
+    IKE PSKs, SNMP communities, and other device secrets verbatim into
+    `current_text`, which the wrapper audits -- raise before any of that
+    reaches the evaluator or the audit trail, rather than silently dropping
+    the unrecognized lines the way `_group_lines` does internally.
+    """
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        body = line[len("inactive:") :].strip() if line.startswith("inactive:") else line
+        if not body.startswith("set ") or _policy_key_for_line(body[len("set ") :]) is None:
+            raise DeltaError(
+                "junos_current_text must contain only 'security policies' set/inactive-set "
+                f"lines (from 'show configuration security policies | display set'): {line!r}"
+            )
+
+
 def apply_junos_text_delta(
     current_text: str, delta_lines: list[str], device_name: str, now: str
 ) -> tuple[list[dict], list[dict]]:
     """Return (P, P') for the Junos text-delta form: P from `current_text`
     as-is, P' from `current_text` with `delta_lines` applied."""
+    validate_security_policies_only(current_text)
     p_rules = parse_security_policies(current_text, device_name, now)
     new_text = apply_junos_set_delta(current_text, delta_lines)
     p_prime_rules = parse_security_policies(new_text, device_name, now)
