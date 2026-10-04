@@ -13,7 +13,11 @@ import json
 import pytest
 
 from ssdf_mcp_query.change_impact_builders import policy_entity_to_rule
-from ssdf_mcp_query.change_impact_tools import ChangeImpactError, ChangeImpactTools
+from ssdf_mcp_query.change_impact_tools import (
+    ChangeImpactError,
+    ChangeImpactTools,
+    _aggregate_candidates,
+)
 
 
 class FakeChClient:
@@ -297,13 +301,8 @@ def test_change_impact_zone_pairs_restricted_to_changed_rules():
 
 
 def test_change_impact_junos_text_baseline_mismatched_with_store_is_refused():
-    """MEC-1776 regression: the store has P1 enabled, but the caller pastes
-    a `junos_current_text` baseline where P1 is `inactive:` (plus a delta
-    that deletes P1). The pasted text's own before/after are identical on
-    this point (P1 absent either way), so a config-only pre-check run
-    against the *pasted* text alone would call this CONFIG_ONLY_NO_IMPACT --
-    but the real device still has P1 active, so removing it does have an
-    impact. The tool must refuse instead of trusting unreconciled text."""
+    """A `junos_current_text` baseline that disagrees with the stored
+    configuration must be refused, not trusted."""
     p1 = _policy_entity("P1", action="allow")
     p1["attrs"]["source_addresses"] = "any"
     p1["attrs"]["dest_addresses"] = "any"
@@ -361,11 +360,96 @@ def test_change_impact_junos_text_baseline_matching_store_is_accepted():
     assert report["device_name"] == "vsrx-ci"
 
 
+def _trust_untrust_rule(name, action, position, src):
+    rule = _policy_entity(name, action=action)
+    rule["attrs"]["position"] = str(position)
+    rule["attrs"]["source_addresses"] = src
+    rule["attrs"]["dest_addresses"] = "any"
+    rule["attrs"]["application"] = "any"
+    rule["attrs"]["service"] = "any"
+    return rule
+
+
+_A_LINES = """set security policies from-zone trust to-zone untrust policy A match source-address 10.0.0.1
+set security policies from-zone trust to-zone untrust policy A match destination-address any
+set security policies from-zone trust to-zone untrust policy A match application any
+set security policies from-zone trust to-zone untrust policy A then permit"""
+
+_B_LINES = """set security policies from-zone trust to-zone untrust policy B match source-address 10.0.0.2
+set security policies from-zone trust to-zone untrust policy B match destination-address any
+set security policies from-zone trust to-zone untrust policy B match application any
+set security policies from-zone trust to-zone untrust policy B then permit"""
+
+_C_LINES = """set security policies from-zone trust to-zone untrust policy C match source-address any
+set security policies from-zone trust to-zone untrust policy C match destination-address any
+set security policies from-zone trust to-zone untrust policy C match application any
+set security policies from-zone trust to-zone untrust policy C then deny"""
+
+
+def test_change_impact_junos_text_baseline_reordered_within_context_is_refused():
+    """A pasted baseline whose per-rule content matches the stored
+    configuration but whose first-match order within a context does not
+    must still be refused."""
+    store = FakeEntityStore(
+        [
+            _trust_untrust_rule("A", "allow", 0, "10.0.0.1"),
+            _trust_untrust_rule("C", "deny", 1, "any"),
+            _trust_untrust_rule("B", "allow", 2, "10.0.0.2"),
+        ]
+    )
+    ch = FakeChClient()
+    tools = ChangeImpactTools(ch, store)
+
+    # Store order is A, C, B; the pasted text lists A, B, C.
+    junos_current_text = "\n".join([_A_LINES, _B_LINES, _C_LINES])
+    with pytest.raises(ChangeImpactError) as excinfo:
+        tools.change_impact(
+            device_name="vsrx-ci",
+            provider="juniper",
+            delta={"lines": []},
+            junos_current_text=junos_current_text,
+            since="2026-09-20T00:00:00",
+            until="2026-10-03T00:00:00",
+        )
+    assert "does not match the stored configuration" in str(excinfo.value)
+
+
+def test_change_impact_junos_text_baseline_matching_order_reorder_delta_is_not_config_only():
+    """The positive case: a baseline whose order matches the store is
+    accepted, and a delta that reorders a rule past a rule with different
+    behaviour must not be reported as provably no impact."""
+    store = FakeEntityStore(
+        [
+            _trust_untrust_rule("A", "allow", 0, "10.0.0.1"),
+            _trust_untrust_rule("C", "deny", 1, "any"),
+            _trust_untrust_rule("B", "allow", 2, "10.0.0.2"),
+        ]
+    )
+    object_book = {"address_books": {"global": {"addresses": {}, "address_sets": {}}}}
+    ch = FakeChClient(object_book=object_book, event_rows=[])
+    tools = ChangeImpactTools(ch, store)
+
+    # Store and text order both A, C, B.
+    junos_current_text = "\n".join([_A_LINES, _C_LINES, _B_LINES])
+    report = tools.change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        delta={
+            "lines": [
+                "insert security policies from-zone trust to-zone untrust policy B before policy A"
+            ]
+        },
+        junos_current_text=junos_current_text,
+        since="2026-09-20T00:00:00",
+        until="2026-10-03T00:00:00",
+    )
+    for section in report["changed_rules"]:
+        assert section.get("result") != "provably no impact (config-only)"
+
+
 def test_change_impact_rejects_provider_mismatched_with_stored_policy():
-    """MEC-1776 regression: the caller's `provider` argument picks vendor
-    semantics (effective-tuple derivation, context ordering) -- it must
-    agree with what the collector actually stored for this device, not be
-    trusted on its own."""
+    """The caller's `provider` argument must agree with what was actually
+    stored for this device, not be trusted on its own."""
     policies = [_policy_entity("RULE-A", action="deny")]  # stored provider: juniper
     store = FakeEntityStore(policies)
     ch = FakeChClient()
@@ -400,3 +484,67 @@ def test_change_impact_junos_text_delta_requires_current_text():
         assert "junos_current_text" in str(exc)
     else:
         raise AssertionError("expected an error without junos_current_text")
+
+
+def test_change_impact_rejects_device_with_no_recorded_provider():
+    """A device whose stored policies carry no provider attribute at all
+    must be refused rather than trusting the caller's `provider` argument
+    unconditionally."""
+    policies = [_policy_entity("RULE-A", action="deny")]
+    del policies[0]["attrs"]["provider"]
+    store = FakeEntityStore(policies)
+    ch = FakeChClient()
+    tools = ChangeImpactTools(ch, store)
+
+    with pytest.raises(ChangeImpactError) as excinfo:
+        tools.change_impact(
+            device_name="vsrx-ci",
+            provider="juniper",
+            delta=[{"op": "modify", "rule_name": "RULE-A", "fields": {"action": "allow"}}],
+            since="2026-09-20T00:00:00",
+            until="2026-10-03T00:00:00",
+        )
+    assert "no recorded provider" in str(excinfo.value)
+
+
+def test_aggregate_candidates_derives_panos_app_from_ext():
+    """PAN-OS candidates must be aggregated with PAN-OS tuple semantics
+    (the `provider` passed in), not whatever default `effective_tuple`
+    would otherwise fall back to."""
+    rows = [
+        {
+            "observer_ingress_zone": "trust",
+            "observer_egress_zone": "untrust",
+            "source_ip": "10.1.1.5",
+            "destination_ip": "10.2.2.5",
+            "network_transport": "tcp",
+            "destination_port": 443,
+            "ext": {"panw.panos.application": "ssl"},
+            "rule_name": "RULE-A",
+            "timestamp": "2026-09-25T00:00:00",
+        }
+    ]
+    [candidate] = _aggregate_candidates(rows, "paloalto")
+    assert candidate["tuple"].app == "ssl"
+
+
+def test_change_impact_json_delta_with_no_net_rule_change_skips_events_query():
+    """A delta that nets to no rule-level change must not fall through to
+    an unscoped candidate pull."""
+    policies = [_policy_entity("RULE-A", action="deny")]
+    store = FakeEntityStore(policies)
+    ch = FakeChClient()
+    tools = ChangeImpactTools(ch, store)
+
+    report = tools.change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        delta=[
+            {"op": "disable", "rule_name": "RULE-A"},
+            {"op": "enable", "rule_name": "RULE-A"},
+        ],
+        since="2026-09-20T00:00:00",
+        until="2026-10-03T00:00:00",
+    )
+    assert report["note"] == "delta produces no rule change"
+    assert not any("ssdf.events" in call[0] for call in ch.calls)

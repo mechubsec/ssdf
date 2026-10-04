@@ -65,8 +65,7 @@ def _rule(name, **overrides):
 
 def test_json_add_inserts_before_named_rule():
     rules = [_rule("A"), _rule("B")]
-    new_rule = _rule("NEW")
-    del new_rule["position"]  # assigned by list order ('before'/'after'), not caller input
+    new_rule = {"rule_name": "NEW", "action": "deny"}
     delta = parse_json_delta([{"op": "add", "rule": new_rule, "before": "B"}])
     result = apply_delta(rules, delta)
     assert [r["rule_name"] for r in result] == ["A", "NEW", "B"]
@@ -74,11 +73,25 @@ def test_json_add_inserts_before_named_rule():
 
 def test_json_add_rejects_caller_supplied_position():
     """A new rule's position is derived from list order ('before'/'after'),
-    never from the caller's dict -- the caller-supplied value used to win
-    silently (defaulting to 0, evaluated first, regardless of 'before'), or
-    crash `int(None)` if the dict explicitly set it to None."""
+    never from the caller's dict."""
     with pytest.raises(DeltaError):
-        parse_json_delta([{"op": "add", "rule": _rule("NEW"), "before": "B"}])
+        parse_json_delta(
+            [{"op": "add", "rule": {"rule_name": "NEW", "position": 0}, "before": "B"}]
+        )
+
+
+def test_json_add_rejects_internal_fields():
+    """An `add` rule dict must not be able to set bookkeeping fields the
+    evaluator trusts from the collector -- `match_unknown`, `provider`,
+    `vendor_extras`, `device_name`, `collected_at`."""
+    with pytest.raises(DeltaError):
+        parse_json_delta([{"op": "add", "rule": {"rule_name": "NEW", "match_unknown": False}}])
+    with pytest.raises(DeltaError):
+        parse_json_delta([{"op": "add", "rule": {"rule_name": "NEW", "provider": "paloalto"}}])
+    with pytest.raises(DeltaError):
+        parse_json_delta([{"op": "add", "rule": {"rule_name": "NEW", "vendor_extras": {}}}])
+    # The positive case: an allowed match/action/enabled field still works.
+    parse_json_delta([{"op": "add", "rule": {"rule_name": "NEW", "action": "deny"}}])
 
 
 def test_json_delete_removes_rule():
@@ -408,14 +421,13 @@ def test_junos_delete_sub_statement_exact_match_is_applied():
 
 
 # ---------------------------------------------------------------------------
-# MEC-1776 review fixes
+# Delta validation hardening
 # ---------------------------------------------------------------------------
 
 
 def test_junos_delete_of_unknown_whole_policy_is_rejected():
-    """A typo'd delete target used to be silently dropped as a no-op
-    (`if key not in index: continue`), making P' == P even though the caller
-    believed a policy was removed. It must be refused instead."""
+    """A delete referencing an unknown policy must be refused, not dropped
+    as a silent no-op."""
     with pytest.raises(DeltaError):
         apply_junos_set_delta(
             BASE_TEXT,
@@ -435,9 +447,8 @@ def test_junos_delete_of_unknown_policy_sub_statement_is_rejected():
 
 
 def test_junos_insert_short_form_before_itself_is_rejected():
-    """`insert P1 before P1` used to raise a bare `StopIteration` from
-    `next()` once the moved group was popped out from under the sibling
-    lookup -- it must raise `DeltaError` instead."""
+    """An insert that places a policy before/after itself must raise
+    `DeltaError`, not an internal exception."""
     with pytest.raises(DeltaError):
         apply_junos_set_delta(BASE_TEXT, ["insert ALLOW-WEB before ALLOW-WEB"])
 
@@ -470,3 +481,35 @@ def test_json_modify_rejects_internal_fields():
         parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"rule_name": "B"}}])
     # The positive case: an allowed match/action/enabled field still works.
     parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"action": "deny"}}])
+
+
+def test_json_modify_setting_scheduler_name_sets_match_unknown():
+    """A `modify` that binds a scheduler to a rule narrows its match in a
+    way this evaluator can't resolve -- `match_unknown` must be recomputed,
+    not left at whatever it was before the modify."""
+    rules = [_rule("A", match_unknown=False)]
+    delta = parse_json_delta(
+        [{"op": "modify", "rule_name": "A", "fields": {"scheduler_name": "biz-hours"}}]
+    )
+    result = apply_delta(rules, delta)
+    assert result[0]["match_unknown"] is True
+
+
+def test_json_modify_clearing_unresolved_clause_does_not_clear_match_unknown():
+    """`match_unknown` must never be cleared by a modify -- only ever
+    widened -- even if the fields being set no longer require it."""
+    rules = [_rule("A", match_unknown=True, scheduler_name="biz-hours")]
+    delta = parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"scheduler_name": ""}}])
+    result = apply_delta(rules, delta)
+    assert result[0]["match_unknown"] is True
+
+
+def test_json_add_with_dynamic_application_sets_match_unknown():
+    rules = [_rule("A")]
+    delta = parse_json_delta(
+        [{"op": "add", "rule": {"rule_name": "NEW", "dynamic_application": ["risky-app"]}}]
+    )
+    result = apply_delta(rules, delta)
+    new = next(r for r in result if r["rule_name"] == "NEW")
+    assert new["match_unknown"] is True
+    assert new["provider"] == "juniper"

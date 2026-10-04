@@ -59,12 +59,7 @@ def _deny_logging_observed(rows: list[dict]) -> dict[tuple[str, str], bool]:
 def _aggregate_candidates(rows: list[dict], provider: str) -> list[dict]:
     """Group raw `ssdf.events` rows into effective-tuple candidates (doc §1.3).
 
-    `provider` is the tool call's own argument, never read off the row: the
-    candidate-pull SQL (`change_impact_builders.build_candidate_pull_sql`)
-    does not select a `provider` column, so a per-row lookup would always
-    fall through to a default and silently mis-derive the effective tuple
-    (e.g. PAN-OS `app` always reading `None`) for every provider but the
-    default.
+    `provider` is always the tool call's own argument, never read off the row.
 
     v1 does this in Python rather than pushing the NAT-aware GROUP BY into
     ClickHouse (see change_impact_builders.build_candidate_pull_sql docstring)
@@ -123,15 +118,15 @@ class ChangeImpactTools:
 
     def _configured_rules(self, device_name: str, provider: str) -> list[dict]:
         items = self._store.configured_policies_for_firewalls([device_name])
-        for item in items:
-            stored_provider = item["policy"].get("attrs", {}).get("provider")
-            # The caller's `provider` argument picks which vendor semantics
-            # (`effective_tuple`, context ordering) to evaluate this device
-            # under; it must agree with what the collector actually stored
-            # for this device, not be trusted on its own -- otherwise a
-            # caller could ask for a Junos device to be evaluated under
-            # PAN-OS rules (or vice versa) and get a report for the wrong
-            # vendor's semantics.
+        # The caller's `provider` argument picks the vendor semantics this
+        # device is evaluated under; it must agree with what was actually
+        # stored for this device, not be trusted on its own.
+        stored_providers = {item["policy"].get("attrs", {}).get("provider") for item in items}
+        if items and not any(stored_providers):
+            raise ChangeImpactError(
+                f"stored configuration for device {device_name!r} has no recorded provider"
+            )
+        for stored_provider in stored_providers:
             if stored_provider and stored_provider != provider:
                 raise ChangeImpactError(
                     f"provider {provider!r} does not match the stored provider "
@@ -148,18 +143,16 @@ class ChangeImpactTools:
         self, device_name: str, provider: str, text_rules: list[dict]
     ) -> None:
         """Refuse a Junos text-form baseline (`junos_current_text`) that
-        doesn't match the stored configuration for this device.
+        doesn't match the stored configuration for this device, including
+        its per-context rule order (first-match depends on it).
 
         The text form lets the caller paste the device's own config instead
         of re-reading the store, but that text then becomes P for the
         config-only pre-check (`evaluator.config_only_precheck`), which can
         return a "provably no impact" verdict before any traffic is looked
-        at. A pasted baseline that's missing an already-applied change (or
-        otherwise stale) would let that pre-check prove "no impact" against
-        a P that was never the device's real policy -- compare on
-        `(context, rule_name)` plus content, ignoring `position` (first
-        appearance order is not the same scale between the two sources) and
-        `collected_at` (a parse timestamp, not state).
+        at. Compared on `(context, rule_name)` plus content and per-context
+        order, ignoring `position`'s absolute scale (not comparable between
+        the two sources) and `collected_at` (a parse timestamp, not state).
         """
         stored_rules = self._configured_rules(device_name, provider)
         stored_compiled = compile_rulebase(stored_rules, {})
@@ -186,7 +179,15 @@ class ChangeImpactTools:
                 for c in compiled
             }
 
-        if _snapshot(stored_compiled) != _snapshot(text_compiled):
+        def _order_by_context(compiled):
+            by_context: dict = {}
+            for c in sorted(compiled, key=lambda c: c.position):
+                by_context.setdefault(c.context, []).append(c.rule_name)
+            return by_context
+
+        if _snapshot(stored_compiled) != _snapshot(text_compiled) or _order_by_context(
+            stored_compiled
+        ) != _order_by_context(text_compiled):
             raise ChangeImpactError(
                 "junos_current_text does not match the stored configuration for this device"
             )
@@ -240,7 +241,7 @@ class ChangeImpactTools:
         elif isinstance(delta, list):
             p_rules = self._configured_rules(device_name, provider)
             delta_obj = parse_json_delta(delta)
-            pprime_rules = apply_delta(p_rules, delta_obj)
+            pprime_rules = apply_delta(p_rules, delta_obj, provider=provider)
             delta_payload = delta
         else:
             raise ChangeImpactError(
@@ -313,12 +314,8 @@ class ChangeImpactTools:
             window_since=since_iso,
             window_until=until_iso,
             delta_payload=delta_payload,
-            # `cutoff` is one device-level value (the latest
-            # `policy_versions.valid_from` among the changed rules), applied
-            # to every zone-pair in the calibration gate -- a changed rule's
-            # own zone pair can be `("any", "any")`, which would never match
-            # a flow's actual (specific) zone pair if this were looked up
-            # per-pair instead.
+            # `cutoff` is one device-level value, applied uniformly across
+            # every zone-pair in the calibration gate.
             cutoff=cutoff,
             deny_logging_observed=deny_logging_observed,
             coverage=coverage,

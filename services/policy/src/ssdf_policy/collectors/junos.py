@@ -12,6 +12,7 @@ import logging
 import re
 
 from .base import register
+from .matchunknown import derive_match_unknown
 
 logger = logging.getLogger(__name__)
 
@@ -66,19 +67,6 @@ def _new_rule(name, device_name, from_zone, to_zone, now, order, is_global):
         "scheduler_name": "",
         "match_unknown": False,
     }
-
-
-# Clauses this collector can parse the tokens of but cannot yet resolve
-# deterministically (no object book for identity/AppID/URL-category/EUP
-# profiles, and scheduler objects are not collected in this task). A rule
-# using any of them is flagged match_unknown rather than silently treated as
-# unmatched-clause == wildcard.
-_UNRESOLVED_MATCH_FIELDS = (
-    "source_identity",
-    "dynamic_application",
-    "url_category",
-    "source_end_user_profile",
-)
 
 
 def parse_security_policies(text: str, device_name: str, now: str) -> list[dict]:
@@ -172,11 +160,7 @@ def parse_security_policies(text: str, device_name: str, now: str) -> list[dict]
                 rule["from_zone"] = ["any"]
             if not rule["to_zone"]:
                 rule["to_zone"] = ["any"]
-        # scheduler-name is only deterministic once the scheduler object
-        # itself is resolved; this task does not collect scheduler objects,
-        # so treat any scheduler-bound rule as unknown rather than assume
-        # "always active".
-        if any(rule[field] for field in _UNRESOLVED_MATCH_FIELDS) or rule["scheduler_name"]:
+        if derive_match_unknown(rule, PROVIDER):
             rule["match_unknown"] = True
     return list(rules.values())
 

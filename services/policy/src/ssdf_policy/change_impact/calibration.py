@@ -2,19 +2,11 @@
 
 Per zone-pair, agreement between the evaluator's P-verdict and the logged
 `rule_name` is computed over candidate sessions whose first-seen is at or
-after `cutoff` (the latest relevant `policy_versions.valid_from` across every
-rule in the changed set -- a single device-level value, not looked up per
-zone-pair: a changed rule's own zone pair can be `("any", "any")`, but the
-candidate pull's actual flow rows carry the flow's real, specific zone pair,
-so a per-zone-pair lookup would miss and silently treat every session as
-having no cutoff at all -- older logs legitimately came from a different
-rulebase, see doc §1.4). If
-agreement is below threshold, or the post-cutoff sample is too small, every
-verdict touching that zone-pair is reported `unknown: model does not
-reproduce device behaviour`, never a guess -- this is the one check standing
-between a bug anywhere upstream (object resolution, NAT handling, an
-unmodelled match clause) and a report telling someone it's safe to delete a
-rule.
+after `cutoff` (a single device-level value, applied uniformly across every
+zone-pair rather than looked up per pair). If agreement is below threshold,
+or the post-cutoff sample is too small, every verdict touching that
+zone-pair is reported `unknown: model does not reproduce device behaviour`,
+never a guess.
 """
 
 from __future__ import annotations

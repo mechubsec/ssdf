@@ -23,16 +23,15 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ..collectors.junos import parse_security_policies
+from ..collectors.matchunknown import derive_match_unknown
 
 OpKind = Literal["add", "modify", "delete", "move", "enable", "disable"]
 
-# Fields `modify` may set: the collector's own match/action/enabled clauses
-# (see collectors/{junos,panos}.py NormalizedRule shape). Deliberately
+# Fields a delta may set directly: the collector's own match/action/enabled
+# clauses (see collectors/{junos,panos}.py NormalizedRule shape). Deliberately
 # excludes bookkeeping/classification fields the evaluator trusts from the
-# collector, not the caller -- `match_unknown`, `is_global`, `provider`,
-# `vendor_extras`, `rule_name` -- so a delta can't, say, clear
-# `match_unknown` on a rule with an unresolved clause and make the evaluator
-# treat it as decided.
+# collector, not the caller -- e.g. `match_unknown`, `provider`,
+# `vendor_extras` -- so a delta can't set those directly.
 _ALLOWED_MODIFY_FIELDS = frozenset(
     {
         "action",
@@ -58,6 +57,10 @@ _ALLOWED_MODIFY_FIELDS = frozenset(
         "destination_hip",
     }
 )
+# `add` additionally needs to name and classify the new rule; everything
+# else about it (provider, vendor_extras, match_unknown) is derived, never
+# taken from the caller's dict.
+_ALLOWED_ADD_FIELDS = _ALLOWED_MODIFY_FIELDS | {"rule_name", "is_global"}
 
 
 class DeltaError(ValueError):
@@ -113,12 +116,10 @@ def parse_json_delta(ops: list[dict]) -> Delta:
             rule = raw.get("rule")
             if not isinstance(rule, dict) or not rule.get("rule_name"):
                 raise DeltaError(f"delta op {i}: 'add' requires a full rule dict with rule_name")
-            if "position" in rule:
-                # `position` is assigned by `apply_delta` from the final list
-                # order (see below), never trusted from caller input.
+            disallowed = set(rule) - _ALLOWED_ADD_FIELDS
+            if disallowed:
                 raise DeltaError(
-                    f"delta op {i}: 'add' must not set 'position'; it is assigned by "
-                    "list order ('before'/'after')"
+                    f"delta op {i}: 'add' must not set internal field(s) {sorted(disallowed)}"
                 )
             parsed.append(
                 DeltaOp(
@@ -198,7 +199,31 @@ def renumber_positions(rules: list[dict]) -> list[dict]:
     return ordered
 
 
-def apply_delta(rules: list[dict], delta: Delta) -> list[dict]:
+_ADD_LIST_DEFAULTS = (
+    "from_zone",
+    "to_zone",
+    "source_addresses",
+    "dest_addresses",
+    "application",
+    "service",
+    "source_identity",
+    "dynamic_application",
+    "url_category",
+    "source_end_user_profile",
+    "source_user",
+    "source_hip",
+    "destination_hip",
+)
+_ADD_STR_DEFAULTS = ("action", "scheduler_name", "schedule")
+_ADD_BOOL_DEFAULTS = (
+    "source_address_excluded",
+    "dest_address_excluded",
+    "negate_source",
+    "negate_destination",
+)
+
+
+def apply_delta(rules: list[dict], delta: Delta, provider: str | None = None) -> list[dict]:
     """P' = apply(P, Delta) for the JSON-op form. Pure: `rules` is not mutated.
 
     The working list is first ordered by each rule's existing `position` (so
@@ -208,12 +233,34 @@ def apply_delta(rules: list[dict], delta: Delta) -> list[dict]:
     is reassigned from the resulting list order, so `diff_rulebases` and
     `firstmatch3` -- which trust `position`, not list order -- always see
     the result of a reorder.
+
+    `provider` is only needed to construct a brand-new rule for an `add` op
+    (its `provider`/`match_unknown` are derived here, never taken from the
+    caller's dict); it defaults to the existing rulebase's own provider when
+    not given. `modify` and `add` both recompute `match_unknown` from the
+    resulting rule's own fields, OR'd with whatever was already set -- a
+    delta can narrow or widen the clauses that made a rule `match_unknown`,
+    but can never directly clear the flag itself.
     """
     result = renumber_positions(rules)
+    if provider is None and result:
+        provider = result[0]["provider"]
     for op in delta.ops:
         if op.kind == "add":
+            if provider is None:
+                raise DeltaError("'add' requires a provider when the rulebase is empty")
             new_rule = copy.deepcopy(op.rule)
             new_rule.setdefault("enabled", True)
+            new_rule.setdefault("is_global", False)
+            for field in _ADD_LIST_DEFAULTS:
+                new_rule.setdefault(field, [])
+            for field in _ADD_STR_DEFAULTS:
+                new_rule.setdefault(field, "")
+            for field in _ADD_BOOL_DEFAULTS:
+                new_rule.setdefault(field, False)
+            new_rule["provider"] = provider
+            new_rule["vendor_extras"] = {}
+            new_rule["match_unknown"] = derive_match_unknown(new_rule, provider)
             insert_at = len(result)
             if op.before is not None:
                 insert_at = _find_rule(result, op.before, None, None)
@@ -225,7 +272,11 @@ def apply_delta(rules: list[dict], delta: Delta) -> list[dict]:
             result.pop(idx)
         elif op.kind == "modify":
             idx = _find_rule(result, op.rule_name, op.from_zone, op.to_zone)
-            result[idx].update(copy.deepcopy(op.fields))
+            rule = result[idx]
+            rule.update(copy.deepcopy(op.fields))
+            rule["match_unknown"] = bool(rule.get("match_unknown")) or derive_match_unknown(
+                rule, rule["provider"]
+            )
         elif op.kind in ("enable", "disable"):
             idx = _find_rule(result, op.rule_name, op.from_zone, op.to_zone)
             result[idx]["enabled"] = op.kind == "enable"

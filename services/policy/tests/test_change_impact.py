@@ -693,8 +693,12 @@ def test_json_delta_add_after_lands_at_its_list_position_not_caller_default():
         _json_rule("B", "deny", 1),
         _json_rule("C", "allow", 2),
     ]
-    new_rule = _json_rule("NEW", "deny", 0)
-    del new_rule["position"]
+    new_rule = {
+        "rule_name": "NEW",
+        "action": "deny",
+        "from_zone": ["trust"],
+        "to_zone": ["untrust"],
+    }
     delta = parse_json_delta([{"op": "add", "rule": new_rule, "after": "B"}])
     pprime_rules = apply_delta(p_rules, delta)
     assert [r["rule_name"] for r in pprime_rules] == ["A", "B", "NEW", "C"]
