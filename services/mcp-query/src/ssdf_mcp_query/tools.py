@@ -15,13 +15,16 @@ from .untrusted_text import UntrustedText
 
 logger = logging.getLogger("ssdf_mcp_query.tools")
 
-# FLOW_COLUMNS fields that carry attacker-reachable free text: both are written
-# from unauthenticated syslog ingest (see docs/security/2026-06-10-vulnerability-
-# review.md H1) and, unlike event_action/event_outcome/event_provider/
-# network_transport/zones (fixed, normalizer-controlled vocabularies), can hold
-# arbitrary text. Everything else in FLOW_COLUMNS is numeric/IP/port/timestamp or
-# one of those bounded-vocabulary fields, so it is returned as-is.
-_FLOW_UNTRUSTED_COLUMNS = ("rule_name", "user_name")
+# FLOW_COLUMNS fields that carry log-echoed free text with no enforced
+# vocabulary at ingest. Everything else in FLOW_COLUMNS is numeric/IP/port/
+# timestamp or a field normalized to a fixed vocabulary, so it is returned
+# as-is.
+_FLOW_UNTRUSTED_COLUMNS = (
+    "rule_name",
+    "user_name",
+    "observer_ingress_zone",
+    "observer_egress_zone",
+)
 
 
 def _ok(result: dict, requested_limit: int) -> dict:

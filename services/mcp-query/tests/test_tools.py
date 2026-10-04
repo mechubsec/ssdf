@@ -33,8 +33,22 @@ def test_query_flows_returns_rows_and_metadata():
 
 def test_query_flows_wraps_log_derived_free_text_columns():
     fake = FakeClient(
-        rows=[{"source_ip": "10.64.0.1", "rule_name": "allow-web", "user_name": "alice"}],
-        columns=["source_ip", "rule_name", "user_name"],
+        rows=[
+            {
+                "source_ip": "10.64.0.1",
+                "rule_name": "allow-web",
+                "user_name": "alice",
+                "observer_ingress_zone": "untrust",
+                "observer_egress_zone": "trust",
+            }
+        ],
+        columns=[
+            "source_ip",
+            "rule_name",
+            "user_name",
+            "observer_ingress_zone",
+            "observer_egress_zone",
+        ],
     )
     tools = Tools(fake, max_rows=1000)
     out = tools.query_flows(action="flow_session_deny", since="now-1h")
@@ -44,6 +58,12 @@ def test_query_flows_wraps_log_derived_free_text_columns():
     # Log-echoed free-text columns carry the UntrustedText response shape.
     assert row["rule_name"] == {"value": "allow-web", "truncated": False, "untrusted": True}
     assert row["user_name"] == {"value": "alice", "truncated": False, "untrusted": True}
+    assert row["observer_ingress_zone"] == {
+        "value": "untrust",
+        "truncated": False,
+        "untrusted": True,
+    }
+    assert row["observer_egress_zone"] == {"value": "trust", "truncated": False, "untrusted": True}
 
 
 def test_query_flows_wrapped_column_reports_truncation():
