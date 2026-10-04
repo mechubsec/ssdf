@@ -11,8 +11,19 @@ from typing import Any
 from .builders import build_query_flows, build_top_talkers, BuilderError, MAX_LIMIT
 from .sql_guard import guard_sql, GuardError
 from .timeparse import TimeParseError
+from .untrusted_text import UntrustedText
 
 logger = logging.getLogger("ssdf_mcp_query.tools")
+
+# FLOW_COLUMNS fields that carry log-echoed free text with no enforced
+# vocabulary at ingest. Everything else in FLOW_COLUMNS is numeric/IP/port/
+# timestamp or a normalizer-derived field, so it is returned as-is.
+_FLOW_UNTRUSTED_COLUMNS = (
+    "rule_name",
+    "user_name",
+    "observer_ingress_zone",
+    "observer_egress_zone",
+)
 
 
 def _ok(result: dict, requested_limit: int) -> dict:
@@ -24,6 +35,15 @@ def _ok(result: dict, requested_limit: int) -> dict:
         "truncated": result["row_count"] >= requested_limit,
         "elapsed_ms": result.pop("_elapsed_ms", 0),
     }
+
+
+def _wrap_untrusted_columns(rows: list[dict], columns: tuple[str, ...]) -> list[dict]:
+    """Replace known log-echoed free-text columns in-place with UntrustedText responses."""
+    for row in rows:
+        for col in columns:
+            if col in row:
+                row[col] = UntrustedText.from_raw(row[col]).to_response()
+    return rows
 
 
 class Tools:
@@ -67,7 +87,10 @@ class Tools:
             )
         except (BuilderError, TimeParseError, ValueError) as exc:
             return {"error": "validation", "detail": str(exc)}
-        return self._safe_execute(sql, params, min(int(limit), self._max_rows))
+        result = self._safe_execute(sql, params, min(int(limit), self._max_rows))
+        if "rows" in result:
+            _wrap_untrusted_columns(result["rows"], _FLOW_UNTRUSTED_COLUMNS)
+        return result
 
     def top_talkers(self, by="bytes", side="src", since=None, until=None, limit=10) -> dict:
         try:
@@ -109,6 +132,10 @@ class Tools:
             return {"error": "upstream", "detail": "query failed", "correlation_id": cid}
 
     def run_sql(self, query: str) -> dict:
+        """Run an operator-authored, read-only SQL query (guarded by sql_guard).
+
+        Trust tier: operator-authored SQL, rows returned raw and to be treated as untrusted.
+        """
         try:
             safe_sql = guard_sql(query, max_limit=self._max_rows)
         except GuardError as exc:

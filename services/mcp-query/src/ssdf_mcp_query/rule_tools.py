@@ -81,6 +81,10 @@ class RuleTools:
     def rule_history(self, device_name: str, rule_name: str, limit: int = 50) -> dict:
         sql, params = build_rule_history_sql(device_name, rule_name, limit=limit)
         result = self._ch.run(sql, params)
+        # `versions` rows are a device config-history snapshot, the same
+        # provenance as the `config`/`configured_controls` fields in
+        # access_tools.py. Not log-ingest output, so none of it is untrusted
+        # free text in the UntrustedText sense.
         return {
             "device_name": device_name,
             "rule_name": rule_name,
@@ -213,6 +217,9 @@ class RuleTools:
         # code decides, the model explains, and this tool's job stops at citing
         # the data a downstream model would explain.
         status = verdict["status"] if verdict else "unknown"
+        # attrs come from device config, not log-ingest output, so `summary`
+        # and `config` below cite operator-authored text, not untrusted free
+        # text.
         summary = (
             f"{rule_name} on {device_name}: action={attrs.get('action', '')}, "
             f"enabled={attrs.get('enabled', '')}, "
