@@ -245,6 +245,10 @@ class AccessTools:
             except (ValueError, TypeError):
                 continue
         rows = self._store.observers_for_ips(sorted(candidate_ips), _since(window))
+        # observer_hostname is NOT untrusted free text: ingest validates it
+        # against a known-device allowlist, so only recognized values reach
+        # this column. Same trust tier as the `firewalls`/`firewall_basis`
+        # fields in explain_access above.
         firewalls = sorted(
             {_short_host(r["observer_hostname"]) for r in rows if r.get("observer_hostname")}
         )
