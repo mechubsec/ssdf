@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 
 from ssdf_mcp_query.wrapper import audited_tool, row_count_of
@@ -41,6 +43,68 @@ def test_allowed_tool_runs_and_audits_allow():
     assert call["data_classes"] == ["security_log"]
     assert call["row_count"] == 2
     assert call["args"] == {"dst_port": 443}
+
+
+def test_change_impact_junos_current_text_is_hashed_not_stored_in_audit():
+    """A caller can paste device output that carries secrets. The audit row
+    must never hold that text verbatim -- only a hash + length for
+    correlation."""
+    rec = _Recorder()
+    secret_text = (
+        "set security policies from-zone trust to-zone untrust policy X then deny\n"
+        "set system root-authentication encrypted-password REDACTED-NOT-REAL"
+    )
+
+    def fn(junos_current_text=None, delta=None):
+        return {"changed_rules": []}
+
+    wrapped = audited_tool("change_impact", fn, rec, caller=lambda: ("p", None))
+    wrapped(junos_current_text=secret_text, delta={"lines": []})
+
+    audited_args = rec.calls[0]["args"]
+    assert secret_text not in str(audited_args)
+    assert audited_args["junos_current_text"] == {
+        "sha256": hashlib.sha256(secret_text.encode("utf-8")).hexdigest(),
+        "length": len(secret_text),
+    }
+
+
+def test_change_impact_refusal_error_never_contains_rejected_line_text():
+    """This wrapper records `error=f"{type(exc).__name__}: {exc}"` in
+    `ssdf.audit` unconditionally, including the deny/refusal path -- a
+    secret-bearing line in `current_text` must never reach the audit table
+    via the error column either, so the refusal message must never echo the
+    offending line's text."""
+    from ssdf_policy.change_impact import DeltaError, validate_security_policies_only
+
+    rec = _Recorder()
+    secret = "set security ike policy P pre-shared-key ascii-text REDACTED-NOT-REAL"
+    tainted_text = (
+        "set security policies from-zone trust to-zone untrust policy X then deny\n" + secret
+    )
+
+    def fn(junos_current_text=None, delta=None):
+        validate_security_policies_only(junos_current_text)
+        return {"changed_rules": []}
+
+    wrapped = audited_tool("change_impact", fn, rec, caller=lambda: ("p", None))
+    with pytest.raises(DeltaError):
+        wrapped(junos_current_text=tainted_text, delta={"lines": []})
+
+    audited_error = rec.calls[0]["error"]
+    assert secret not in audited_error
+    assert "REDACTED-NOT-REAL" not in audited_error
+
+
+def test_redaction_leaves_other_tools_args_untouched():
+    rec = _Recorder()
+
+    def fn(junos_current_text=None):
+        return {"rows": []}
+
+    wrapped = audited_tool("query_flows", fn, rec, caller=lambda: ("p", None))
+    wrapped(junos_current_text="not actually redacted for this tool")
+    assert rec.calls[0]["args"] == {"junos_current_text": "not actually redacted for this tool"}
 
 
 def test_disallowed_tool_denied_and_not_invoked():

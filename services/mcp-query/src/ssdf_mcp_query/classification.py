@@ -47,6 +47,7 @@ TOOL_DATA_CLASSES: dict[str, frozenset[str]] = {
     "rule_usage": frozenset({"security_log", "firewall_config"}),
     "unused_rules": frozenset({"security_log", "firewall_config"}),
     "explain_rule": frozenset({"security_log", "firewall_config"}),
+    "change_impact": frozenset({"security_log", "firewall_config"}),
 }
 
 

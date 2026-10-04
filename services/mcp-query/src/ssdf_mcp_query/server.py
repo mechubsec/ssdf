@@ -36,6 +36,7 @@ from .metrics_store import MetricsStore
 from .metric_tools import MetricTools
 from .alerts import AlertTools
 from .rule_tools import RuleTools
+from .change_impact_tools import ChangeImpactTools
 
 
 def build_app(tier: str = "sovereign") -> FastMCP:
@@ -53,6 +54,7 @@ def build_app(tier: str = "sovereign") -> FastMCP:
     access = None
     liveness = None
     rule_tools = None
+    change_impact_tools = None
     if tier != "public":
         entity_store = ClickHouseEntityStore(client, tenant="t_main")
         access = AccessTools(entity_store, topo)
@@ -60,6 +62,7 @@ def build_app(tier: str = "sovereign") -> FastMCP:
         fabric = FabricTools(entity_store._ch, liveness=liveness)
         public_snapshot = PublicSnapshotTools(graph_store)
         rule_tools = RuleTools(client, entity_store)
+        change_impact_tools = ChangeImpactTools(client, entity_store)
 
     metrics_store = MetricsStore(client, tenant="t_main")
     metrics = MetricTools(metrics_store)
@@ -306,6 +309,41 @@ def build_app(tier: str = "sovereign") -> FastMCP:
         formatting the cited fields only -- no model-generated safety judgment."""
         return rule_tools.explain_rule(device_name, rule_name, since=since, until=until)
 
+    def change_impact(
+        device_name: str,
+        provider: str,
+        delta: list | dict,
+        junos_current_text: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        deny_logging_observed: dict | None = None,
+    ) -> dict:
+        """Read-only pre-change impact analysis (MEC-570): replays historical flows
+        against the current rulebase and a proposed change, and reports which
+        flows' first-match verdict would change. Never writes to a device -- `delta`
+        is a vendor-neutral JSON op list (add/modify/delete/move/enable/disable), or
+        for Junos only `{"lines": [...]}` of `set`/`delete`/`insert ... before|after`/
+        `activate`/`deactivate` lines applied to `junos_current_text`. Every number in
+        the result is query/evaluator output; "safe" and "no impact" never appear --
+        a zero-session result reads "no historical sessions observed in the
+        analysable scope", or "provably no impact (config-only)" when the change
+        provably can't touch any flow without looking at traffic at all. A
+        deny-widening count with no logged denies in-window is reported "unknown",
+        never 0 (deny-side blindness). Per-zone-pair calibration against the
+        device's own logged `rule_name` gates every verdict: if the evaluator
+        doesn't reproduce what the device actually logged for a zone-pair, that
+        zone-pair's verdicts are "unknown: model does not reproduce device
+        behaviour" instead of a guess. Default window 14 days over raw events."""
+        return change_impact_tools.change_impact(
+            device_name,
+            provider,
+            delta,
+            junos_current_text=junos_current_text,
+            since=since,
+            until=until,
+            deny_logging_observed=deny_logging_observed,
+        )
+
     raw_tools = {
         "query_flows": query_flows,
         "describe_schema": describe_schema,
@@ -332,6 +370,7 @@ def build_app(tier: str = "sovereign") -> FastMCP:
         raw_tools["rule_usage"] = rule_usage
         raw_tools["unused_rules"] = unused_rules
         raw_tools["explain_rule"] = explain_rule
+        raw_tools["change_impact"] = change_impact
     if liveness is not None:  # sovereign-only: ingest liveness
         raw_tools["ingest_status"] = ingest_status
         raw_tools["fabric_status"] = fabric_status
