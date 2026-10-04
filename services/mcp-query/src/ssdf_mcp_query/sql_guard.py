@@ -21,6 +21,13 @@ _BLOCKED_TABLES = {
     "audit",
     "pseudonym_map",
     "topo_observations",
+    # MEC-565: ssdf_ro holds no grant on any of these (022/023/024), so this
+    # is defense in depth, not the primary control -- same posture as `audit`
+    # above, for the same reason: who-did-what content stays off the generic
+    # run_sql surface even if a future grant drifts.
+    "audit_checkpoints",
+    "audit_evidence",
+    "audit_ocsf_export",
 }
 # ClickHouse's IN-family functions accept a bare table name as the set
 # (`globalNotIn(x, ssdf.t)`); sqlglot leaves them as Anonymous calls.

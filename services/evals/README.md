@@ -8,6 +8,26 @@ cadence, and pass-rate policy.
 
 Spec: `docs/superpowers/specs/2026-06-12-ssdf-m8-eval-harness-design.md`.
 
+## What is this benchmark?
+
+This package contains the **NL→SQL benchmark** for evaluating LLM tool-calling accuracy
+on natural language queries against SSDF's ClickHouse firewall log database. The benchmark
+tests whether an agent can:
+
+1. Understand natural language questions about firewall traffic
+2. Translate them to ClickHouse SQL queries
+3. Route to the correct MCP tools
+4. Return structured JSON answers that match SQL-based ground truth
+
+For a detailed overview, including when to use this benchmark vs
+[mechubbench](https://github.com/mechubsec/mechubbench), see `BENCHMARK.md`.
+
+**Why not mechubbench?** mechubbench is a tool-call benchmark for network config tasks
+(e.g., "prepare change set for overly permissive rules"). This NL→SQL benchmark is
+domain-specific to SSDF's ClickHouse schema and firewall log analysis—Conway's Law
+suggests it belongs with the team that owns the data (SSDF), not in a general-purpose
+network automation harness.
+
 ## The contract (3 versioned artifacts)
 
 1. `golden/core.yaml` — the questions. Runner sends each `question` to its
@@ -24,6 +44,9 @@ Spec: `docs/superpowers/specs/2026-06-12-ssdf-m8-eval-harness-design.md`.
    Scorecards are written to `results/<UTC-date>-<model>-<run_id>.json`
    (sanitized) and should be committed to git; git history is the eval
    database.
+
+For a detailed description of the benchmark, including when to use it vs
+[mechubbench](https://github.com/mechubsec/mechubbench), see `BENCHMARK.md`.
 
 ## Runner obligations
 

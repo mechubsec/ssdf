@@ -52,6 +52,12 @@ class Config:
     ch_audit_user: str = "ssdf_audit"
     ch_audit_password: Secret | None = None
     ch_audit_verify_password: Secret | None = None
+    # MEC-565: path to the base64-encoded Ed25519 verifying key for
+    # ssdf.audit chain checkpoints (checkpoint_verify.load_verifying_key).
+    # None disables checkpoint-based verification; verify_audit.py then falls
+    # back to today's behaviour (an expired genesis reports every surviving
+    # row in that chain as unreachable, same as before this feature existed).
+    ch_checkpoint_verify_key_path: str | None = None
     # M16f: default False preserves the existing (best-effort) deploy; set
     # MCP_AUDIT_REQUIRED=1 to refuse startup rather than silently run with
     # audit disabled when CH_AUDIT_PASSWORD is unset.
@@ -205,6 +211,7 @@ def load_config() -> Config:
         ch_audit_user=os.environ.get("CH_AUDIT_USER", "ssdf_audit"),
         ch_audit_password=Secret(audit_password) if audit_password else None,
         ch_audit_verify_password=Secret(audit_verify_password) if audit_verify_password else None,
+        ch_checkpoint_verify_key_path=os.environ.get("CH_CHECKPOINT_VERIFY_KEY_PATH") or None,
         audit_required=os.environ.get("MCP_AUDIT_REQUIRED", "").strip().lower() in ("1", "true"),
         max_execution_time=int(os.environ.get("MCP_MAX_EXEC_SECS", "10")),
         max_result_rows=int(os.environ.get("MCP_MAX_RESULT_ROWS", "100000")),

@@ -8,6 +8,7 @@ import clickhouse_connect
 
 from ssdf_common.clickhouse import client_kwargs as _client_kwargs
 from .config import Config
+from .object_book import diff_new_object_books
 from .policy_versions import diff_new_versions, version_key
 
 # Byte-identical to services/entity/src/ssdf_entity/chwriter.py column orders.
@@ -97,6 +98,43 @@ class ClickHouseEntityWriter:
         )
         return len(versions)
 
+    def append_object_book_hashes(self, collected: list[dict]) -> int:
+        """Append one ssdf.object_book_hash row per device whose resolved
+        object book changed since its last known hash (MEC-992). Same
+        read+diff+INSERT pattern as append_policy_versions, never UPDATE or
+        DELETE."""
+        if not collected:
+            return 0
+        keys = [(item["provider"], item["device_name"]) for item in collected]
+        last_hash_by_key = self._fetch_latest_object_book_hashes(keys)
+        rows = diff_new_object_books(collected, last_hash_by_key)
+        if not rows:
+            return 0
+        for row in rows:
+            row.setdefault("tenant_id", self._config.tenant_id)
+        self._client.insert(
+            "object_book_hash",
+            [[row[c] for c in OBJECT_BOOK_HASH_COLUMNS] for row in rows],
+            column_names=OBJECT_BOOK_HASH_COLUMNS,
+        )
+        return len(rows)
+
+    def _fetch_latest_object_book_hashes(self, keys: list[tuple[str, str]]) -> dict:
+        if not keys:
+            return {}
+        providers = sorted({k[0] for k in keys})
+        devices = sorted({k[1] for k in keys})
+        result = self._client.query(
+            "SELECT provider, device_name, "
+            "argMax(content_hash, valid_from) AS content_hash "
+            "FROM object_book_hash "
+            "WHERE provider IN {providers:Array(String)} "
+            "AND device_name IN {devices:Array(String)} "
+            "GROUP BY provider, device_name",
+            parameters={"providers": providers, "devices": devices},
+        )
+        return {(row[0], row[1]): row[2] for row in result.result_rows}
+
     def _fetch_latest_hashes(self, keys: list[tuple[str, str, str]]) -> dict:
         if not keys:
             return {}
@@ -128,4 +166,13 @@ POLICY_VERSION_COLUMNS = [
     "to_zone",
     "enabled",
     "position",
+]
+
+OBJECT_BOOK_HASH_COLUMNS = [
+    "tenant_id",
+    "provider",
+    "device_name",
+    "valid_from",
+    "content_hash",
+    "object_book",
 ]

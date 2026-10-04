@@ -87,7 +87,15 @@ def test_lowercase_ssdf_table_is_allowed():
 # M16d: a run_sql-only token must not be able to read these tables directly,
 # even though ssdf_ro holds SELECT on them for other, access-controlled tools
 # (reidentify, fabric_status, the audit hash-chain seed).
-BLOCKED_TABLES = ["audit", "pseudonym_map", "topo_observations"]
+BLOCKED_TABLES = [
+    "audit",
+    "pseudonym_map",
+    "topo_observations",
+    # MEC-565
+    "audit_checkpoints",
+    "audit_evidence",
+    "audit_ocsf_export",
+]
 
 
 @pytest.mark.parametrize("table", BLOCKED_TABLES)

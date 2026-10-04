@@ -67,6 +67,25 @@ def resolve_policies(rules: list[dict], tenant: str) -> tuple[list[dict], list[d
             "position": str(rule["position"]),
             "enabled": "true" if rule["enabled"] else "false",
         }
+        # MEC-992: surface the previously-dropped match clauses (and the PAN-OS
+        # negate/schedule bindings) on the entity itself, so a rule using one
+        # is visibly flagged rather than silently indistinguishable from a
+        # rule that matches everything.
+        if "match_unknown" in rule:
+            attrs["match_unknown"] = "true" if rule["match_unknown"] else "false"
+            attrs["source_address_excluded"] = (
+                "true" if rule["source_address_excluded"] else "false"
+            )
+            attrs["dest_address_excluded"] = "true" if rule["dest_address_excluded"] else "false"
+            attrs["source_identity"] = _join(rule["source_identity"])
+            attrs["dynamic_application"] = _join(rule["dynamic_application"])
+            attrs["url_category"] = _join(rule["url_category"])
+            attrs["source_end_user_profile"] = _join(rule["source_end_user_profile"])
+            attrs["scheduler_name"] = rule["scheduler_name"]
+        if "negate_source" in rule:
+            attrs["negate_source"] = "true" if rule["negate_source"] else "false"
+            attrs["negate_destination"] = "true" if rule["negate_destination"] else "false"
+            attrs["schedule"] = rule["schedule"]
         attrs.update(rule.get("vendor_extras") or {})
         policy = {
             "entity_id": pol_eid,

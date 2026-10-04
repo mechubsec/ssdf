@@ -179,3 +179,41 @@ def test_append_policy_versions_skips_unchanged_rule(monkeypatch):
     n = writer.append_policy_versions([policy])
     assert n == 0
     assert fake.inserted is None
+
+
+def _collected_object_book(device="vSRX-test10", provider="juniper"):
+    return {
+        "provider": provider,
+        "device_name": device,
+        "collected_at": "2026-09-30T00:00:00.000Z",
+        "object_book": {"address_books": {"global": {"addresses": {"A1": "10.1.1.0/24"}}}},
+    }
+
+
+def test_append_object_book_hashes_no_devices_is_noop(monkeypatch):
+    writer, fake = _writer_with_fake_client(monkeypatch)
+    assert writer.append_object_book_hashes([]) == 0
+    assert fake.inserted is None
+
+
+def test_append_object_book_hashes_inserts_new_device(monkeypatch):
+    writer, fake = _writer_with_fake_client(monkeypatch, query_rows=[])
+    n = writer.append_object_book_hashes([_collected_object_book()])
+    assert n == 1
+    assert fake.insert_table == "object_book_hash"
+    rows, columns = fake.inserted
+    assert columns == chwriter.OBJECT_BOOK_HASH_COLUMNS
+    assert rows[0][columns.index("device_name")] == "vSRX-test10"
+    assert rows[0][columns.index("tenant_id")] == "t_main"
+
+
+def test_append_object_book_hashes_skips_unchanged_device(monkeypatch):
+    from ssdf_policy.object_book import content_hash
+
+    item = _collected_object_book()
+    existing_hash = content_hash(item["object_book"])
+    query_rows = [("juniper", "vSRX-test10", existing_hash)]
+    writer, fake = _writer_with_fake_client(monkeypatch, query_rows=query_rows)
+    n = writer.append_object_book_hashes([item])
+    assert n == 0
+    assert fake.inserted is None

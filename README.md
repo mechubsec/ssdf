@@ -25,6 +25,16 @@ Two principles shape every design decision:
 - **Rust is permitted, not doctrine** — use it where a future component is genuinely performance-critical; nothing in SSDF is Rust today. `rust-junosmcp` remains the external reference implementation, not part of this repo.
 - **No Docker.** Each component is a plain systemd unit on its own host; the reference deployment uses one container per role. Nothing in the design depends on that particular substrate.
 
+## Benchmarks
+
+SSDF includes two benchmark packages for evaluating LLM tool-calling accuracy:
+
+- **NL→SQL benchmark** (`services/evals/`) — evaluates translation of natural language to ClickHouse SQL queries against SSDF's firewall log data. See `services/evals/BENCHMARK.md` for details. **This benchmark is domain-specific to SSDF's data model** and is not suitable for general SQL generation evaluation.
+
+- **Tool-call benchmark** ([mechubbench](https://github.com/mechubsec/mechubbench)) — evaluates routing to network automation tools (config management, policy auditing) on general firewall scenarios. This is a **separate repository** and is not included in SSDF—it's for general network automation evaluation, not SSDF-specific SQL queries.
+
+Why two separate benchmarks? Per Conway's Law, the NL→SQL benchmark belongs in SSDF (it requires SSDF's ClickHouse schema and data), while tool-call benchmarks for general network automation belong in the shared `mechubbench` repo. The two test different skills: SQL generation vs. tool routing.
+
 ## Architecture
 
 Data flows one direction; LLM agents are read-only consumers via MCP:

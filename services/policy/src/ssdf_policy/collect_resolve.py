@@ -44,9 +44,12 @@ def run_once(
 
     ``version_writer``, when given, appends ssdf.policy_versions rows for any
     configured-policy entity whose content changed since its last known version
-    (MEC-566). Optional and additive: existing callers that omit it are unchanged.
+    (MEC-566), and ssdf.object_book_hash rows for any device whose resolved
+    address/application/service object book changed (MEC-992). Optional and
+    additive: existing callers that omit it are unchanged.
     """
     all_rules: list[dict] = []
+    all_object_books: list[dict] = []
     for name in enabled:
         try:
             collector = collector_factory(name)
@@ -54,6 +57,20 @@ def run_once(
             all_rules.extend(collector.collect(client, now))
         except Exception:
             log.warning("policy collector %r failed; skipping", name, exc_info=True)
+            continue
+        # MEC-992: object-book collection is additive and independent of rule
+        # collection -- a failure here must not be mistaken for the rules
+        # themselves failing to collect (all_rules above already has them).
+        collect_objects = getattr(collector, "collect_objects", None)
+        if collect_objects is not None:
+            try:
+                all_object_books.extend(collect_objects(client, now))
+            except Exception:
+                log.warning(
+                    "policy collector %r: object book collection failed; skipping",
+                    name,
+                    exc_info=True,
+                )
     entities, edges = resolve_policies(all_rules, tenant)
     n_ent = writer.replace_entities(entities)
     n_edge = writer.replace_edges(edges)
@@ -68,6 +85,11 @@ def run_once(
             # itself failed to resolve/write" (n_ent/n_edge above already
             # succeeded and are returned regardless).
             log.warning("policy_versions append failed; continuing", exc_info=True)
+        try:
+            n_obj = version_writer.append_object_book_hashes(all_object_books)
+            log.info("policy resolver: %d object_book_hash rows appended", n_obj)
+        except Exception:
+            log.warning("object_book_hash append failed; continuing", exc_info=True)
     log.info("policy resolver: %d entities, %d edges upserted", n_ent, n_edge)
     return n_ent, n_edge
 

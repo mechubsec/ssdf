@@ -58,6 +58,11 @@ def _text(entry: ET.Element, tag: str) -> str:
     return el.text.strip() if el is not None and el.text else ""
 
 
+def _restricts(members: list[str]) -> bool:
+    """True if a PAN-OS member list narrows the match beyond "no restriction"."""
+    return members not in ([], ["any"])
+
+
 def parse_security_rules(text: str, device_name: str, now: str) -> list[dict]:
     """Parse a PAN-OS security rulebase into normalized rule dicts (order preserved)."""
     root = _root(text)
@@ -68,6 +73,11 @@ def parse_security_rules(text: str, device_name: str, now: str) -> list[dict]:
         name = entry.get("name", "").strip()
         if not name:
             continue
+        schedule = _text(entry, "schedule")
+        source_user = _members(entry, "source-user")
+        url_category = _members(entry, "category")
+        source_hip = _members(entry, "source-hip")
+        destination_hip = _members(entry, "destination-hip")
         rules.append(
             {
                 "provider": PROVIDER,
@@ -84,6 +94,28 @@ def parse_security_rules(text: str, device_name: str, now: str) -> list[dict]:
                 "enabled": _text(entry, "disabled").lower() != "yes",
                 "vendor_extras": {"panw.panos.uuid": entry.get("uuid", "")},
                 "collected_at": now,
+                # MEC-992: negate flags and schedule binding. Both are
+                # deterministic once the schedule/address objects are
+                # resolved (schedules aren't semantically evaluated by this
+                # task -- that's the change_impact evaluator's job -- but the
+                # binding itself must not be silently dropped).
+                "negate_source": _text(entry, "negate-source").lower() == "yes",
+                "negate_destination": _text(entry, "negate-destination").lower() == "yes",
+                "schedule": schedule,
+                "source_user": source_user,
+                "url_category": url_category,
+                "source_hip": source_hip,
+                "destination_hip": destination_hip,
+                # MEC-992 review (F5): a schedule, or a source-user/category/HIP
+                # restriction, are clauses this collector records but does not
+                # evaluate. Without this flag a rule scoped to "corp\\alice" or
+                # a URL category reads as matching every user and every site --
+                # broader than it actually is.
+                "match_unknown": bool(schedule)
+                or _restricts(source_user)
+                or _restricts(url_category)
+                or _restricts(source_hip)
+                or _restricts(destination_hip),
             }
         )
     return rules
@@ -140,6 +172,143 @@ _HITCOUNT_OP_COMMAND = (
 )
 
 
+ADDRESS_XPATH = "/config/devices/entry/vsys/entry[@name='vsys1']/address"
+ADDRESS_GROUP_XPATH = "/config/devices/entry/vsys/entry[@name='vsys1']/address-group"
+SERVICE_XPATH = "/config/devices/entry/vsys/entry[@name='vsys1']/service"
+SERVICE_GROUP_XPATH = "/config/devices/entry/vsys/entry[@name='vsys1']/service-group"
+SCHEDULE_XPATH = "/config/devices/entry/vsys/entry[@name='vsys1']/schedule"
+
+
+def _object_entries(root: ET.Element) -> list[ET.Element]:
+    """Locate `<entry>` object definitions regardless of get_panos_config's envelope
+    (full `<config>` doc, a bare `<address>`/`<address-group>`/... container, or a
+    bare list of `<entry>`)."""
+    if root.tag == "entry":
+        return [root]
+    entries = root.findall("entry")
+    if entries:
+        return entries
+    for child in root:
+        entries = child.findall("entry")
+        if entries:
+            return entries
+    return []
+
+
+def parse_address_objects(text: str) -> dict[str, dict]:
+    """Parse a PAN-OS `<address>` container into `{name: {...}}`.
+
+    Static objects only (ip-netmask, ip-range, fqdn); `fqdn` resolves to
+    `{"kind": "unknown", "reason": "fqdn"}` since it is not resolvable without
+    a live DNS lookup at collection time.
+    """
+    root = _root(text)
+    if root is None:
+        return {}
+    objects: dict[str, dict] = {}
+    for entry in _object_entries(root):
+        name = entry.get("name", "").strip()
+        if not name:
+            continue
+        if val := _text(entry, "ip-netmask"):
+            objects[name] = {"kind": "ip-netmask", "value": val}
+        elif val := _text(entry, "ip-range"):
+            objects[name] = {"kind": "ip-range", "value": val}
+        elif val := _text(entry, "ip-wildcard"):
+            objects[name] = {"kind": "ip-wildcard", "value": val}
+        elif _text(entry, "fqdn"):
+            objects[name] = {"kind": "unknown", "reason": "fqdn"}
+        else:
+            objects[name] = {"kind": "unknown", "reason": "unrecognized-address-type"}
+    return objects
+
+
+def parse_address_groups(text: str) -> dict[str, dict]:
+    """Parse a PAN-OS `<address-group>` container into `{name: {...}}`.
+
+    Static groups only, per MEC-992 §5 -- dynamic address groups (DAG,
+    tag-based `<dynamic><filter>`) are out of scope and resolve to
+    `{"kind": "unknown", "reason": "dynamic-address-group"}`.
+    """
+    root = _root(text)
+    if root is None:
+        return {}
+    groups: dict[str, dict] = {}
+    for entry in _object_entries(root):
+        name = entry.get("name", "").strip()
+        if not name:
+            continue
+        if entry.find("dynamic") is not None:
+            groups[name] = {"kind": "unknown", "reason": "dynamic-address-group"}
+        else:
+            groups[name] = {"kind": "static", "members": _members(entry, "static")}
+    return groups
+
+
+def _service_protocol(entry: ET.Element) -> dict:
+    protocol_el = entry.find("protocol")
+    if protocol_el is None:
+        return {}
+    for proto in ("tcp", "udp"):
+        proto_el = protocol_el.find(proto)
+        if proto_el is not None:
+            return {
+                "protocol": proto,
+                "port": _text(proto_el, "port"),
+                "source_port": _text(proto_el, "source-port"),
+            }
+    return {}
+
+
+def parse_service_objects(text: str) -> dict[str, dict]:
+    """Parse a PAN-OS `<service>` container into `{name: {"protocol", "port", ...}}`."""
+    root = _root(text)
+    if root is None:
+        return {}
+    services: dict[str, dict] = {}
+    for entry in _object_entries(root):
+        name = entry.get("name", "").strip()
+        if not name:
+            continue
+        services[name] = _service_protocol(entry) or {
+            "kind": "unknown",
+            "reason": "unrecognized-protocol",
+        }
+    return services
+
+
+def parse_service_groups(text: str) -> dict[str, dict]:
+    """Parse a PAN-OS `<service-group>` container into `{name: {"members": [...]}}`."""
+    root = _root(text)
+    if root is None:
+        return {}
+    groups: dict[str, dict] = {}
+    for entry in _object_entries(root):
+        name = entry.get("name", "").strip()
+        if not name:
+            continue
+        groups[name] = {"members": _members(entry, "members")}
+    return groups
+
+
+def parse_schedules(text: str) -> dict[str, dict]:
+    """Parse a PAN-OS `<schedule>` container into `{name: {}}`.
+
+    Presence/name only: schedule *evaluation* (whether it is currently active)
+    is the change_impact evaluator's job (task C of MEC-570), not this
+    collector's -- this just makes sure a rule's `schedule` binding resolves
+    to a known object rather than an unresolvable string.
+    """
+    root = _root(text)
+    if root is None:
+        return {}
+    return {
+        entry.get("name", "").strip(): {}
+        for entry in _object_entries(root)
+        if entry.get("name", "").strip()
+    }
+
+
 @register("panos")
 class PanosPolicyCollector:
     """Collects the configured security rulebase from one PAN-OS firewall."""
@@ -187,3 +356,73 @@ class PanosPolicyCollector:
                 exc_info=True,
             )
         return rules
+
+    def collect_objects(self, client, now: str) -> list[dict]:
+        """Read the device's address/service object book (MEC-992).
+
+        Each xpath is fetched independently, but a failed fetch, a truncated
+        envelope, or XML that doesn't parse for ANY one of the five aborts the
+        whole device's object book for this pass (returns `[]`) rather than
+        emitting a partial book. MEC-992 review (F4): the earlier per-key
+        `object_book[key] = {}` behavior looked identical to a legitimately
+        empty container (e.g. `<address/>`), so a single transient failure got
+        recorded as a genuine "object book changed" row in
+        ssdf.object_book_hash -- and every later change_impact query over
+        that window silently couldn't resolve a single address. A skipped
+        pass leaves the previous hash as the latest-known good one instead.
+        """
+        fetches = (
+            ("addresses", ADDRESS_XPATH, parse_address_objects),
+            ("address_groups", ADDRESS_GROUP_XPATH, parse_address_groups),
+            ("services", SERVICE_XPATH, parse_service_objects),
+            ("service_groups", SERVICE_GROUP_XPATH, parse_service_groups),
+            ("schedules", SCHEDULE_XPATH, parse_schedules),
+        )
+        object_book: dict[str, dict] = {}
+        for key, xpath, parser in fetches:
+            try:
+                text = client.call_tool("get_panos_config", {"device": self.device, "xpath": xpath})
+            except Exception:
+                logger.warning(
+                    "panos %r: %s object fetch failed; refusing object book for this pass",
+                    self.device,
+                    key,
+                    exc_info=True,
+                )
+                return []
+            if envelope_truncated(text):
+                logger.warning(
+                    "panos %r: %s object fetch truncated; refusing object book for this pass",
+                    self.device,
+                    key,
+                )
+                return []
+            if _root(text) is None:
+                # A container that legitimately has no entries (`<address/>`)
+                # still parses to a real Element; only genuinely unparseable
+                # XML hits this branch, so this can't misclassify "empty" as
+                # "failed".
+                logger.warning(
+                    "panos %r: %s object fetch did not parse; refusing object book for this pass",
+                    self.device,
+                    key,
+                )
+                return []
+            try:
+                object_book[key] = parser(text)
+            except Exception:
+                logger.warning(
+                    "panos %r: %s object parse failed; refusing object book for this pass",
+                    self.device,
+                    key,
+                    exc_info=True,
+                )
+                return []
+        return [
+            {
+                "provider": PROVIDER,
+                "device_name": self.device,
+                "collected_at": now,
+                "object_book": object_book,
+            }
+        ]
