@@ -1,0 +1,48 @@
+[Unit]
+Description=SSDF ClickHouse Database
+After=network-online.target
+Wants=network-online.target
+Documentation=https://clickhouse.com/docs
+
+[Service]
+Type=simple
+User=clickhouse
+Group=clickhouse
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_NICE CAP_IPC_LOCK CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_DAC_OVERRIDE CAP_SYS_NICE CAP_IPC_LOCK CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CacheDirectory=clickhouse
+LogsDirectory=clickhouse
+ConfigurationDirectory=clickhouse
+RuntimeDirectory=clickhouse
+RuntimeDirectoryMode=0750
+Environment=CLICKHOUSE_CONFIG=/etc/clickhouse-server/config.xml
+
+# Listen address (0.0.0.0 for all interfaces)
+Environment=CLICKHOUSE_HOST=0.0.0.0
+
+# HTTP port (default: 8123)
+Environment=CLICKHOUSE_HTTP_PORT=8123
+
+# Native protocol port (default: 9000)
+Environment=CLICKHOUSE_TCP_PORT=9000
+
+# Start command
+ExecStart=/usr/bin/clickhouse-server --config-file=/etc/clickhouse-server/config.xml
+
+# Restart policy
+Restart=on-failure
+RestartSec=3
+
+# Resource limits
+LimitCORE=infinity
+LimitNOFILE=262144
+
+# Directory permissions
+ReadWritePaths=/var/lib/clickhouse /var/log/clickhouse-server
+
+[Install]
+WantedBy=multi-user.target
