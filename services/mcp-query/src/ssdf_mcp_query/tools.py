@@ -17,8 +17,7 @@ logger = logging.getLogger("ssdf_mcp_query.tools")
 
 # FLOW_COLUMNS fields that carry log-echoed free text with no enforced
 # vocabulary at ingest. Everything else in FLOW_COLUMNS is numeric/IP/port/
-# timestamp or a field normalized to a fixed vocabulary, so it is returned
-# as-is.
+# timestamp or a normalizer-derived field, so it is returned as-is.
 _FLOW_UNTRUSTED_COLUMNS = (
     "rule_name",
     "user_name",
@@ -135,15 +134,7 @@ class Tools:
     def run_sql(self, query: str) -> dict:
         """Run an operator-authored, read-only SQL query (guarded by sql_guard).
 
-        Contract: unlike the purpose-built tools above, the row shape here is
-        whatever columns the caller's own SELECT names, so there is no fixed
-        allowlist of free-text columns to wrap. Rows are returned RAW -- every
-        string-typed cell must be treated by the caller as untrusted,
-        log-derived free text (same threat model as UntrustedText) unless the
-        caller's own query is known to select only structural/numeric columns.
-        This tool is for operators composing their own SQL, a different trust
-        tier from the fixed-shape tools, so unsanitized-raw is the documented
-        contract rather than an oversight.
+        Trust tier: operator-authored SQL, rows returned raw and to be treated as untrusted.
         """
         try:
             safe_sql = guard_sql(query, max_limit=self._max_rows)
