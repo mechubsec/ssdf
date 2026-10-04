@@ -10,4 +10,13 @@ regexes = [
     '00112233445566778899aabbccddeeff',
     'SANITIZED_KEY_[0-9a-z]',
     '(ASA|OPENSSH|EC|PKCS8)-PRIVATE-BLOCK-ORIGINAL',
+    # MEC-565: synthetic Ed25519 checkpoint-signature known-answer fixtures
+    # (base64-encoded public keys and signatures, no private key material)
+    # in test_checkpoint_verify.py / test_verify_audit.py. These exercise
+    # cross-implementation verification against mechubsec/mecmcp's Rust
+    # signer and are not credentials of any kind.
+    'eq9vdjiCq9yRMn3C7MQmI6QFOkxq52Bb4PRExbLQ0GM=',
+    'AtqHG8dIiOhQanjTfmfJcED8/U6XfQLxeyANTVzwusk=',
+    'ynK96u2ASYHKQIBzfKs1U9AZBYtBQQ/NjRr5rIKnrl2uL2WSOh\+nWi3pNc3DwUYhNiKnuWjEeOSRKaZqK/dPCQ==',
+    'YpCXYBv7x5nVgoxe8z2HFu5jAKUQIb8xrAhJ/9TP20bMwm20AqgEB0b4fsRpshlCUAFFYSXzhnYNwGhAIzLYBg==',
 ]

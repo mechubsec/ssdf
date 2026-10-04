@@ -9,6 +9,7 @@ dependencies = [
     "sqlglot>=25.0",
     "networkx>=3.0",
     "ssdf-common",
+    "cryptography>=48.0.0",
 ]
 
 [project.optional-dependencies]

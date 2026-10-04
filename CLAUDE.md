@@ -425,6 +425,13 @@ Device naming: see docs/naming-standard.md (fleet role-renamed 2026-07-06).
 - Installed editable on ct109 (5 services) + ct106 + ct113: `pip install -e /opt/src/common --no-deps`. Each service venv needs it alongside the service itself; a fresh deploy adds the editable install step.
 - No code change to services — each reuses its shim `config.py`/`collectors/` (re-exports from `ssdf_common`). Cross-service helpers now centralized; future shared patterns land in `ssdf_common` (no per-service duplication).
 
+### M17 (audit-chain checkpoints + long-retention evidence tier)
+- Unit tests: `cd services/mcp-query && uv run pytest -m "not integration"` (adds checkpoint/verify/evidence-archive/orchestrator suites).
+- Apply checkpoints schema + user: `: "${CH_CHECKPOINT_PASSWORD:?}" && CHECKPOINT_PW="$CH_CHECKPOINT_PASSWORD" envsubst < infra/clickhouse/022_audit_checkpoints.sql | clickhouse-client --host <ct104> --multiquery` (creates `ssdf.audit_checkpoints` + `ssdf_checkpoint`; grants `ssdf_audit_verify` read access).
+- Apply evidence tier schema + user: `: "${CH_ARCHIVER_PASSWORD:?}" && ARCHIVER_PW="$CH_ARCHIVER_PASSWORD" envsubst < infra/clickhouse/023_audit_evidence.sql | clickhouse-client --host <ct104> --multiquery` (creates `ssdf.audit_evidence` + `ssdf_archiver`; grants `ssdf_audit_verify`/`ssdf_checkpoint` read access). Must run after 022.
+- Apply OCSF export view + users: `: "${CH_OCSF_DEFINER_PASSWORD:?}" "${CH_AUDIT_EXPORT_PASSWORD:?}" && OCSF_DEFINER_PW="$CH_OCSF_DEFINER_PASSWORD" AUDIT_EXPORT_PW="$CH_AUDIT_EXPORT_PASSWORD" envsubst < infra/clickhouse/024_audit_ocsf_export.sql | clickhouse-client --host <ct104> --multiquery` (creates `ssdf.audit_ocsf_export`, `ssdf_audit_ocsf_definer`, `ssdf_audit_export`). Must run after 023. All four passwords are required — an unset/empty one aborts the apply rather than silently creating a passworded-by-empty-string user.
+- Run `scripts/checkpoint_audit.py` and `scripts/archive_audit.py` on a schedule (e.g. daily, via the deploy's scheduler of choice); neither schedules itself.
+
 Future Rust/Python components will record their own commands here as they are scaffolded.
 
 ## Related external systems
