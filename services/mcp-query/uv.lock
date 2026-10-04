@@ -1376,6 +1376,7 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "clickhouse-connect" },
+    { name = "cryptography" },
     { name = "fastmcp" },
     { name = "networkx" },
     { name = "sqlglot" },
@@ -1395,6 +1396,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "clickhouse-connect", specifier = ">=0.8" },
+    { name = "cryptography", specifier = ">=48.0.0" },
     { name = "fastmcp", specifier = ">=2.0" },
     { name = "networkx", specifier = ">=3.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
