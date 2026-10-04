@@ -374,10 +374,10 @@ def test_a_checkpoint_near_the_chain_tip_is_not_selected_over_the_matching_one()
     first_run = _chain(2)
     surviving = _chain(2, first_prev=first_run[-1]["row_hash"])
     matching_checkpoint = _signed_checkpoint(
-        signing_key, first_run[-1]["row_hash"], "2026-09-15T00:00:00.000Z"
+        signing_key, first_run[-1]["row_hash"], "2026-09-15T00:00:00.000Z", row_count=2
     )
     near_tip_checkpoint = _signed_checkpoint(
-        signing_key, surviving[-1]["row_hash"], "2026-09-16T00:00:00.000Z"
+        signing_key, surviving[-1]["row_hash"], "2026-09-16T00:00:00.000Z", row_count=4
     )
     issues = verify_tier(
         surviving,
@@ -457,13 +457,15 @@ def test_checkpoint_does_not_mask_a_real_tamper_on_the_surviving_rows():
     assert any(i["type"] == "content_edit" for i in issues)
 
 
-def _signed_checkpoint(signing_key, head_row_hash: str, checkpoint_ts: str) -> Checkpoint:
+def _signed_checkpoint(
+    signing_key, head_row_hash: str, checkpoint_ts: str, row_count: int = 1
+) -> Checkpoint:
     from ssdf_mcp_query.checkpoint_verify import canonical_digest
 
     unsigned = Checkpoint(
         tier="sovereign",
         server_id="",
-        row_count=1,
+        row_count=row_count,
         head_row_hash=head_row_hash,
         checkpoint_ts=checkpoint_ts,
         signature="",
@@ -486,13 +488,18 @@ def test_bridge_through_evidence_rows_anchors_a_predecessor_the_checkpoint_does_
     signing_key = Ed25519PrivateKey.generate()
     verifying_key = signing_key.public_key().public_bytes_raw()
 
-    full_chain = _chain(5)
+    full_chain = _chain(5)  # ts base 2026-06-10, rows 12:00:00 .. 12:00:04
     checkpoint = _signed_checkpoint(
-        signing_key, full_chain[0]["row_hash"], "2026-01-01T00:00:00.000Z"
+        # After the chain's own rows, so this fixture's surviving rows are
+        # never "newer than the latest checkpoint" -- this test is about
+        # bridging/anchoring, not about MEC-1634's stale_checkpoint check.
+        signing_key,
+        full_chain[0]["row_hash"],
+        "2026-06-11T00:00:00.000Z",
     )
     bridge_rows = full_chain[1:3]  # rows between the checkpoint head and the TTL boundary
     surviving = full_chain[3:]  # all that remains in ssdf.audit
-    now = dt.datetime(2026, 4, 15, tzinfo=dt.timezone.utc)  # ~104 days later: old enough
+    now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)  # ~100 days later: old enough
 
     issues_without_bridge = verify_tier(
         surviving, checkpoints=[checkpoint], verifying_key=verifying_key, now=now
@@ -652,6 +659,190 @@ def test_recent_checkpoint_with_invalid_signature_is_not_skipped_silently():
         i["type"] == "unverifiable_checkpoint" and i["row_hash"] == full_chain[-1]["row_hash"]
         for i in issues
     )
+
+
+def test_checkpoint_head_missing_is_not_masked_by_a_replayed_but_too_young_bridge_row():
+    """A bridge row that is not old enough to have legitimately reached the
+    evidence tier must not be accepted as proof a checkpoint head survives."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+
+    full_chain = _chain(5)
+    checkpoint = _signed_checkpoint(
+        signing_key, full_chain[3]["row_hash"], "2026-04-01T00:00:00.000Z"
+    )
+    now = dt.datetime(2026, 4, 15, tzinfo=dt.timezone.utc)  # 14 days later: not old enough
+
+    replacement_tail = _chain(2, first_prev=full_chain[1]["row_hash"])
+    live_rows = full_chain[:2] + replacement_tail
+
+    issues_alone = verify_tier(
+        live_rows, checkpoints=[checkpoint], verifying_key=verifying_key, now=now
+    )
+    assert any(i["type"] == "checkpoint_head_missing" for i in issues_alone)
+
+    original_tail = full_chain[2:4]  # the real rows 3-4, replayed verbatim
+    issues_with_bridge = verify_tier(
+        live_rows,
+        checkpoints=[checkpoint],
+        bridge_rows=original_tail,
+        verifying_key=verifying_key,
+        now=now,
+    )
+    assert any(i["type"] == "checkpoint_head_missing" for i in issues_with_bridge), (
+        "a too-young bridge row must not vouch for a checkpoint head it did not "
+        "legitimately outlive"
+    )
+
+
+def test_checkpoint_head_missing_is_not_masked_by_a_content_tampered_bridge_row():
+    """Even when a bridge row's age alone would pass, a content tamper must
+    still be caught before it can vouch for a checkpoint head -- presence
+    under the right dict key is not proof the stored content is genuine."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+
+    full_chain = _chain(5)  # ts base 2026-06-10
+    checkpoint = _signed_checkpoint(
+        signing_key, full_chain[3]["row_hash"], "2026-09-05T00:00:00.000Z"
+    )
+    now = dt.datetime(2026, 9, 10, tzinfo=dt.timezone.utc)  # checkpoint itself only 5 days old
+
+    live_rows = full_chain[:2]  # rows 3-5 no longer in ssdf.audit
+    bridge_row = dict(full_chain[3])
+    bridge_row["tool"] = "TAMPERED"  # dict key (row_hash) unchanged; content no longer matches
+
+    issues = verify_tier(
+        live_rows,
+        checkpoints=[checkpoint],
+        bridge_rows=[bridge_row],
+        verifying_key=verifying_key,
+        now=now,
+    )
+    assert any(i["type"] == "checkpoint_head_missing" for i in issues)
+
+
+def test_checkpoint_head_missing_is_not_flagged_when_bridge_row_is_genuinely_archived():
+    """The positive case: a bridge row that is both old enough (per
+    ``_AUDIT_TTL_DAYS - _CHECKPOINT_INTERVAL_SLACK_DAYS``) and unmodified
+    must still vouch for a young checkpoint's head, exactly as before this
+    fix -- the gate must not reject legitimate archived material."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+
+    full_chain = _chain(5)  # ts base 2026-06-10, ~92 days before `now` below
+    checkpoint = _signed_checkpoint(
+        signing_key, full_chain[3]["row_hash"], "2026-09-05T00:00:00.000Z"
+    )
+    now = dt.datetime(2026, 9, 10, tzinfo=dt.timezone.utc)  # checkpoint only 5 days old
+
+    live_rows = full_chain[:2]
+    bridge_row = dict(full_chain[3])  # genuinely archived, unmodified
+
+    issues = verify_tier(
+        live_rows,
+        checkpoints=[checkpoint],
+        bridge_rows=[bridge_row],
+        verifying_key=verifying_key,
+        now=now,
+    )
+    assert not any(i["type"] == "checkpoint_head_missing" for i in issues)
+
+
+def test_stale_checkpoint_is_flagged_when_the_checkpoint_job_has_stalled():
+    """MEC-1634 finding 2: if the checkpoint job stops, or its rows are
+    deleted, nothing else here would ever notice -- there is simply no
+    recent checkpoint left to check reachability or a head against. This
+    must be flagged on its own rather than only showing up once some other,
+    checkpoint-dependent tamper happens to occur."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+
+    rows = _chain(3)  # ts 12:00:00, 12:00:01, 12:00:02 on 2026-06-10
+    checkpoint = _signed_checkpoint(signing_key, rows[1]["row_hash"], "2026-06-10T12:00:01.500Z")
+    now = dt.datetime(2026, 6, 14, 12, 0, 0, tzinfo=dt.timezone.utc)  # checkpoint ~4 days stale
+
+    issues = verify_tier(rows, checkpoints=[checkpoint], verifying_key=verifying_key, now=now)
+    assert any(i["type"] == "stale_checkpoint" for i in issues)
+
+
+def test_stale_checkpoint_is_not_flagged_when_the_checkpoint_covers_all_rows():
+    """No row is newer than the latest checkpoint, so there is nothing for
+    the checkpoint job to have fallen behind on -- an old checkpoint alone
+    must not be enough to flag staleness."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+
+    rows = _chain(3)
+    checkpoint = _signed_checkpoint(signing_key, rows[-1]["row_hash"], "2026-06-10T12:00:02.000Z")
+    now = dt.datetime(2026, 6, 20, tzinfo=dt.timezone.utc)
+
+    issues = verify_tier(rows, checkpoints=[checkpoint], verifying_key=verifying_key, now=now)
+    assert not any(i["type"] == "stale_checkpoint" for i in issues)
+
+
+def test_checkpoint_count_regression_is_flagged_when_row_count_does_not_increase():
+    """MEC-1634 finding 2: a legitimate checkpoint job's signed row_count is
+    cumulative. A later, validly-signed checkpoint reporting a row_count no
+    greater than an earlier one means checkpoint rows were deleted or the
+    job restarted against a stale baseline -- a tamper invisible to every
+    other check here, since it never touches ssdf.audit."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+
+    rows = _chain(5)
+    earlier = _signed_checkpoint(
+        signing_key, rows[1]["row_hash"], "2026-06-10T00:00:00.000Z", row_count=10
+    )
+    later = _signed_checkpoint(
+        signing_key, rows[3]["row_hash"], "2026-06-11T00:00:00.000Z", row_count=8
+    )
+
+    issues = verify_tier(
+        rows,
+        checkpoints=[earlier, later],
+        verifying_key=verifying_key,
+        now=dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc),
+    )
+    assert any(
+        i["type"] == "checkpoint_count_regression" and i["row_hash"] == later.head_row_hash
+        for i in issues
+    )
+
+
+def test_checkpoint_count_regression_is_not_flagged_when_row_count_increases():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+
+    rows = _chain(5)
+    earlier = _signed_checkpoint(
+        signing_key, rows[1]["row_hash"], "2026-06-10T00:00:00.000Z", row_count=8
+    )
+    later = _signed_checkpoint(
+        signing_key, rows[3]["row_hash"], "2026-06-11T00:00:00.000Z", row_count=10
+    )
+
+    issues = verify_tier(
+        rows,
+        checkpoints=[earlier, later],
+        verifying_key=verifying_key,
+        now=dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc),
+    )
+    assert not any(i["type"] == "checkpoint_count_regression" for i in issues)
 
 
 def test_main_still_reports_a_chain_whose_rows_are_all_gone(monkeypatch):

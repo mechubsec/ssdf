@@ -427,8 +427,11 @@ def test_run_self_verifies_past_an_expired_genesis_via_the_evidence_bridge(monke
     # Anchors the now-expired genesis; old enough to stand in for it.
     anchor_checkpoint = _sign(genesis_hash, 1, "2026-01-01T00:00:00.000Z", "k1")
     # The most recent checkpoint, used by compute_next_checkpoint's forward
-    # walk -- unrelated to the self-verification bridge above.
-    recent_checkpoint = _sign(s1_hash, 3, "2026-05-28T00:00:00.000Z", "k2")
+    # walk -- unrelated to the self-verification bridge above. Dated within
+    # a day of `now` (rather than further back) so MEC-1634's
+    # stale_checkpoint check does not fire on this fixture's rows, which are
+    # all hardcoded to ts=2026-06-10 regardless of `now` (see _audit_row).
+    recent_checkpoint = _sign(s1_hash, 3, "2026-05-31T00:00:00.000Z", "k2")
 
     client = _FakeClient(
         audit_rows=[s1_tuple, s2_tuple],
@@ -451,6 +454,53 @@ def test_run_self_verifies_past_an_expired_genesis_via_the_evidence_bridge(monke
     result = checkpoint_audit.run(client, "binary", "key", now=now, verifying_key=verifying_key)
 
     assert result.skipped == [], "self-verification must bridge through audit_evidence, not stall"
+    assert result.inserted == [signed]
+
+
+def test_run_checkpoints_a_stale_chain_instead_of_skipping_it_forever(monkeypatch):
+    """The checkpoint job is the only thing that can extend a chain's newest
+    verified checkpoint, so its own self-verification must not refuse to do
+    so just because that checkpoint has fallen behind schedule -- that would
+    be self-perpetuating and leave the chain stuck skipped indefinitely."""
+    from ssdf_mcp_query.checkpoint_verify import Checkpoint, canonical_digest
+
+    genesis_tuple, genesis_hash = _audit_row(0, "sovereign", "")
+    second_tuple, second_hash = _audit_row(1, "sovereign", genesis_hash)
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+
+    def _sign(head_row_hash: str, row_count: int, checkpoint_ts: str, key_id: str) -> tuple:
+        unsigned = Checkpoint(
+            tier="sovereign",
+            server_id="",
+            row_count=row_count,
+            head_row_hash=head_row_hash,
+            checkpoint_ts=checkpoint_ts,
+            signature="",
+            key_id=key_id,
+        )
+        signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
+        return ("sovereign", "", row_count, head_row_hash, checkpoint_ts, signature, key_id)
+
+    checkpoint_row = _sign(genesis_hash, 1, "2026-06-09T23:59:59.000Z", "k1")
+    client = _FakeClient(audit_rows=[genesis_tuple, second_tuple], checkpoint_rows=[checkpoint_row])
+
+    signed = {
+        "tier": "sovereign",
+        "server_id": "",
+        "row_count": 2,
+        "head_row_hash": second_hash,
+        "checkpoint_ts": "2026-06-13T00:00:00.000Z",
+        "signature": "sig",
+        "key_id": "k2",
+    }
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", lambda *a, **k: signed)
+
+    now = dt.datetime(2026, 6, 13, tzinfo=dt.timezone.utc)  # checkpoint is well past due
+    result = checkpoint_audit.run(client, "binary", "key", now=now, verifying_key=verifying_key)
+
+    assert result.skipped == [], "a stale checkpoint must still be extendable, not stuck forever"
     assert result.inserted == [signed]
 
 
