@@ -8,6 +8,7 @@ Scale: critical=4, high=3, medium=2, low=1.
 from __future__ import annotations
 
 from .timeparse import parse_time
+from .untrusted_text import UntrustedText
 
 SEVERITY_NUM = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 
@@ -156,7 +157,10 @@ class AlertTools:
             if norm is None or norm[1] < floor:
                 continue
 
-            # Signature: UniFi has ext.unifi.ips.signature, else rule_name, else event_kind
+            # Signature: UniFi has ext.unifi.ips.signature, else rule_name, else event_kind.
+            # All three are log-derived (attacker-influenceable via the traffic a sensor
+            # observed), so this is the boundary where that text becomes UntrustedText --
+            # downstream code works with .value/.truncated, never a bare trusted str.
             sig = ext.get("unifi.ips.signature") or r.get("rule_name") or r.get("event_kind")
 
             rows.append(
@@ -165,7 +169,7 @@ class AlertTools:
                     "timestamp": r["timestamp"],
                     "provider": r["event_provider"],
                     "event_kind": r["event_kind"],
-                    "signature": sig,
+                    "signature": UntrustedText.from_raw(sig).to_response(),
                     "severity": norm[0],
                     "severity_num": norm[1],
                     "source_ip": r.get("source_ip"),
@@ -176,7 +180,7 @@ class AlertTools:
                     "ingress_zone": r.get("observer_ingress_zone", ""),
                     "egress_zone": r.get("observer_egress_zone", ""),
                     "ext_subset": {
-                        k: v
+                        k: UntrustedText.from_raw(v).to_response()
                         for k, v in ext.items()
                         if k.startswith(("unifi.ips.", "panw.", "syslog."))
                     },
