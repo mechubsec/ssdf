@@ -180,7 +180,9 @@ def test_ttl_expiry_closes_without_a_checkpoint_but_opens_with_one(raw):
 
     # 2. MEC-565's fix: a checkpoint signed (over the full original chain,
     #    before TTL ran) while rows[1] was still the chain head anchors the
-    #    surviving rows back in.
+    #    surviving rows back in. checkpoint_ts is derived from the same
+    #    `now` as the rows (not a hardcoded date) so this stays fresh under
+    #    MEC-1634's stale_checkpoint check regardless of when the suite runs.
     signing_key = Ed25519PrivateKey.generate()
     anchor = _sign(
         Checkpoint(
@@ -188,7 +190,7 @@ def test_ttl_expiry_closes_without_a_checkpoint_but_opens_with_one(raw):
             server_id="",
             row_count=2,
             head_row_hash=rows[1]["row_hash"],
-            checkpoint_ts="2026-01-01T00:00:00.000Z",
+            checkpoint_ts=fresh_ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
             signature="",
             key_id="test",
         ),
@@ -197,6 +199,6 @@ def test_ttl_expiry_closes_without_a_checkpoint_but_opens_with_one(raw):
     verifying_key = signing_key.public_key().public_bytes_raw()
 
     issues_with_checkpoint = verify_tier(
-        surviving, checkpoints=[anchor], verifying_key=verifying_key
+        surviving, checkpoints=[anchor], verifying_key=verifying_key, now=now
     )
     assert issues_with_checkpoint == []
