@@ -405,3 +405,68 @@ def test_junos_delete_sub_statement_exact_match_is_applied():
     )
     assert "match from-zone trust" not in result
     assert "match to-zone untrust" in result
+
+
+# ---------------------------------------------------------------------------
+# MEC-1776 review fixes
+# ---------------------------------------------------------------------------
+
+
+def test_junos_delete_of_unknown_whole_policy_is_rejected():
+    """A typo'd delete target used to be silently dropped as a no-op
+    (`if key not in index: continue`), making P' == P even though the caller
+    believed a policy was removed. It must be refused instead."""
+    with pytest.raises(DeltaError):
+        apply_junos_set_delta(
+            BASE_TEXT,
+            ["delete security policies from-zone trust to-zone untrust policy GHOST"],
+        )
+
+
+def test_junos_delete_of_unknown_policy_sub_statement_is_rejected():
+    with pytest.raises(DeltaError):
+        apply_junos_set_delta(
+            BASE_TEXT,
+            [
+                "delete security policies from-zone trust to-zone untrust policy GHOST "
+                "match application any"
+            ],
+        )
+
+
+def test_junos_insert_short_form_before_itself_is_rejected():
+    """`insert P1 before P1` used to raise a bare `StopIteration` from
+    `next()` once the moved group was popped out from under the sibling
+    lookup -- it must raise `DeltaError` instead."""
+    with pytest.raises(DeltaError):
+        apply_junos_set_delta(BASE_TEXT, ["insert ALLOW-WEB before ALLOW-WEB"])
+
+
+def test_junos_insert_full_form_after_itself_is_rejected():
+    with pytest.raises(DeltaError):
+        apply_junos_set_delta(
+            BASE_TEXT,
+            [
+                "insert security policies from-zone trust to-zone untrust policy ALLOW-WEB "
+                "after policy ALLOW-WEB"
+            ],
+        )
+
+
+def test_json_modify_rejects_internal_fields():
+    """A delta must not be able to clear `match_unknown` (or set `is_global`,
+    `provider`, `vendor_extras`, `rule_name`) via `modify.fields` -- those are
+    collector-derived bookkeeping the evaluator trusts, not match/action/
+    enabled clauses a proposed change can describe."""
+    with pytest.raises(DeltaError):
+        parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"match_unknown": False}}])
+    with pytest.raises(DeltaError):
+        parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"is_global": True}}])
+    with pytest.raises(DeltaError):
+        parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"provider": "paloalto"}}])
+    with pytest.raises(DeltaError):
+        parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"vendor_extras": {}}}])
+    with pytest.raises(DeltaError):
+        parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"rule_name": "B"}}])
+    # The positive case: an allowed match/action/enabled field still works.
+    parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"action": "deny"}}])

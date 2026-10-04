@@ -14,6 +14,7 @@ import pytest
 
 from ssdf_policy.change_impact import (
     CONFIG_ONLY_NO_IMPACT,
+    NO_RULE_CHANGE,
     NO_SESSIONS_OBSERVED,
     apply_delta,
     evaluate_change_impact,
@@ -457,6 +458,61 @@ def test_calibration_gate_failure_downgrades_zone_pair_to_unknown():
     _assert_honesty_contract(report)
 
 
+def test_calibration_cutoff_applies_to_global_rule_zone_pairs_uniformly():
+    """The calibration cutoff is one device-level value and must gate every
+    zone-pair's sessions by the flow's *actual* zone pair -- a global rule's
+    own context carries no real zone pair (`("any", "any")`) to key a
+    per-zone-pair cutoff lookup off of, so a lookup keyed that way would miss
+    every real flow and silently stop gating stale sessions out."""
+    text_before = """
+    set security policies global policy G match source-address any
+    set security policies global policy G match destination-address any
+    set security policies global policy G match application any
+    set security policies global policy G then deny
+    """
+    text_after = """
+    set security policies global policy G match source-address any
+    set security policies global policy G match destination-address any
+    set security policies global policy G match application any
+    set security policies global policy G then permit
+    """
+    pre_cutoff = _candidate(
+        src_ip="10.9.9.1",
+        sessions=200,
+        logged_rules=["G"],
+        first_seen="2026-09-01T00:00:00",
+        last_seen="2026-09-05T00:00:00",
+    )
+    post_cutoff = _candidate(
+        src_ip="10.9.9.2",
+        sessions=5,
+        logged_rules=["G"],
+        first_seen="2026-09-25T00:00:00",
+        last_seen="2026-09-26T00:00:00",
+    )
+    report = evaluate_change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        p_rules=_junos_rules(text_before),
+        pprime_rules=_junos_rules(text_after),
+        object_book=EMPTY_BOOK,
+        candidates=[pre_cutoff, post_cutoff],
+        window_since="2026-09-01T00:00:00",
+        window_until="2026-10-03T00:00:00",
+        delta_payload={"kind": "global-rule-cutoff-test"},
+        cutoff="2026-09-20T00:00:00",
+    )
+    calibration = report["calibration"]["trust->untrust"]
+    # Only the 5 post-cutoff sessions may count; that's below the 100-session
+    # minimum, so the gate must still refuse to trust this zone-pair. Before
+    # the fix, the cutoff was looked up by the rule's own zone pair
+    # (`("any", "any")`), never a key the flow's actual `("trust",
+    # "untrust")` zone pair would find, so it fell back to "no cutoff" and
+    # all 205 sessions -- including the 200 stale ones -- were counted.
+    assert calibration["status"] == "insufficient_sample"
+    assert calibration["sample_sessions"] == 5
+
+
 def test_calibration_gate_passes_below_minimum_sample():
     text_before = """
     set security policies from-zone trust to-zone untrust policy RULE-Y match source-address any
@@ -534,7 +590,7 @@ def test_multi_rule_change_reports_per_rule_even_when_aggregate_cancels_out():
         window_since="2026-09-20T00:00:00",
         window_until="2026-10-03T00:00:00",
         delta_payload={"kind": "cancel-out-test"},
-        cutoff_by_zone_pair=None,
+        cutoff=None,
         calibration_min_sample=1,
     )
     by_name = {s["rule_name"]: s for s in report["changed_rules"]}
@@ -548,6 +604,35 @@ def test_multi_rule_change_reports_per_rule_even_when_aggregate_cancels_out():
     # first), so its report is the explicit "no sessions observed" wording,
     # not a fabricated zero.
     assert by_name["CLOSE-B"]["result"] == NO_SESSIONS_OBSERVED
+    _assert_honesty_contract(report)
+
+
+def test_identical_rulebases_report_no_rule_change_without_candidate_io():
+    """When P and P' have no changed rule names at all, the pipeline must
+    say so explicitly (`NO_RULE_CHANGE`) rather than proceed as if there were
+    a real (empty) change set -- the caller (services/mcp-query's tool
+    wrapper) relies on this to skip an unscoped candidate pull entirely."""
+    text = """
+    set security policies from-zone trust to-zone untrust policy RULE-A match source-address any
+    set security policies from-zone trust to-zone untrust policy RULE-A match destination-address any
+    set security policies from-zone trust to-zone untrust policy RULE-A match application any
+    set security policies from-zone trust to-zone untrust policy RULE-A then deny
+    """
+    rules = _junos_rules(text)
+    report = evaluate_change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        p_rules=rules,
+        pprime_rules=rules,
+        object_book=EMPTY_BOOK,
+        candidates=[_candidate(sessions=150, logged_rules=["RULE-A"])],
+        window_since="2026-09-20T00:00:00",
+        window_until="2026-10-03T00:00:00",
+        delta_payload={"kind": "no-op-test"},
+        cutoff=None,
+    )
+    assert report["changed_rules"] == []
+    assert report["note"] == NO_RULE_CHANGE
     _assert_honesty_contract(report)
 
 

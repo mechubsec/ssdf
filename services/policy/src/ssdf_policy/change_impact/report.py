@@ -24,6 +24,7 @@ TOP_N_DEFAULT = 10
 
 NO_SESSIONS_OBSERVED = "no historical sessions observed in the analysable scope"
 CONFIG_ONLY_NO_IMPACT = "provably no impact (config-only)"
+NO_RULE_CHANGE = "delta produces no rule change"
 AMBIGUOUS_RULE_NAME = (
     "unknown: rule name is not unique across contexts in P/P'; cannot attribute "
     "candidate traffic to a single rule by name alone"
@@ -181,11 +182,12 @@ def build_report(
     deny_side_blindness: dict,
     coverage: dict,
     truncated: bool = False,
+    note: str | None = None,
 ) -> dict:
     """Assemble the final change_impact report. `rule_sections` is a list of
     `build_rule_section(...)` outputs, one per rule in C, aggregate + per-rule.
     """
-    return {
+    report = {
         "device_name": device_name,
         "window": {
             "since": window_since,
@@ -203,3 +205,6 @@ def build_report(
         "coverage": coverage,
         "truncated": truncated,
     }
+    if note is not None:
+        report["note"] = note
+    return report

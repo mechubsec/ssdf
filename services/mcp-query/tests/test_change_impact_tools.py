@@ -13,7 +13,7 @@ import json
 import pytest
 
 from ssdf_mcp_query.change_impact_builders import policy_entity_to_rule
-from ssdf_mcp_query.change_impact_tools import ChangeImpactTools
+from ssdf_mcp_query.change_impact_tools import ChangeImpactError, ChangeImpactTools
 
 
 class FakeChClient:
@@ -294,6 +294,92 @@ def test_change_impact_zone_pairs_restricted_to_changed_rules():
     assert params.get("ingress_0") == "trust"
     assert params.get("egress_0") == "untrust"
     assert "ingress_1" not in params
+
+
+def test_change_impact_junos_text_baseline_mismatched_with_store_is_refused():
+    """MEC-1776 regression: the store has P1 enabled, but the caller pastes
+    a `junos_current_text` baseline where P1 is `inactive:` (plus a delta
+    that deletes P1). The pasted text's own before/after are identical on
+    this point (P1 absent either way), so a config-only pre-check run
+    against the *pasted* text alone would call this CONFIG_ONLY_NO_IMPACT --
+    but the real device still has P1 active, so removing it does have an
+    impact. The tool must refuse instead of trusting unreconciled text."""
+    p1 = _policy_entity("P1", action="allow")
+    p1["attrs"]["source_addresses"] = "any"
+    p1["attrs"]["dest_addresses"] = "any"
+    p1["attrs"]["application"] = "any"
+    p1["attrs"]["service"] = "any"
+    store = FakeEntityStore([p1])
+    ch = FakeChClient()
+    tools = ChangeImpactTools(ch, store)
+
+    junos_current_text = """
+    inactive: set security policies from-zone trust to-zone untrust policy P1 match source-address any
+    inactive: set security policies from-zone trust to-zone untrust policy P1 match destination-address any
+    inactive: set security policies from-zone trust to-zone untrust policy P1 match application any
+    inactive: set security policies from-zone trust to-zone untrust policy P1 then permit
+    """
+    with pytest.raises(ChangeImpactError) as excinfo:
+        tools.change_impact(
+            device_name="vsrx-ci",
+            provider="juniper",
+            delta={"lines": ["delete security policies from-zone trust to-zone untrust policy P1"]},
+            junos_current_text=junos_current_text,
+            since="2026-09-20T00:00:00",
+            until="2026-10-03T00:00:00",
+        )
+    assert "does not match the stored configuration" in str(excinfo.value)
+
+
+def test_change_impact_junos_text_baseline_matching_store_is_accepted():
+    """The positive case for the above: when the pasted text does agree with
+    the store, the call proceeds normally instead of being refused."""
+    p1 = _policy_entity("P1", action="allow")
+    p1["attrs"]["source_addresses"] = "any"
+    p1["attrs"]["dest_addresses"] = "any"
+    p1["attrs"]["application"] = "any"
+    p1["attrs"]["service"] = "any"
+    store = FakeEntityStore([p1])
+    object_book = {"address_books": {"global": {"addresses": {}, "address_sets": {}}}}
+    ch = FakeChClient(object_book=object_book, event_rows=[])
+    tools = ChangeImpactTools(ch, store)
+
+    junos_current_text = """
+    set security policies from-zone trust to-zone untrust policy P1 match source-address any
+    set security policies from-zone trust to-zone untrust policy P1 match destination-address any
+    set security policies from-zone trust to-zone untrust policy P1 match application any
+    set security policies from-zone trust to-zone untrust policy P1 then permit
+    """
+    report = tools.change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        delta={"lines": ["delete security policies from-zone trust to-zone untrust policy P1"]},
+        junos_current_text=junos_current_text,
+        since="2026-09-20T00:00:00",
+        until="2026-10-03T00:00:00",
+    )
+    assert report["device_name"] == "vsrx-ci"
+
+
+def test_change_impact_rejects_provider_mismatched_with_stored_policy():
+    """MEC-1776 regression: the caller's `provider` argument picks vendor
+    semantics (effective-tuple derivation, context ordering) -- it must
+    agree with what the collector actually stored for this device, not be
+    trusted on its own."""
+    policies = [_policy_entity("RULE-A", action="deny")]  # stored provider: juniper
+    store = FakeEntityStore(policies)
+    ch = FakeChClient()
+    tools = ChangeImpactTools(ch, store)
+
+    with pytest.raises(ChangeImpactError) as excinfo:
+        tools.change_impact(
+            device_name="vsrx-ci",
+            provider="paloalto",
+            delta=[{"op": "modify", "rule_name": "RULE-A", "fields": {"action": "allow"}}],
+            since="2026-09-20T00:00:00",
+            until="2026-10-03T00:00:00",
+        )
+    assert "does not match the stored provider" in str(excinfo.value)
 
 
 def test_change_impact_junos_text_delta_requires_current_text():

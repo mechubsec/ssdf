@@ -56,8 +56,15 @@ def _deny_logging_observed(rows: list[dict]) -> dict[tuple[str, str], bool]:
     return observed
 
 
-def _aggregate_candidates(rows: list[dict]) -> list[dict]:
+def _aggregate_candidates(rows: list[dict], provider: str) -> list[dict]:
     """Group raw `ssdf.events` rows into effective-tuple candidates (doc §1.3).
+
+    `provider` is the tool call's own argument, never read off the row: the
+    candidate-pull SQL (`change_impact_builders.build_candidate_pull_sql`)
+    does not select a `provider` column, so a per-row lookup would always
+    fall through to a default and silently mis-derive the effective tuple
+    (e.g. PAN-OS `app` always reading `None`) for every provider but the
+    default.
 
     v1 does this in Python rather than pushing the NAT-aware GROUP BY into
     ClickHouse (see change_impact_builders.build_candidate_pull_sql docstring)
@@ -67,7 +74,7 @@ def _aggregate_candidates(rows: list[dict]) -> list[dict]:
 
     buckets: dict[tuple, dict] = {}
     for row in rows:
-        tup = effective_tuple(row, row.get("provider", "juniper"))
+        tup = effective_tuple(row, provider)
         key = (
             tup.ingress_zone,
             tup.egress_zone,
@@ -116,12 +123,73 @@ class ChangeImpactTools:
 
     def _configured_rules(self, device_name: str, provider: str) -> list[dict]:
         items = self._store.configured_policies_for_firewalls([device_name])
+        for item in items:
+            stored_provider = item["policy"].get("attrs", {}).get("provider")
+            # The caller's `provider` argument picks which vendor semantics
+            # (`effective_tuple`, context ordering) to evaluate this device
+            # under; it must agree with what the collector actually stored
+            # for this device, not be trusted on its own -- otherwise a
+            # caller could ask for a Junos device to be evaluated under
+            # PAN-OS rules (or vice versa) and get a report for the wrong
+            # vendor's semantics.
+            if stored_provider and stored_provider != provider:
+                raise ChangeImpactError(
+                    f"provider {provider!r} does not match the stored provider "
+                    f"{stored_provider!r} for device {device_name!r}"
+                )
         rules = [policy_entity_to_rule(item["policy"], device_name, provider) for item in items]
         # `configured_policies_for_firewalls` returns entities in SQL join
         # order, not rulebase order -- `renumber_positions` puts P onto the
         # same position scale `apply_delta` produces for P', trusting each
         # policy's stored `attrs["position"]`, not list order.
         return renumber_positions(rules)
+
+    def _reconcile_junos_baseline(
+        self, device_name: str, provider: str, text_rules: list[dict]
+    ) -> None:
+        """Refuse a Junos text-form baseline (`junos_current_text`) that
+        doesn't match the stored configuration for this device.
+
+        The text form lets the caller paste the device's own config instead
+        of re-reading the store, but that text then becomes P for the
+        config-only pre-check (`evaluator.config_only_precheck`), which can
+        return a "provably no impact" verdict before any traffic is looked
+        at. A pasted baseline that's missing an already-applied change (or
+        otherwise stale) would let that pre-check prove "no impact" against
+        a P that was never the device's real policy -- compare on
+        `(context, rule_name)` plus content, ignoring `position` (first
+        appearance order is not the same scale between the two sources) and
+        `collected_at` (a parse timestamp, not state).
+        """
+        stored_rules = self._configured_rules(device_name, provider)
+        stored_compiled = compile_rulebase(stored_rules, {})
+        text_compiled = compile_rulebase(renumber_positions(text_rules), {})
+        ignored_fields = {
+            "position",
+            "collected_at",
+            # PAN-OS-only NormalizedRule fields (collectors/panos.py):
+            # `policy_entity_to_rule` always fills these in (defaulting
+            # false/empty) regardless of provider, but the Junos text-form
+            # parser (collectors/junos.py `_new_rule`) never produces these
+            # keys at all -- comparing them would make every genuinely
+            # matching Junos baseline look like a mismatch.
+            "negate_source",
+            "negate_destination",
+            "schedule",
+        }
+
+        def _snapshot(compiled):
+            return {
+                (c.context, c.rule_name): {
+                    k: v for k, v in c.raw.items() if k not in ignored_fields
+                }
+                for c in compiled
+            }
+
+        if _snapshot(stored_compiled) != _snapshot(text_compiled):
+            raise ChangeImpactError(
+                "junos_current_text does not match the stored configuration for this device"
+            )
 
     def _object_book(self, provider: str, device_name: str) -> dict:
         sql, params = build_latest_object_book_sql(provider, device_name)
@@ -164,6 +232,10 @@ class ChangeImpactTools:
             p_rules, pprime_rules = apply_junos_text_delta(
                 junos_current_text, delta["lines"], device_name, until_iso
             )
+            # The text form's P comes from caller-supplied text, not the
+            # store -- verify it actually matches the stored configuration
+            # before it's allowed to drive a config-only "no impact" verdict.
+            self._reconcile_junos_baseline(device_name, provider, p_rules)
             delta_payload = delta
         elif isinstance(delta, list):
             p_rules = self._configured_rules(device_name, provider)
@@ -176,12 +248,6 @@ class ChangeImpactTools:
             )
 
         object_book = self._object_book(provider, device_name)
-        all_names = sorted(
-            {r["rule_name"] for r in p_rules} | {r["rule_name"] for r in pprime_rules}
-        )
-        cutoff_sql, cutoff_params = build_policy_version_cutoff_sql(device_name, all_names)
-        cutoff_rows = self._ch.run(cutoff_sql, cutoff_params)["rows"]
-        cutoff = cutoff_rows[0]["cutoff"] if cutoff_rows and cutoff_rows[0].get("cutoff") else None
 
         # Restrict the candidate pull's zone-pairs to C, the rules that
         # actually differ between P and P': scoping to the whole rulebase's
@@ -191,6 +257,38 @@ class ChangeImpactTools:
             compile_rulebase(p_rules, object_book), compile_rulebase(pprime_rules, object_book)
         )
         changed_names = diff_result.changed_rule_names
+        coverage = {"window_default_days": DEFAULT_WINDOW_DAYS if since_was_default else None}
+
+        if not changed_names:
+            # A delta that resolves to no rule-level change (e.g. a typo'd
+            # delete target already refused, or ops that cancel out) must not
+            # fall through to an unscoped candidate pull (zone clause `1=1`
+            # when `zone_pairs` is empty) -- `evaluate_change_impact` reports
+            # this explicitly without any ClickHouse I/O.
+            return evaluate_change_impact(
+                device_name=device_name,
+                provider=provider,
+                p_rules=p_rules,
+                pprime_rules=pprime_rules,
+                object_book=object_book,
+                candidates=[],
+                window_since=since_iso,
+                window_until=until_iso,
+                delta_payload=delta_payload,
+                cutoff=None,
+                deny_logging_observed={},
+                coverage=coverage,
+                truncated=False,
+                truncated_at=None,
+            )
+
+        all_names = sorted(
+            {r["rule_name"] for r in p_rules} | {r["rule_name"] for r in pprime_rules}
+        )
+        cutoff_sql, cutoff_params = build_policy_version_cutoff_sql(device_name, all_names)
+        cutoff_rows = self._ch.run(cutoff_sql, cutoff_params)["rows"]
+        cutoff = cutoff_rows[0]["cutoff"] if cutoff_rows and cutoff_rows[0].get("cutoff") else None
+
         p_changed = [r for r in p_rules if r["rule_name"] in changed_names]
         pprime_changed = [r for r in pprime_rules if r["rule_name"] in changed_names]
         zone_pairs = sorted(set(self._zone_pairs(p_changed) + self._zone_pairs(pprime_changed)))
@@ -202,10 +300,8 @@ class ChangeImpactTools:
         truncated = len(raw_rows) > DEFAULT_CANDIDATE_LIMIT
         if truncated:
             raw_rows = raw_rows[:DEFAULT_CANDIDATE_LIMIT]
-        candidates = _aggregate_candidates(raw_rows)
+        candidates = _aggregate_candidates(raw_rows, provider)
         deny_logging_observed = _deny_logging_observed(raw_rows)
-
-        cutoff_by_zone_pair = {zp: cutoff for zp in zone_pairs} if cutoff else {}
 
         return evaluate_change_impact(
             device_name=device_name,
@@ -217,9 +313,15 @@ class ChangeImpactTools:
             window_since=since_iso,
             window_until=until_iso,
             delta_payload=delta_payload,
-            cutoff_by_zone_pair=cutoff_by_zone_pair,
+            # `cutoff` is one device-level value (the latest
+            # `policy_versions.valid_from` among the changed rules), applied
+            # to every zone-pair in the calibration gate -- a changed rule's
+            # own zone pair can be `("any", "any")`, which would never match
+            # a flow's actual (specific) zone pair if this were looked up
+            # per-pair instead.
+            cutoff=cutoff,
             deny_logging_observed=deny_logging_observed,
-            coverage={"window_default_days": DEFAULT_WINDOW_DAYS if since_was_default else None},
+            coverage=coverage,
             truncated=truncated,
             truncated_at=DEFAULT_CANDIDATE_LIMIT if truncated else None,
         )

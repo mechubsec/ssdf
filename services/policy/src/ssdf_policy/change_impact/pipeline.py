@@ -1,9 +1,9 @@
 """Top-level orchestration: glue delta application, diffing, the config-only
 pre-check, candidate evaluation, the calibration gate, and report assembly
 into one pure call. No ClickHouse or device I/O -- `candidates` is already
-the stage-1 SQL pull (doc §2.1), and `deny_logging_observed` /
-`cutoff_by_zone_pair` / `coverage` are already-computed inputs from the
-caller (the MCP tool wrapper in services/mcp-query owns that I/O).
+the stage-1 SQL pull (doc §2.1), and `deny_logging_observed` / `cutoff` /
+`coverage` are already-computed inputs from the caller (the MCP tool wrapper
+in services/mcp-query owns that I/O).
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from .calibration import apply_calibration_gate, calibration_gate
 from .diff import diff_rulebases
 from .evaluator import config_only_precheck, evaluate_candidates
 from .flowtuple import effective_tuple
-from .report import build_deny_side_blindness, build_report, build_rule_section
+from .report import NO_RULE_CHANGE, build_deny_side_blindness, build_report, build_rule_section
 from .rulemodel import compile_rulebase
 
 
@@ -29,7 +29,7 @@ def evaluate_change_impact(
     window_since: str,
     window_until: str,
     delta_payload: Any,
-    cutoff_by_zone_pair: dict[tuple[str, str], str] | None = None,
+    cutoff: str | None = None,
     deny_logging_observed: dict[tuple[str, str], bool] | None = None,
     coverage: dict | None = None,
     calibration_threshold: float = 0.99,
@@ -45,6 +45,27 @@ def evaluate_change_impact(
     pprime_compiled = compile_rulebase(pprime_rules, object_book)
 
     diff_result = diff_rulebases(p_compiled, pprime_compiled)
+
+    if not diff_result.changed_rule_names:
+        # Nothing for the candidate pull to be scoped to -- the caller
+        # (services/mcp-query's wrapper) must not run an unscoped pull
+        # against this, and this function makes that explicit rather than
+        # silently returning an all-empty report indistinguishable from "no
+        # traffic seen".
+        return build_report(
+            device_name=device_name,
+            window_since=window_since,
+            window_until=window_until,
+            p_rules=p_rules,
+            pprime_rules=pprime_rules,
+            delta_payload=delta_payload,
+            rule_sections=[],
+            calibration={},
+            deny_side_blindness={},
+            coverage=coverage or {},
+            truncated=truncated,
+            note=NO_RULE_CHANGE,
+        )
 
     p_by_name = {r.rule_name: r for r in p_compiled}
     pprime_by_name = {r.rule_name: r for r in pprime_compiled}
@@ -87,7 +108,7 @@ def evaluate_change_impact(
 
     calibration = calibration_gate(
         evaluated,
-        cutoff_by_zone_pair=cutoff_by_zone_pair,
+        cutoff=cutoff,
         threshold=calibration_threshold,
         min_sample=calibration_min_sample,
     )

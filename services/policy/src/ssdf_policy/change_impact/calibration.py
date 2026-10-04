@@ -2,8 +2,13 @@
 
 Per zone-pair, agreement between the evaluator's P-verdict and the logged
 `rule_name` is computed over candidate sessions whose first-seen is at or
-after that context's cutoff (the latest relevant `policy_versions.valid_from`
--- older logs legitimately came from a different rulebase, see doc §1.4). If
+after `cutoff` (the latest relevant `policy_versions.valid_from` across every
+rule in the changed set -- a single device-level value, not looked up per
+zone-pair: a changed rule's own zone pair can be `("any", "any")`, but the
+candidate pull's actual flow rows carry the flow's real, specific zone pair,
+so a per-zone-pair lookup would miss and silently treat every session as
+having no cutoff at all -- older logs legitimately came from a different
+rulebase, see doc §1.4). If
 agreement is below threshold, or the post-cutoff sample is too small, every
 verdict touching that zone-pair is reported `unknown: model does not
 reproduce device behaviour`, never a guess -- this is the one check standing
@@ -58,18 +63,16 @@ def _after_cutoff(evaluated: EvaluatedTuple, cutoff: str | None) -> bool:
 
 def calibration_gate(
     evaluated: list[EvaluatedTuple],
-    cutoff_by_zone_pair: dict[tuple[str, str], str] | None = None,
+    cutoff: str | None = None,
     threshold: float = DEFAULT_THRESHOLD,
     min_sample: int = DEFAULT_MIN_SAMPLE,
 ) -> dict[tuple[str, str], CalibrationResult]:
-    cutoff_by_zone_pair = cutoff_by_zone_pair or {}
     by_zone: dict[tuple[str, str], list[EvaluatedTuple]] = {}
     for item in evaluated:
         by_zone.setdefault(_zone_pair(item), []).append(item)
 
     results: dict[tuple[str, str], CalibrationResult] = {}
     for zone_pair, items in by_zone.items():
-        cutoff = cutoff_by_zone_pair.get(zone_pair)
         sample = 0
         agree = 0
         mismatches: list[dict] = []

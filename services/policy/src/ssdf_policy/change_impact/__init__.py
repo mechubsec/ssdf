@@ -37,6 +37,7 @@ from .pipeline import evaluate_change_impact
 from .report import (
     AMBIGUOUS_RULE_NAME,
     CONFIG_ONLY_NO_IMPACT,
+    NO_RULE_CHANGE,
     NO_SESSIONS_OBSERVED,
     build_calibration_section,
     build_deny_side_blindness,
@@ -83,6 +84,7 @@ __all__ = [
     "build_deny_side_blindness",
     "content_hash",
     "CONFIG_ONLY_NO_IMPACT",
+    "NO_RULE_CHANGE",
     "NO_SESSIONS_OBSERVED",
     "AMBIGUOUS_RULE_NAME",
 ]

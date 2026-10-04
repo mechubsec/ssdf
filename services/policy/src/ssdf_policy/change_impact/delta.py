@@ -26,6 +26,39 @@ from ..collectors.junos import parse_security_policies
 
 OpKind = Literal["add", "modify", "delete", "move", "enable", "disable"]
 
+# Fields `modify` may set: the collector's own match/action/enabled clauses
+# (see collectors/{junos,panos}.py NormalizedRule shape). Deliberately
+# excludes bookkeeping/classification fields the evaluator trusts from the
+# collector, not the caller -- `match_unknown`, `is_global`, `provider`,
+# `vendor_extras`, `rule_name` -- so a delta can't, say, clear
+# `match_unknown` on a rule with an unresolved clause and make the evaluator
+# treat it as decided.
+_ALLOWED_MODIFY_FIELDS = frozenset(
+    {
+        "action",
+        "enabled",
+        "from_zone",
+        "to_zone",
+        "source_addresses",
+        "dest_addresses",
+        "application",
+        "service",
+        "source_address_excluded",
+        "dest_address_excluded",
+        "source_identity",
+        "dynamic_application",
+        "url_category",
+        "source_end_user_profile",
+        "scheduler_name",
+        "negate_source",
+        "negate_destination",
+        "schedule",
+        "source_user",
+        "source_hip",
+        "destination_hip",
+    }
+)
+
 
 class DeltaError(ValueError):
     """Raised for a Delta that can't be unambiguously applied -- never guessed."""
@@ -108,6 +141,11 @@ def parse_json_delta(ops: list[dict]) -> Delta:
                 raise DeltaError(
                     f"delta op {i}: 'modify' must not set 'position' directly; use 'move' "
                     "to change order"
+                )
+            disallowed = set(fields) - _ALLOWED_MODIFY_FIELDS
+            if disallowed:
+                raise DeltaError(
+                    f"delta op {i}: 'modify' must not set internal field(s) {sorted(disallowed)}"
                 )
             parsed.append(
                 DeltaOp(
@@ -347,6 +385,10 @@ def apply_junos_set_delta(current_text: str, delta_lines: list[str]) -> str:
         resolved = _resolve_insert(line, groups, lineno)
         if resolved is not None:
             moved_idx, sibling_idx, where = resolved
+            if moved_idx == sibling_idx:
+                raise DeltaError(
+                    f"delta line {lineno}: insert cannot place a policy before/after itself"
+                )
             sibling_key = groups[sibling_idx][0]
             moved = groups.pop(moved_idx)
             sibling_idx = next(i for i, (k, _l) in enumerate(groups) if k == sibling_key)
@@ -374,7 +416,7 @@ def apply_junos_set_delta(current_text: str, delta_lines: list[str]) -> str:
                 target.append(full_line)
         elif verb == "delete":
             if key not in index:
-                continue
+                raise DeltaError(f"delta line {lineno}: delete references unknown policy")
             if is_whole_policy:
                 groups.pop(index[key])
                 index = {k: i for i, (k, _l) in enumerate(groups)}
