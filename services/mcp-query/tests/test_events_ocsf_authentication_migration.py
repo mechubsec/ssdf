@@ -38,8 +38,5 @@ def test_export_identity_is_granted_the_view_only():
     that would let it read columns the view leaves out on purpose, bypassing
     the DEFINER's narrower read surface entirely."""
     text = _text()
-    assert (
-        "GRANT SELECT ON ssdf.events_ocsf_authentication_export TO ssdf_events_export"
-        in text
-    )
+    assert "GRANT SELECT ON ssdf.events_ocsf_authentication_export TO ssdf_events_export" in text
     assert "GRANT SELECT ON ssdf.events TO ssdf_events_export" not in text
