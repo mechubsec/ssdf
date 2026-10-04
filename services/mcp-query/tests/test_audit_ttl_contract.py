@@ -126,6 +126,12 @@ def _sign(checkpoint: Checkpoint, signing_key: Ed25519PrivateKey) -> Checkpoint:
     return Checkpoint(**{**checkpoint.__dict__, "signature": signature})
 
 
+def _format_checkpoint_ts(ts: dt.datetime) -> str:
+    """Millisecond-precision RFC3339 with a literal 'Z', matching the shape
+    ``_parse_checkpoint_ts`` in verify_audit.py expects."""
+    return ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond // 1000:03d}Z"
+
+
 def test_ttl_expiry_closes_without_a_checkpoint_but_opens_with_one(raw):
     now = dt.datetime.now(dt.timezone.utc)
     # The first two rows are timestamped already past the 2-second TTL so they
@@ -180,9 +186,11 @@ def test_ttl_expiry_closes_without_a_checkpoint_but_opens_with_one(raw):
 
     # 2. MEC-565's fix: a checkpoint signed (over the full original chain,
     #    before TTL ran) while rows[1] was still the chain head anchors the
-    #    surviving rows back in.
+    #    surviving rows back in. Dated far in the past so it clears
+    #    _is_old_enough_to_anchor's production-scale (90-day) threshold for
+    #    a head that has, in this test, already aged out of the table.
     signing_key = Ed25519PrivateKey.generate()
-    anchor = _sign(
+    old_anchor = _sign(
         Checkpoint(
             tier="sovereign",
             server_id="",
@@ -194,9 +202,28 @@ def test_ttl_expiry_closes_without_a_checkpoint_but_opens_with_one(raw):
         ),
         signing_key,
     )
+    # A second, recent checkpoint over the still-live tip (rows[3]) -- without
+    # it, old_anchor alone would also be the *latest* verified checkpoint, and
+    # being >2 days stale relative to the fresh surviving rows would trip the
+    # MEC-1634 stale_checkpoint check that this same old date is required to
+    # satisfy above. A real deployment never hits this: checkpoints run on a
+    # schedule, so the one anchoring a long-expired head is never also the
+    # latest one.
+    recent_anchor = _sign(
+        Checkpoint(
+            tier="sovereign",
+            server_id="",
+            row_count=4,
+            head_row_hash=rows[3]["row_hash"],
+            checkpoint_ts=_format_checkpoint_ts(now + dt.timedelta(seconds=1)),
+            signature="",
+            key_id="test",
+        ),
+        signing_key,
+    )
     verifying_key = signing_key.public_key().public_bytes_raw()
 
     issues_with_checkpoint = verify_tier(
-        surviving, checkpoints=[anchor], verifying_key=verifying_key
+        surviving, checkpoints=[old_anchor, recent_anchor], verifying_key=verifying_key
     )
     assert issues_with_checkpoint == []

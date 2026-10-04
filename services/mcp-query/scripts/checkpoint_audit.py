@@ -319,7 +319,10 @@ def run(
     Self-verifies each chain with `verify_tier` before checkpointing it -- a
     chain `compute_next_checkpoint` has not first been confirmed clean on is
     never signed; it is skipped (fail closed) instead, surfaced via
-    `RunResult.skipped`.
+    `RunResult.skipped`. Passes `check_freshness=False`: a new checkpoint is
+    the only remedy for a stale one, so this job cannot be the thing that
+    checkpoint freshness is enforced against, or a chain that falls behind
+    schedule could never be caught back up.
     """
     now = now or dt.datetime.now(dt.timezone.utc)
     rows_by_chain = fetch_rows_by_chain(client)
@@ -340,6 +343,7 @@ def run(
             bridge_rows=evidence_by_chain.get(chain, []),
             verifying_key=verifying_key,
             now=now,
+            check_freshness=False,
         )
         if issues:
             print(

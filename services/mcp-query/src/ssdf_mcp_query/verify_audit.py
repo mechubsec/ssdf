@@ -236,11 +236,102 @@ def _checkpoint_head_issues(
             continue
         if _is_old_enough_to_anchor(checkpoint.checkpoint_ts, now):
             continue
-        if (
-            checkpoint.head_row_hash not in by_hash
-            and checkpoint.head_row_hash not in bridge_by_hash
-        ):
+        if checkpoint.head_row_hash in by_hash:
+            continue
+        bridge_row = bridge_by_hash.get(checkpoint.head_row_hash)
+        if bridge_row is None or not _bridge_row_vouches_for_head(bridge_row, now):
             issues.append({"type": "checkpoint_head_missing", "row_hash": checkpoint.head_row_hash})
+    return issues
+
+
+def _bridge_row_vouches_for_head(bridge_row: dict, now: dt.datetime) -> bool:
+    """Whether a bridge-tier (``ssdf.audit_evidence``) row may stand in as
+    proof that a still-young checkpoint's head continues to exist.
+
+    Requires both that the row is old enough to have legitimately reached
+    this tier through the normal archival path, and that its content still
+    recomputes to its stored hash.
+    """
+    ts = bridge_row["ts"]
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    if now - ts < dt.timedelta(days=_AUDIT_TTL_DAYS - _CHECKPOINT_INTERVAL_SLACK_DAYS):
+        return False
+    return compute_row_hash(bridge_row["prev_hash"], bridge_row) == bridge_row["row_hash"]
+
+
+# How old (as a multiple of the nominally-daily checkpoint schedule) the
+# newest verified checkpoint for a chain may be, once that chain has rows
+# newer than it, before the gap is itself reported. A module constant, not a
+# config value: the default assumes the daily schedule documented alongside
+# _CHECKPOINT_INTERVAL_SLACK_DAYS.
+_STALE_CHECKPOINT_THRESHOLD_DAYS = 2
+
+
+def _verified_checkpoints(
+    checkpoints: list[Checkpoint], verifying_key: bytes | None
+) -> list[Checkpoint]:
+    """Checkpoints whose signature actually verifies. Checks that depend on
+    a checkpoint's own claims (``checkpoint_ts``, ``row_count``) rather than
+    just its presence must only trust ones that pass this -- an unverified
+    claim is exactly as trustworthy as one fabricated by whoever has INSERT
+    on ``audit_checkpoints``."""
+    if verifying_key is None:
+        return []
+    verified = []
+    for checkpoint in checkpoints:
+        try:
+            verify_checkpoint_signature(checkpoint, verifying_key)
+        except CheckpointVerificationError:
+            continue
+        verified.append(checkpoint)
+    return verified
+
+
+def _stale_checkpoint_issue(
+    rows: list[dict], verified_checkpoints: list[Checkpoint], now: dt.datetime
+) -> dict | None:
+    """A chain with rows newer than its latest checkpoint, where that
+    checkpoint is itself more than ``_STALE_CHECKPOINT_THRESHOLD_DAYS`` past
+    due on the nominal schedule.
+
+    Nothing else in this module would ever notice a stopped checkpoint job,
+    or a deletion of its rows: there would simply be no recent checkpoint
+    left to check reachability or a head against, and every row written
+    since quietly reverts to the pre-checkpoint (pre-MEC-565) blind spot.
+    This flags that silence directly rather than waiting for a tamper that
+    depends on it.
+    """
+    if not verified_checkpoints or not rows:
+        return None
+    latest = max(verified_checkpoints, key=lambda c: c.checkpoint_ts)
+    try:
+        latest_ts = _parse_checkpoint_ts(latest.checkpoint_ts)
+    except ValueError:
+        return None
+    newest_row_ts = max(r["ts"] for r in rows)
+    if newest_row_ts.tzinfo is None:
+        newest_row_ts = newest_row_ts.replace(tzinfo=dt.timezone.utc)
+    if newest_row_ts <= latest_ts:
+        return None
+    if now - latest_ts <= dt.timedelta(days=_STALE_CHECKPOINT_THRESHOLD_DAYS):
+        return None
+    return {"type": "stale_checkpoint", "row_hash": latest.head_row_hash}
+
+
+def _checkpoint_count_regression_issues(verified_checkpoints: list[Checkpoint]) -> list[dict]:
+    """A legitimate checkpoint job's signed ``row_count`` is cumulative and
+    must only grow between consecutive checkpoints for the same chain.
+    Deleting checkpoint rows, or restarting the job against a stale
+    baseline, can make the surviving sequence go flat or backward without
+    ever touching ``ssdf.audit`` -- a tamper none of the other checks here
+    can see, since they only look at ``ssdf.audit`` itself.
+    """
+    ordered = sorted(verified_checkpoints, key=lambda c: c.checkpoint_ts)
+    issues: list[dict] = []
+    for prev, cur in zip(ordered, ordered[1:]):
+        if cur.row_count <= prev.row_count:
+            issues.append({"type": "checkpoint_count_regression", "row_hash": cur.head_row_hash})
     return issues
 
 
@@ -291,6 +382,7 @@ def verify_tier(
     bridge_rows: list[dict] = (),
     verifying_key: bytes | None = None,
     now: dt.datetime | None = None,
+    check_freshness: bool = True,
 ) -> list[dict]:
     """Verify one tier's rows. Returns a list of issue dicts (empty == clean).
 
@@ -315,6 +407,13 @@ def verify_tier(
     ``now`` is when "old enough to have expired" is measured from; defaults
     to the real current time. Only matters together with ``checkpoints`` --
     see ``_is_old_enough_to_anchor``.
+
+    ``check_freshness`` gates the ``stale_checkpoint`` issue only -- every
+    other check still runs. The checkpoint job itself is the only remedy for
+    a stale checkpoint, so it calls this with ``check_freshness=False``;
+    otherwise a lapsed checkpoint can never be renewed, since the job skips
+    any chain ``verify_tier`` reports an issue for. Callers that only
+    observe (never write) a checkpoint keep the default and see the issue.
     """
     now = now or dt.datetime.now(dt.timezone.utc)
     rows = [r for r in rows if r["row_hash"] != ""]
@@ -362,6 +461,16 @@ def verify_tier(
     issues.extend(
         _checkpoint_head_issues(list(checkpoints), by_hash, bridge_by_hash, verifying_key, now)
     )
+
+    # 1.6 Checkpoint freshness and count continuity, both independent of
+    # whether any particular row or head is currently reachable -- see
+    # _stale_checkpoint_issue and _checkpoint_count_regression_issues.
+    verified_checkpoints = _verified_checkpoints(list(checkpoints), verifying_key)
+    if check_freshness:
+        stale_issue = _stale_checkpoint_issue(rows, verified_checkpoints, now)
+        if stale_issue is not None:
+            issues.append(stale_issue)
+    issues.extend(_checkpoint_count_regression_issues(verified_checkpoints))
 
     # Genesis-or-checkpoint anchor selection, done once up front so both the
     # linkage check (2) and reachability (3) below agree on what counts as a
