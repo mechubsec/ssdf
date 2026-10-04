@@ -28,7 +28,7 @@ _GLOBAL_RE = re.compile(r"security policies global policy (\S+) (.*)$")
 _HITCOUNT_RE = re.compile(r"^\s*\d+\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s+\S+\s*$")
 
 
-def _new_rule(name, device_name, from_zone, to_zone, now, order):
+def _new_rule(name, device_name, from_zone, to_zone, now, order, is_global):
     return {
         "provider": PROVIDER,
         "device_name": device_name,
@@ -36,6 +36,12 @@ def _new_rule(name, device_name, from_zone, to_zone, now, order):
         "action": "",
         "from_zone": list(from_zone),
         "to_zone": list(to_zone),
+        # MEC-1640: which evaluation context (§1.2) this rule belongs to.
+        # `position` alone is ambiguous once global and zone-pair policies are
+        # mixed, because it counts first appearance across the whole
+        # display-set, not within one context -- change_impact's firstmatch3
+        # must group by context and never compare `position` across them.
+        "is_global": is_global,
         "source_addresses": [],
         "dest_addresses": [],
         "application": [],
@@ -106,7 +112,7 @@ def parse_security_policies(text: str, device_name: str, now: str) -> list[dict]
             seed_from, seed_to = [], []
         rule = rules.get(key)
         if rule is None:
-            rule = _new_rule(name, device_name, seed_from, seed_to, now, order)
+            rule = _new_rule(name, device_name, seed_from, seed_to, now, order, key[0] == "global")
             rules[key] = rule
             order += 1
         if inactive:
