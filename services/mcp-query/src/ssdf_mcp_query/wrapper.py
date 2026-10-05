@@ -11,12 +11,50 @@ from __future__ import annotations
 
 import datetime as _dt
 import functools
+import hashlib
 from typing import Any, Callable
 
 from .attribution import current_attribution
 from .auth import current_caller_claims
 from .classification import classes_for_tool
 from .ratelimit import ConcurrencyExceeded, PrincipalLimiter, RateLimitExceeded
+
+# Args that must never reach ssdf.audit verbatim, by tool name:
+# `change_impact.junos_current_text` is the caller's pasted device output,
+# which may carry device secrets alongside the policy config. Hash + length
+# round-trips the argument for correlation (same input -> same hash) without
+# storing the secret-bearing text itself in the long-retention evidence tier.
+REDACTED_ARGS: dict[str, frozenset[str]] = {
+    "change_impact": frozenset({"junos_current_text"}),
+}
+
+
+def _hash_summary(value: str) -> dict:
+    return {
+        "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        "length": len(value),
+    }
+
+
+def _redact_for_audit(tool_name: str, kwargs: dict) -> dict:
+    redact_keys = REDACTED_ARGS.get(tool_name)
+    redacted = dict(kwargs) if redact_keys or tool_name == "change_impact" else kwargs
+    for key in redact_keys or ():
+        value = redacted.get(key)
+        if isinstance(value, str) and value:
+            redacted[key] = _hash_summary(value)
+    if tool_name == "change_impact":
+        # The Junos text-delta form's `delta["lines"]` is, like
+        # `junos_current_text`, the caller's pasted material -- a rejected
+        # line (not yet vetted against the security-policies allowlist) must
+        # not reach ssdf.audit verbatim via `args` even though the rejection
+        # itself is reported by line number only.
+        delta = redacted.get("delta")
+        if isinstance(delta, dict) and isinstance(delta.get("lines"), list):
+            lines = delta["lines"]
+            joined = "\n".join(str(line) for line in lines)
+            redacted["delta"] = {**_hash_summary(joined), "line_count": len(lines)}
+    return redacted
 
 
 def row_count_of(result: Any) -> int:
@@ -60,7 +98,7 @@ def audited_tool(
             principal=principal,
             tier=tier,
             tool=tool_name,
-            args=kwargs,
+            args=_redact_for_audit(tool_name, kwargs),
             data_classes=data_classes,
             decision="deny",
             row_count=0,
@@ -121,7 +159,7 @@ def audited_tool(
                 principal=principal,
                 tier=tier,
                 tool=tool_name,
-                args=kwargs,
+                args=_redact_for_audit(tool_name, kwargs),
                 data_classes=data_classes,
                 decision="allow",
                 row_count=row_count_of(result) if isinstance(result, dict) else 0,
