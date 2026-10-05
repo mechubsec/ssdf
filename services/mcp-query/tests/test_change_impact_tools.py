@@ -507,6 +507,27 @@ def test_change_impact_rejects_device_with_no_recorded_provider():
     assert "no recorded provider" in str(excinfo.value)
 
 
+def test_change_impact_rejects_device_with_no_stored_configuration():
+    """F3 regression: a device with nothing stored at all must be refused,
+    not silently evaluated against an empty P (= default-deny everywhere).
+    The calibration gate would eventually downgrade the result to
+    `indeterminate`, but that must not be the only thing standing between a
+    caller and a "no stored config" state being read as a real baseline."""
+    store = FakeEntityStore([])
+    ch = FakeChClient()
+    tools = ChangeImpactTools(ch, store)
+
+    with pytest.raises(ChangeImpactError) as excinfo:
+        tools.change_impact(
+            device_name="vsrx-ci",
+            provider="juniper",
+            delta=[{"op": "add", "rule": {"rule_name": "NEW", "action": "allow"}}],
+            since="2026-09-20T00:00:00",
+            until="2026-10-03T00:00:00",
+        )
+    assert "no stored configuration" in str(excinfo.value)
+
+
 def test_aggregate_candidates_derives_panos_app_from_ext():
     """PAN-OS candidates must be aggregated with PAN-OS tuple semantics
     (the `provider` passed in), not whatever default `effective_tuple`

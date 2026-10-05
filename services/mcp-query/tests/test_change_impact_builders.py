@@ -36,3 +36,13 @@ def test_both_zones_any_drops_the_whole_pair_clause():
 
 def test_default_limit_is_unchanged():
     assert DEFAULT_CANDIDATE_LIMIT == 50_000
+
+
+def test_pull_selects_bytes_column():
+    """F2 regression: the candidate pull must select a bytes-bearing column,
+    or every `_aggregate_candidates` bucket reports `bytes: 0` regardless of
+    the real traffic volume -- a silent-zero honesty-contract violation."""
+    sql, _params = build_candidate_pull_sql(
+        "vsrx-ci", [("trust", "untrust")], "2026-09-20T00:00:00", "2026-10-03T00:00:00"
+    )
+    assert "network_bytes AS bytes" in sql

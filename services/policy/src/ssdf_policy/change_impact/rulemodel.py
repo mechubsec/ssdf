@@ -108,6 +108,21 @@ def _junos_context(rule: dict) -> ContextKey:
     return ("zonepair", tuple(from_zones), tuple(to_zones))
 
 
+def rule_context(rule: dict) -> ContextKey:
+    """The `(context, rule_name)` identity key's context half for a single
+    `NormalizedRule` dict -- Junos: zone-pair or global; PAN-OS: one flat
+    ordered list (`diff.py`'s module docstring). Exposed publicly so
+    `delta.apply_delta` can check an `add` op against the same identity
+    `compile_rulebase`/`diff_rulebases` use, without duplicating the logic.
+    """
+    provider = rule["provider"]
+    if provider == "juniper":
+        return _junos_context(rule)
+    if provider == "paloalto":
+        return ("panos",)
+    raise ValueError(f"unsupported provider: {provider!r}")
+
+
 def compile_rulebase(rules: list[dict], object_book: dict) -> list[CompiledRule]:
     """Compile a flat rule list (one device, one provider) into `CompiledRule`s,
     each tagged with its evaluation context. Order within the input list is
@@ -116,20 +131,14 @@ def compile_rulebase(rules: list[dict], object_book: dict) -> list[CompiledRule]
     """
     compiled = []
     for rule in rules:
-        provider = rule["provider"]
-        if provider == "juniper":
-            context = _junos_context(rule)
-        elif provider == "paloalto":
-            context = ("panos",)
-        else:
-            raise ValueError(f"unsupported provider: {provider!r}")
+        context = rule_context(rule)
         compiled.append(
             CompiledRule(
                 rule_name=rule["rule_name"],
                 action=rule.get("action", ""),
                 enabled=bool(rule.get("enabled", True)),
                 position=int(rule.get("position", 0)),
-                provider=provider,
+                provider=rule["provider"],
                 context=context,
                 raw=rule,
                 object_book=object_book,

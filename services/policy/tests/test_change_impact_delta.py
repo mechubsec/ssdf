@@ -84,6 +84,53 @@ def test_json_add_rejects_caller_supplied_position():
         )
 
 
+def test_json_add_rejects_duplicate_rule_name_in_same_context():
+    """F1 regression: an `add` landing on another rule's (context, rule_name)
+    identity must be refused, not silently collapse into "no rule change"
+    when `diff_rulebases` later keys both sides by that identity."""
+    rules = [_rule("A", action="deny", from_zone=["trust"], to_zone=["untrust"])]
+    delta = parse_json_delta(
+        [
+            {
+                "op": "add",
+                "rule": {
+                    "rule_name": "A",
+                    "action": "allow",
+                    "from_zone": ["trust"],
+                    "to_zone": ["untrust"],
+                },
+                "before": "A",
+            }
+        ],
+        "juniper",
+    )
+    with pytest.raises(DeltaError):
+        apply_delta(rules, delta)
+
+
+def test_json_add_allows_same_rule_name_in_different_context():
+    """The same rule_name is legitimately reused across two different
+    zone-pair contexts (doc §1.2) -- only a same-context collision is an
+    error."""
+    rules = [_rule("A", from_zone=["trust"], to_zone=["untrust"])]
+    delta = parse_json_delta(
+        [
+            {
+                "op": "add",
+                "rule": {
+                    "rule_name": "A",
+                    "action": "allow",
+                    "from_zone": ["dmz"],
+                    "to_zone": ["untrust"],
+                },
+            }
+        ],
+        "juniper",
+    )
+    result = apply_delta(rules, delta)
+    assert [r["from_zone"] for r in result if r["rule_name"] == "A"] == [["trust"], ["dmz"]]
+
+
 def test_json_add_rejects_internal_fields():
     """An `add` rule dict must not be able to set bookkeeping fields the
     evaluator trusts from the collector -- `match_unknown`, `provider`,

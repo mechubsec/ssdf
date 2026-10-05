@@ -162,7 +162,7 @@ def build_candidate_pull_sql(
         zone_clause = "(" + " OR ".join(pair_clauses) + ")"
     sql = (
         "SELECT observer_ingress_zone, observer_egress_zone, source_ip, destination_ip, "
-        "network_transport, destination_port, ext, "
+        "network_transport, destination_port, ext, network_bytes AS bytes, "
         "rule_name, event_action, timestamp "
         "FROM ssdf.events "
         "WHERE observer_hostname = {device:String} "

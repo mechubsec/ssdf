@@ -18,6 +18,15 @@ from .rulemodel import CompiledRule
 _IGNORED_FIELDS = {"position"}
 
 
+class DiffError(ValueError):
+    """Raised when P or P' contains two rules with the same `(context,
+    rule_name)` identity -- defence in depth against `delta.apply_delta`
+    producing a duplicate (e.g. an `add`/`modify` landing a rule on another
+    rule's identity): `diff_rulebases` keys both sides by that identity, so a
+    silent collision would make the duplicate vanish from the diff instead of
+    being reported as a change."""
+
+
 @dataclass(frozen=True)
 class DiffResult:
     changed_rule_names: set[str] = field(default_factory=set)
@@ -41,6 +50,10 @@ def _content_equal(a: dict, b: dict) -> bool:
 def diff_rulebases(p_rules: list[CompiledRule], pprime_rules: list[CompiledRule]) -> DiffResult:
     p_by_key = {(r.context, r.rule_name): r for r in p_rules}
     pprime_by_key = {(r.context, r.rule_name): r for r in pprime_rules}
+    if len(p_by_key) != len(p_rules):
+        raise DiffError("P contains two rules with the same (context, rule_name) identity")
+    if len(pprime_by_key) != len(pprime_rules):
+        raise DiffError("P' contains two rules with the same (context, rule_name) identity")
 
     added = {k[1] for k in pprime_by_key if k not in p_by_key}
     deleted = {k[1] for k in p_by_key if k not in pprime_by_key}

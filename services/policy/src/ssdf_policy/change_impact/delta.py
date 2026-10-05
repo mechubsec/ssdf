@@ -24,6 +24,7 @@ from typing import Any, Literal
 
 from ..collectors.junos import parse_security_policies
 from ..collectors.matchunknown import derive_match_unknown
+from .rulemodel import rule_context
 
 OpKind = Literal["add", "modify", "delete", "move", "enable", "disable"]
 
@@ -320,6 +321,17 @@ def apply_delta(rules: list[dict], delta: Delta, provider: str | None = None) ->
             new_rule["provider"] = provider
             new_rule["vendor_extras"] = {}
             new_rule["match_unknown"] = derive_match_unknown(new_rule, provider)
+            new_context = rule_context(new_rule)
+            if any(
+                existing["rule_name"] == new_rule["rule_name"]
+                and rule_context(existing) == new_context
+                for existing in result
+            ):
+                raise DeltaError(
+                    f"'add' rule_name {new_rule['rule_name']!r} already exists in this context "
+                    "-- diff_rulebases identifies rules by (context, rule_name), so a duplicate "
+                    "would silently collapse with the existing rule instead of being added"
+                )
             insert_at = len(result)
             if op.before is not None:
                 insert_at = _find_rule(result, op.before, None, None)

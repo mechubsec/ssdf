@@ -20,8 +20,8 @@ from .delta import (
     parse_json_delta,
     validate_security_policies_only,
 )
-from .rulemodel import CompiledRule, compile_rulebase
-from .diff import DiffResult, diff_rulebases
+from .rulemodel import CompiledRule, compile_rulebase, rule_context
+from .diff import DiffError, DiffResult, diff_rulebases
 from .flowtuple import FlowTuple, effective_tuple
 from .evaluator import (
     Classification,
@@ -63,6 +63,8 @@ __all__ = [
     "validate_security_policies_only",
     "CompiledRule",
     "compile_rulebase",
+    "rule_context",
+    "DiffError",
     "DiffResult",
     "diff_rulebases",
     "FlowTuple",

@@ -118,11 +118,20 @@ class ChangeImpactTools:
 
     def _configured_rules(self, device_name: str, provider: str) -> list[dict]:
         items = self._store.configured_policies_for_firewalls([device_name])
+        if not items:
+            # An empty list here means "nothing stored", not "an empty
+            # rulebase" -- treating it as the latter would silently evaluate
+            # every JSON `add` against a bare default-deny baseline. The
+            # calibration gate downgrades the resulting verdicts to
+            # `indeterminate` anyway (logged rule names never match a
+            # default-deny verdict), so this refuses the guess explicitly
+            # up front instead of relying on that gate alone.
+            raise ChangeImpactError(f"no stored configuration for device {device_name!r}")
         # The caller's `provider` argument picks the vendor semantics this
         # device is evaluated under; it must agree with what was actually
         # stored for this device, not be trusted on its own.
         stored_providers = {item["policy"].get("attrs", {}).get("provider") for item in items}
-        if items and not any(stored_providers):
+        if not any(stored_providers):
             raise ChangeImpactError(
                 f"stored configuration for device {device_name!r} has no recorded provider"
             )
