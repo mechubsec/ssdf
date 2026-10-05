@@ -71,21 +71,40 @@ def resolve_policies(rules: list[dict], tenant: str) -> tuple[list[dict], list[d
         # negate/schedule bindings) on the entity itself, so a rule using one
         # is visibly flagged rather than silently indistinguishable from a
         # rule that matches everything.
+        #
+        # MEC-1834: each key is guarded on its own presence, not grouped under
+        # "match_unknown" -- match_unknown is set by both Junos and PAN-OS, but
+        # source_address_excluded/dest_address_excluded/source_identity/
+        # dynamic_application/source_end_user_profile/scheduler_name are
+        # Junos-only, so assuming the whole group KeyErrors on every PAN-OS rule.
         if "match_unknown" in rule:
             attrs["match_unknown"] = "true" if rule["match_unknown"] else "false"
+        if "source_address_excluded" in rule:
             attrs["source_address_excluded"] = (
                 "true" if rule["source_address_excluded"] else "false"
             )
+        if "dest_address_excluded" in rule:
             attrs["dest_address_excluded"] = "true" if rule["dest_address_excluded"] else "false"
+        if "source_identity" in rule:
             attrs["source_identity"] = _join(rule["source_identity"])
+        if "dynamic_application" in rule:
             attrs["dynamic_application"] = _join(rule["dynamic_application"])
+        if "url_category" in rule:
             attrs["url_category"] = _join(rule["url_category"])
+        if "source_end_user_profile" in rule:
             attrs["source_end_user_profile"] = _join(rule["source_end_user_profile"])
+        if "scheduler_name" in rule:
             attrs["scheduler_name"] = rule["scheduler_name"]
         if "negate_source" in rule:
             attrs["negate_source"] = "true" if rule["negate_source"] else "false"
             attrs["negate_destination"] = "true" if rule["negate_destination"] else "false"
             attrs["schedule"] = rule["schedule"]
+        if "source_user" in rule:
+            attrs["source_user"] = _join(rule["source_user"])
+        if "source_hip" in rule:
+            attrs["source_hip"] = _join(rule["source_hip"])
+        if "destination_hip" in rule:
+            attrs["destination_hip"] = _join(rule["destination_hip"])
         if "is_global" in rule:
             # Persist the collector's own classification rather than making
             # change_impact re-derive it from from_zone later: a Junos global
