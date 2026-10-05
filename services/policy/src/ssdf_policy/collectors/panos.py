@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET  # type annotations only (ET.Element)
 from ssdf_common.mcp_envelope import envelope_truncated, unwrap_mcp_text
 
 from .base import register
+from .matchunknown import derive_match_unknown
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +59,6 @@ def _text(entry: ET.Element, tag: str) -> str:
     return el.text.strip() if el is not None and el.text else ""
 
 
-def _restricts(members: list[str]) -> bool:
-    """True if a PAN-OS member list narrows the match beyond "no restriction"."""
-    return members not in ([], ["any"])
-
-
 def parse_security_rules(text: str, device_name: str, now: str) -> list[dict]:
     """Parse a PAN-OS security rulebase into normalized rule dicts (order preserved)."""
     root = _root(text)
@@ -73,51 +69,31 @@ def parse_security_rules(text: str, device_name: str, now: str) -> list[dict]:
         name = entry.get("name", "").strip()
         if not name:
             continue
-        schedule = _text(entry, "schedule")
-        source_user = _members(entry, "source-user")
-        url_category = _members(entry, "category")
-        source_hip = _members(entry, "source-hip")
-        destination_hip = _members(entry, "destination-hip")
-        rules.append(
-            {
-                "provider": PROVIDER,
-                "device_name": device_name,
-                "rule_name": name,
-                "action": _text(entry, "action"),
-                "from_zone": _members(entry, "from"),
-                "to_zone": _members(entry, "to"),
-                "source_addresses": _members(entry, "source"),
-                "dest_addresses": _members(entry, "destination"),
-                "application": _members(entry, "application"),
-                "service": _members(entry, "service"),
-                "position": position,
-                "enabled": _text(entry, "disabled").lower() != "yes",
-                "vendor_extras": {"panw.panos.uuid": entry.get("uuid", "")},
-                "collected_at": now,
-                # MEC-992: negate flags and schedule binding. Both are
-                # deterministic once the schedule/address objects are
-                # resolved (schedules aren't semantically evaluated by this
-                # task -- that's the change_impact evaluator's job -- but the
-                # binding itself must not be silently dropped).
-                "negate_source": _text(entry, "negate-source").lower() == "yes",
-                "negate_destination": _text(entry, "negate-destination").lower() == "yes",
-                "schedule": schedule,
-                "source_user": source_user,
-                "url_category": url_category,
-                "source_hip": source_hip,
-                "destination_hip": destination_hip,
-                # MEC-992 review (F5): a schedule, or a source-user/category/HIP
-                # restriction, are clauses this collector records but does not
-                # evaluate. Without this flag a rule scoped to "corp\\alice" or
-                # a URL category reads as matching every user and every site --
-                # broader than it actually is.
-                "match_unknown": bool(schedule)
-                or _restricts(source_user)
-                or _restricts(url_category)
-                or _restricts(source_hip)
-                or _restricts(destination_hip),
-            }
-        )
+        rule = {
+            "provider": PROVIDER,
+            "device_name": device_name,
+            "rule_name": name,
+            "action": _text(entry, "action"),
+            "from_zone": _members(entry, "from"),
+            "to_zone": _members(entry, "to"),
+            "source_addresses": _members(entry, "source"),
+            "dest_addresses": _members(entry, "destination"),
+            "application": _members(entry, "application"),
+            "service": _members(entry, "service"),
+            "position": position,
+            "enabled": _text(entry, "disabled").lower() != "yes",
+            "vendor_extras": {"panw.panos.uuid": entry.get("uuid", "")},
+            "collected_at": now,
+            "negate_source": _text(entry, "negate-source").lower() == "yes",
+            "negate_destination": _text(entry, "negate-destination").lower() == "yes",
+            "schedule": _text(entry, "schedule"),
+            "source_user": _members(entry, "source-user"),
+            "url_category": _members(entry, "category"),
+            "source_hip": _members(entry, "source-hip"),
+            "destination_hip": _members(entry, "destination-hip"),
+        }
+        rule["match_unknown"] = derive_match_unknown(rule, PROVIDER)
+        rules.append(rule)
     return rules
 
 

@@ -9,6 +9,7 @@ dependencies = [
     "sqlglot>=25.0",
     "networkx>=3.0",
     "ssdf-common",
+    "ssdf-policy",
     "cryptography>=50.0.0",
 ]
 
@@ -36,3 +37,4 @@ dev = [
 
 [tool.uv.sources]
 ssdf-common = { path = "../common", editable = true }
+ssdf-policy = { path = "../policy", editable = true }
