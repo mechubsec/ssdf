@@ -1,5 +1,6 @@
 from ssdf_policy.resolve_policies import resolve_policies
-from ssdf_policy.models import entity_id, ASSET, POLICY, FIREWALL
+from ssdf_policy.models import entity_id, ASSET, POLICY, FIREWALL, CONFIGURED
+from ssdf_policy.collectors.panos import parse_security_rules
 
 
 def _rule(device, name, provider="paloalto", action="allow"):
@@ -74,3 +75,73 @@ def test_is_global_is_persisted_on_the_policy_entity():
     attrs_by_name = {e["name"]: e["attrs"] for e in entities if e["kind"] == POLICY}
     assert attrs_by_name["GLOBAL-RULE"]["is_global"] == "true"
     assert attrs_by_name["ZONEPAIR-RULE"]["is_global"] == "false"
+
+
+def test_panos_rule_from_parse_security_rules_resolves_without_keyerror():
+    """MEC-1834: a real PAN-OS rule dict (as produced by
+    collectors.panos.parse_security_rules) has `match_unknown` set but none of
+    the Junos-only match-clause keys, so resolve_policies must not assume the
+    whole Junos group is present just because `match_unknown` is. It must also
+    surface PAN-OS's own clauses (negate_source/schedule/url_category/
+    source_user/source_hip/destination_hip) instead of silently dropping
+    them."""
+    xml = (
+        "<rules>"
+        "<entry name='allow-web' uuid='u-1'>"
+        "<from><member>trust</member></from>"
+        "<to><member>untrust</member></to>"
+        "<source><member>any</member></source>"
+        "<destination><member>any</member></destination>"
+        "<application><member>web-browsing</member></application>"
+        "<service><member>application-default</member></service>"
+        "<action>allow</action>"
+        "<negate-source>yes</negate-source>"
+        "<schedule>business-hours</schedule>"
+        "<category><member>malware</member></category>"
+        "<source-user><member>any</member></source-user>"
+        "<source-hip><member>hip-profile-1</member></source-hip>"
+        "<destination-hip><member>any</member></destination-hip>"
+        "</entry>"
+        "</rules>"
+    )
+    rules = parse_security_rules(xml, "panosvm", "2026-06-08T00:00:00")
+    entities, _ = resolve_policies(rules, "t_main")
+    pol = next(e for e in entities if e["kind"] == POLICY)
+    assert pol["source"] == CONFIGURED
+    attrs = pol["attrs"]
+    assert attrs["match_unknown"] == "true"
+    assert attrs["negate_source"] == "true"
+    assert attrs["negate_destination"] == "false"
+    assert attrs["schedule"] == "business-hours"
+    assert attrs["url_category"] == "malware"
+    assert attrs["source_hip"] == "hip-profile-1"
+    # no Junos-only keys leaked onto a PAN-OS entity
+    assert "source_address_excluded" not in attrs
+    assert "scheduler_name" not in attrs
+
+
+def test_junos_match_clause_attrs_still_populate():
+    """Guard regression: per-key presence checks must not stop populating the
+    Junos attrs that were already working before MEC-1834."""
+    rule = {
+        **_rule("vsrx-ci", "RESTRICTED-RULE", provider="juniper"),
+        "match_unknown": True,
+        "source_address_excluded": True,
+        "dest_address_excluded": False,
+        "source_identity": ["eng-group"],
+        "dynamic_application": ["junos:FACEBOOK"],
+        "url_category": ["Enhanced_Gambling"],
+        "source_end_user_profile": ["corp-laptop"],
+        "scheduler_name": "weekends",
+    }
+    entities, _ = resolve_policies([rule], "t_main")
+    pol = next(e for e in entities if e["kind"] == POLICY)
+    attrs = pol["attrs"]
+    assert attrs["match_unknown"] == "true"
+    assert attrs["source_address_excluded"] == "true"
+    assert attrs["dest_address_excluded"] == "false"
+    assert attrs["source_identity"] == "eng-group"
+    assert attrs["dynamic_application"] == "junos:FACEBOOK"
+    assert attrs["url_category"] == "Enhanced_Gambling"
+    assert attrs["source_end_user_profile"] == "corp-laptop"
+    assert attrs["scheduler_name"] == "weekends"
