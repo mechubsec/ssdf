@@ -240,7 +240,7 @@ class ChangeImpactTools:
             delta_payload = delta
         elif isinstance(delta, list):
             p_rules = self._configured_rules(device_name, provider)
-            delta_obj = parse_json_delta(delta)
+            delta_obj = parse_json_delta(delta, provider)
             pprime_rules = apply_delta(p_rules, delta_obj, provider=provider)
             delta_payload = delta
         else:

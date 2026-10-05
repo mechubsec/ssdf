@@ -62,6 +62,64 @@ _ALLOWED_MODIFY_FIELDS = frozenset(
 # taken from the caller's dict.
 _ALLOWED_ADD_FIELDS = _ALLOWED_MODIFY_FIELDS | {"rule_name", "is_global"}
 
+# Field-name allowlisting alone isn't enough: a well-typed value matters too
+# (e.g. `enabled` as the string "false" is truthy, a zone as a bare string
+# instead of a list matches by substring). Each allowed field is checked
+# against its collector-emitted shape before a delta op is accepted.
+_BOOL_FIELDS = frozenset(
+    {
+        "enabled",
+        "is_global",
+        "source_address_excluded",
+        "dest_address_excluded",
+        "negate_source",
+        "negate_destination",
+    }
+)
+_LIST_STR_FIELDS = frozenset(
+    {
+        "from_zone",
+        "to_zone",
+        "source_addresses",
+        "dest_addresses",
+        "application",
+        "service",
+        "source_identity",
+        "dynamic_application",
+        "url_category",
+        "source_end_user_profile",
+        "source_user",
+        "source_hip",
+        "destination_hip",
+    }
+)
+_STR_FIELDS = frozenset({"scheduler_name", "schedule", "rule_name"})
+_ACTIONS_BY_PROVIDER = {
+    "juniper": frozenset({"allow", "deny", "reject"}),
+    "paloalto": frozenset({"allow", "deny", "drop", "reset-client", "reset-server", "reset-both"}),
+}
+
+
+def _validate_field_value(name: str, value: Any, provider: str, op_index: int) -> None:
+    if name == "action":
+        valid_actions = _ACTIONS_BY_PROVIDER.get(provider)
+        if valid_actions is None or not isinstance(value, str) or value not in valid_actions:
+            raise DeltaError(f"delta op {op_index}: field 'action' has invalid type")
+        return
+    if name in _BOOL_FIELDS:
+        if not isinstance(value, bool):
+            raise DeltaError(f"delta op {op_index}: field {name!r} has invalid type")
+        return
+    if name in _LIST_STR_FIELDS:
+        if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+            raise DeltaError(f"delta op {op_index}: field {name!r} has invalid type")
+        return
+    if name in _STR_FIELDS:
+        if not isinstance(value, str):
+            raise DeltaError(f"delta op {op_index}: field {name!r} has invalid type")
+        return
+    raise DeltaError(f"delta op {op_index}: field {name!r} has invalid type")
+
 
 class DeltaError(ValueError):
     """Raised for a Delta that can't be unambiguously applied -- never guessed."""
@@ -105,7 +163,7 @@ def _find_rule(
     return matches[0]
 
 
-def parse_json_delta(ops: list[dict]) -> Delta:
+def parse_json_delta(ops: list[dict], provider: str) -> Delta:
     """Validate and structure a vendor-neutral JSON op list."""
     parsed: list[DeltaOp] = []
     for i, raw in enumerate(ops):
@@ -121,6 +179,8 @@ def parse_json_delta(ops: list[dict]) -> Delta:
                 raise DeltaError(
                     f"delta op {i}: 'add' must not set internal field(s) {sorted(disallowed)}"
                 )
+            for name, value in rule.items():
+                _validate_field_value(name, value, provider, i)
             parsed.append(
                 DeltaOp(
                     kind="add",
@@ -148,6 +208,8 @@ def parse_json_delta(ops: list[dict]) -> Delta:
                 raise DeltaError(
                     f"delta op {i}: 'modify' must not set internal field(s) {sorted(disallowed)}"
                 )
+            for name, value in fields.items():
+                _validate_field_value(name, value, provider, i)
             parsed.append(
                 DeltaOp(
                     kind="modify",

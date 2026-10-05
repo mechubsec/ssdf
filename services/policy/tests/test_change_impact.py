@@ -651,7 +651,9 @@ def test_json_delta_move_to_front_is_reported_not_hidden():
         _json_rule("ALLOW-ANY", "allow", 0),
         _json_rule("DENY-ALL", "deny", 1),
     ]
-    delta = parse_json_delta([{"op": "move", "rule_name": "DENY-ALL", "before": "ALLOW-ANY"}])
+    delta = parse_json_delta(
+        [{"op": "move", "rule_name": "DENY-ALL", "before": "ALLOW-ANY"}], "juniper"
+    )
     pprime_rules = apply_delta(p_rules, delta)
     assert [r["rule_name"] for r in pprime_rules] == ["DENY-ALL", "ALLOW-ANY"]
 
@@ -699,7 +701,7 @@ def test_json_delta_add_after_lands_at_its_list_position_not_caller_default():
         "from_zone": ["trust"],
         "to_zone": ["untrust"],
     }
-    delta = parse_json_delta([{"op": "add", "rule": new_rule, "after": "B"}])
+    delta = parse_json_delta([{"op": "add", "rule": new_rule, "after": "B"}], "juniper")
     pprime_rules = apply_delta(p_rules, delta)
     assert [r["rule_name"] for r in pprime_rules] == ["A", "B", "NEW", "C"]
 

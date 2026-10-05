@@ -66,7 +66,10 @@ def _rule(name, **overrides):
 def test_json_add_inserts_before_named_rule():
     rules = [_rule("A"), _rule("B")]
     new_rule = {"rule_name": "NEW", "action": "deny"}
-    delta = parse_json_delta([{"op": "add", "rule": new_rule, "before": "B"}])
+    delta = parse_json_delta(
+        [{"op": "add", "rule": new_rule, "before": "B"}],
+        "juniper",
+    )
     result = apply_delta(rules, delta)
     assert [r["rule_name"] for r in result] == ["A", "NEW", "B"]
 
@@ -76,7 +79,8 @@ def test_json_add_rejects_caller_supplied_position():
     never from the caller's dict."""
     with pytest.raises(DeltaError):
         parse_json_delta(
-            [{"op": "add", "rule": {"rule_name": "NEW", "position": 0}, "before": "B"}]
+            [{"op": "add", "rule": {"rule_name": "NEW", "position": 0}, "before": "B"}],
+            "juniper",
         )
 
 
@@ -85,25 +89,43 @@ def test_json_add_rejects_internal_fields():
     evaluator trusts from the collector -- `match_unknown`, `provider`,
     `vendor_extras`, `device_name`, `collected_at`."""
     with pytest.raises(DeltaError):
-        parse_json_delta([{"op": "add", "rule": {"rule_name": "NEW", "match_unknown": False}}])
+        parse_json_delta(
+            [{"op": "add", "rule": {"rule_name": "NEW", "match_unknown": False}}],
+            "juniper",
+        )
     with pytest.raises(DeltaError):
-        parse_json_delta([{"op": "add", "rule": {"rule_name": "NEW", "provider": "paloalto"}}])
+        parse_json_delta(
+            [{"op": "add", "rule": {"rule_name": "NEW", "provider": "paloalto"}}],
+            "juniper",
+        )
     with pytest.raises(DeltaError):
-        parse_json_delta([{"op": "add", "rule": {"rule_name": "NEW", "vendor_extras": {}}}])
+        parse_json_delta(
+            [{"op": "add", "rule": {"rule_name": "NEW", "vendor_extras": {}}}],
+            "juniper",
+        )
     # The positive case: an allowed match/action/enabled field still works.
-    parse_json_delta([{"op": "add", "rule": {"rule_name": "NEW", "action": "deny"}}])
+    parse_json_delta(
+        [{"op": "add", "rule": {"rule_name": "NEW", "action": "deny"}}],
+        "juniper",
+    )
 
 
 def test_json_delete_removes_rule():
     rules = [_rule("A"), _rule("B")]
-    delta = parse_json_delta([{"op": "delete", "rule_name": "A"}])
+    delta = parse_json_delta(
+        [{"op": "delete", "rule_name": "A"}],
+        "juniper",
+    )
     result = apply_delta(rules, delta)
     assert [r["rule_name"] for r in result] == ["B"]
 
 
 def test_json_modify_updates_fields_without_mutating_input():
     rules = [_rule("A", action="allow")]
-    delta = parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"action": "deny"}}])
+    delta = parse_json_delta(
+        [{"op": "modify", "rule_name": "A", "fields": {"action": "deny"}}],
+        "juniper",
+    )
     result = apply_delta(rules, delta)
     assert result[0]["action"] == "deny"
     assert rules[0]["action"] == "allow"  # pure: input untouched
@@ -111,20 +133,29 @@ def test_json_modify_updates_fields_without_mutating_input():
 
 def test_json_enable_disable():
     rules = [_rule("A", enabled=False)]
-    delta = parse_json_delta([{"op": "enable", "rule_name": "A"}])
+    delta = parse_json_delta(
+        [{"op": "enable", "rule_name": "A"}],
+        "juniper",
+    )
     assert apply_delta(rules, delta)[0]["enabled"] is True
 
 
 def test_json_move_before():
     rules = [_rule("A"), _rule("B"), _rule("C")]
-    delta = parse_json_delta([{"op": "move", "rule_name": "C", "before": "A"}])
+    delta = parse_json_delta(
+        [{"op": "move", "rule_name": "C", "before": "A"}],
+        "juniper",
+    )
     result = apply_delta(rules, delta)
     assert [r["rule_name"] for r in result] == ["C", "A", "B"]
 
 
 def test_json_delta_rejects_unknown_op():
     with pytest.raises(DeltaError):
-        parse_json_delta([{"op": "frobnicate", "rule_name": "A"}])
+        parse_json_delta(
+            [{"op": "frobnicate", "rule_name": "A"}],
+            "juniper",
+        )
 
 
 def test_json_delta_rejects_ambiguous_rule_name_across_contexts():
@@ -132,18 +163,27 @@ def test_json_delta_rejects_ambiguous_rule_name_across_contexts():
         _rule("DUP", from_zone=["trust"], to_zone=["untrust"]),
         _rule("DUP", from_zone=["dmz"], to_zone=["untrust"]),
     ]
-    delta = parse_json_delta([{"op": "delete", "rule_name": "DUP"}])
+    delta = parse_json_delta(
+        [{"op": "delete", "rule_name": "DUP"}],
+        "juniper",
+    )
     with pytest.raises(DeltaError):
         apply_delta(rules, delta)
     # Disambiguated by from_zone, it resolves cleanly.
-    delta_ok = parse_json_delta([{"op": "delete", "rule_name": "DUP", "from_zone": "dmz"}])
+    delta_ok = parse_json_delta(
+        [{"op": "delete", "rule_name": "DUP", "from_zone": "dmz"}],
+        "juniper",
+    )
     result = apply_delta(rules, delta_ok)
     assert len(result) == 1 and result[0]["from_zone"] == ["trust"]
 
 
 def test_json_delta_rejects_modify_with_empty_fields():
     with pytest.raises(DeltaError):
-        parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {}}])
+        parse_json_delta(
+            [{"op": "modify", "rule_name": "A", "fields": {}}],
+            "juniper",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -470,17 +510,35 @@ def test_json_modify_rejects_internal_fields():
     collector-derived bookkeeping the evaluator trusts, not match/action/
     enabled clauses a proposed change can describe."""
     with pytest.raises(DeltaError):
-        parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"match_unknown": False}}])
+        parse_json_delta(
+            [{"op": "modify", "rule_name": "A", "fields": {"match_unknown": False}}],
+            "juniper",
+        )
     with pytest.raises(DeltaError):
-        parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"is_global": True}}])
+        parse_json_delta(
+            [{"op": "modify", "rule_name": "A", "fields": {"is_global": True}}],
+            "juniper",
+        )
     with pytest.raises(DeltaError):
-        parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"provider": "paloalto"}}])
+        parse_json_delta(
+            [{"op": "modify", "rule_name": "A", "fields": {"provider": "paloalto"}}],
+            "juniper",
+        )
     with pytest.raises(DeltaError):
-        parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"vendor_extras": {}}}])
+        parse_json_delta(
+            [{"op": "modify", "rule_name": "A", "fields": {"vendor_extras": {}}}],
+            "juniper",
+        )
     with pytest.raises(DeltaError):
-        parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"rule_name": "B"}}])
+        parse_json_delta(
+            [{"op": "modify", "rule_name": "A", "fields": {"rule_name": "B"}}],
+            "juniper",
+        )
     # The positive case: an allowed match/action/enabled field still works.
-    parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"action": "deny"}}])
+    parse_json_delta(
+        [{"op": "modify", "rule_name": "A", "fields": {"action": "deny"}}],
+        "juniper",
+    )
 
 
 def test_json_modify_setting_scheduler_name_sets_match_unknown():
@@ -489,7 +547,8 @@ def test_json_modify_setting_scheduler_name_sets_match_unknown():
     not left at whatever it was before the modify."""
     rules = [_rule("A", match_unknown=False)]
     delta = parse_json_delta(
-        [{"op": "modify", "rule_name": "A", "fields": {"scheduler_name": "biz-hours"}}]
+        [{"op": "modify", "rule_name": "A", "fields": {"scheduler_name": "biz-hours"}}],
+        "juniper",
     )
     result = apply_delta(rules, delta)
     assert result[0]["match_unknown"] is True
@@ -499,7 +558,10 @@ def test_json_modify_clearing_unresolved_clause_does_not_clear_match_unknown():
     """`match_unknown` must never be cleared by a modify -- only ever
     widened -- even if the fields being set no longer require it."""
     rules = [_rule("A", match_unknown=True, scheduler_name="biz-hours")]
-    delta = parse_json_delta([{"op": "modify", "rule_name": "A", "fields": {"scheduler_name": ""}}])
+    delta = parse_json_delta(
+        [{"op": "modify", "rule_name": "A", "fields": {"scheduler_name": ""}}],
+        "juniper",
+    )
     result = apply_delta(rules, delta)
     assert result[0]["match_unknown"] is True
 
@@ -507,9 +569,67 @@ def test_json_modify_clearing_unresolved_clause_does_not_clear_match_unknown():
 def test_json_add_with_dynamic_application_sets_match_unknown():
     rules = [_rule("A")]
     delta = parse_json_delta(
-        [{"op": "add", "rule": {"rule_name": "NEW", "dynamic_application": ["risky-app"]}}]
+        [{"op": "add", "rule": {"rule_name": "NEW", "dynamic_application": ["risky-app"]}}],
+        "juniper",
     )
     result = apply_delta(rules, delta)
     new = next(r for r in result if r["rule_name"] == "NEW")
     assert new["match_unknown"] is True
     assert new["provider"] == "juniper"
+
+
+def test_json_modify_rejects_non_bool_enabled():
+    with pytest.raises(DeltaError):
+        parse_json_delta(
+            [{"op": "modify", "rule_name": "A", "fields": {"enabled": "false"}}],
+            "juniper",
+        )
+
+
+def test_json_modify_rejects_non_list_zone():
+    with pytest.raises(DeltaError):
+        parse_json_delta(
+            [{"op": "modify", "rule_name": "A", "fields": {"from_zone": "trust"}}],
+            "juniper",
+        )
+
+
+def test_json_modify_rejects_unknown_action_value():
+    with pytest.raises(DeltaError):
+        parse_json_delta(
+            [{"op": "modify", "rule_name": "A", "fields": {"action": "Deny"}}],
+            "juniper",
+        )
+    # "reject" is valid for juniper but not paloalto.
+    with pytest.raises(DeltaError):
+        parse_json_delta(
+            [{"op": "modify", "rule_name": "A", "fields": {"action": "reject"}}],
+            "paloalto",
+        )
+    # "allow" is valid for both providers.
+    parse_json_delta(
+        [{"op": "modify", "rule_name": "A", "fields": {"action": "allow"}}],
+        "paloalto",
+    )
+
+
+def test_json_modify_accepts_well_typed_values():
+    rules = [_rule("A")]
+    delta = parse_json_delta(
+        [
+            {
+                "op": "modify",
+                "rule_name": "A",
+                "fields": {
+                    "enabled": False,
+                    "from_zone": ["trust", "dmz"],
+                    "action": "deny",
+                },
+            }
+        ],
+        "juniper",
+    )
+    result = apply_delta(rules, delta)
+    assert result[0]["enabled"] is False
+    assert result[0]["from_zone"] == ["trust", "dmz"]
+    assert result[0]["action"] == "deny"
