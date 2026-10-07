@@ -31,6 +31,15 @@ from .timeparse import parse_time
 
 DEFAULT_WINDOW_DAYS = 14  # doc §4: raw-events default until flow_tuples_daily (task B) lands
 
+# ssdf.events' own TTL (infra/clickhouse/001_events.sql): a `since` older than
+# this can request days for which the candidate pull's source table has
+# already dropped every row, not days for which the device logged no traffic.
+# The calibration gate (services/policy's calibration.py) already downgrades a
+# thin sample to "unknown", but a sample built entirely from a shorter window
+# than the caller asked for can still clear min_sample -- the report must say
+# the window was narrower than requested, not stay silent about why.
+EVENTS_RETENTION_DAYS = 30
+
 # `event_action` values the candidate pull's own query already filters on
 # (see change_impact_builders.build_candidate_pull_sql) that represent a
 # logged deny/drop, as opposed to a session close.
@@ -233,8 +242,18 @@ class ChangeImpactTools:
         since_was_default = since is None
         since = since or f"now-{DEFAULT_WINDOW_DAYS}d"
         until = until or "now"
-        since_iso = parse_time(since).isoformat()
-        until_iso = parse_time(until).isoformat()
+        since_dt = parse_time(since)
+        until_dt = parse_time(until)
+        since_iso = since_dt.isoformat()
+        until_iso = until_dt.isoformat()
+
+        # The candidate pull reads ssdf.events directly (raw-events only, see
+        # EVENTS_RETENTION_DAYS above); a requested `since` older than that
+        # retention floor silently returns fewer rows than the window implies,
+        # not zero traffic -- flag it instead of letting a thin, TTL-starved
+        # sample read as a clean "no impact" over the full requested window.
+        retention_floor = parse_time(f"now-{EVENTS_RETENTION_DAYS}d")
+        since_predates_retention = since_dt < retention_floor
 
         if provider == "juniper" and isinstance(delta, dict) and "lines" in delta:
             if not junos_current_text:
@@ -267,7 +286,11 @@ class ChangeImpactTools:
             compile_rulebase(p_rules, object_book), compile_rulebase(pprime_rules, object_book)
         )
         changed_names = diff_result.changed_rule_names
-        coverage = {"window_default_days": DEFAULT_WINDOW_DAYS if since_was_default else None}
+        coverage = {
+            "window_default_days": DEFAULT_WINDOW_DAYS if since_was_default else None,
+            "raw_events_retention_days": EVENTS_RETENTION_DAYS,
+            "since_predates_raw_retention": since_predates_retention,
+        }
 
         if not changed_names:
             # A delta that resolves to no rule-level change (e.g. a typo'd
@@ -330,4 +353,5 @@ class ChangeImpactTools:
             coverage=coverage,
             truncated=truncated,
             truncated_at=DEFAULT_CANDIDATE_LIMIT if truncated else None,
+            retention_days=EVENTS_RETENTION_DAYS if since_predates_retention else None,
         )

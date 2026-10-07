@@ -36,6 +36,7 @@ def evaluate_change_impact(
     calibration_min_sample: int = 100,
     truncated: bool = False,
     truncated_at: int | None = None,
+    retention_days: int | None = None,
 ) -> dict:
     """`candidates` rows are the stage-1 pull: each a dict with `tuple` (a raw
     event-row dict suitable for `effective_tuple`, or already a `FlowTuple`),
@@ -120,6 +121,7 @@ def evaluate_change_impact(
                 name,
                 evaluated,
                 truncated_at=truncated_at if truncated else None,
+                retention_days=retention_days,
                 ambiguous=name in diff_result.ambiguous_names,
             )
         )

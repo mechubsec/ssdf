@@ -607,6 +607,43 @@ def test_multi_rule_change_reports_per_rule_even_when_aggregate_cancels_out():
     _assert_honesty_contract(report)
 
 
+def test_empty_rule_section_reports_unknown_when_window_predates_retention():
+    """A `since` older than ssdf.events' retention floor means part of the
+    requested window's rows have already aged out of the source table --
+    an empty per-rule bucket for that rule must read as `unknown`, not as
+    proof the rule saw no traffic over the full window (doc §1.6: a false
+    'no impact' is worse than no tool)."""
+    text_before = """
+    set security policies from-zone trust to-zone untrust policy OPEN-A match source-address any
+    set security policies from-zone trust to-zone untrust policy OPEN-A match destination-address any
+    set security policies from-zone trust to-zone untrust policy OPEN-A match application any
+    set security policies from-zone trust to-zone untrust policy OPEN-A then deny
+    """
+    text_after = """
+    set security policies from-zone trust to-zone untrust policy OPEN-A match source-address any
+    set security policies from-zone trust to-zone untrust policy OPEN-A match destination-address any
+    set security policies from-zone trust to-zone untrust policy OPEN-A match application any
+    set security policies from-zone trust to-zone untrust policy OPEN-A then permit
+    """
+    report = evaluate_change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        p_rules=_junos_rules(text_before),
+        pprime_rules=_junos_rules(text_after),
+        object_book=EMPTY_BOOK,
+        candidates=[],
+        window_since="2026-08-01T00:00:00",
+        window_until="2026-10-03T00:00:00",
+        delta_payload={"kind": "retention-floor-test"},
+        cutoff=None,
+        calibration_min_sample=1,
+        retention_days=30,
+    )
+    [section] = report["changed_rules"]
+    assert section["result"] == ("unknown: requested window predates raw-events retention (30d)")
+    _assert_honesty_contract(report)
+
+
 def test_identical_rulebases_report_no_rule_change_without_candidate_io():
     """When P and P' have no changed rule names at all, the pipeline must
     say so explicitly (`NO_RULE_CHANGE`) rather than proceed as if there were

@@ -90,6 +90,7 @@ def build_rule_section(
     config_only: bool = False,
     top_n: int = TOP_N_DEFAULT,
     truncated_at: int | None = None,
+    retention_days: int | None = None,
     ambiguous: bool = False,
 ) -> dict:
     if config_only:
@@ -109,6 +110,18 @@ def build_rule_section(
             return {
                 "rule_name": rule_name,
                 "result": f"unknown: candidate pull truncated at {truncated_at} rows",
+            }
+        if retention_days is not None:
+            # The requested `since` is older than ssdf.events' own retention
+            # floor: rows for part of the window have already aged out, so
+            # "no sessions observed" would read as evidence of no traffic
+            # over the full requested window, when it's only evidence over
+            # whatever fraction of it survived the TTL. Say so.
+            return {
+                "rule_name": rule_name,
+                "result": (
+                    f"unknown: requested window predates raw-events retention ({retention_days}d)"
+                ),
             }
         return {"rule_name": rule_name, "result": NO_SESSIONS_OBSERVED}
     return {
