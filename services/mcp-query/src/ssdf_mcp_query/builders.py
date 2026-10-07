@@ -7,6 +7,7 @@ from .timeparse import parse_time
 
 MAX_LIMIT = 1000
 TOP_MAX_LIMIT = 100
+ZONE_MATRIX_MAX_LIMIT = 500
 
 FLOW_COLUMNS = [
     "timestamp",
@@ -109,5 +110,36 @@ def build_top_talkers(by="bytes", side="src", since=None, until=None, limit=10):
         f"SELECT {ip_col} AS ip, sum(network_bytes) AS bytes, count() AS flows "
         f"FROM ssdf.events WHERE {where} "
         f"GROUP BY ip ORDER BY {order_expr} DESC LIMIT {limit}"
+    )
+    return sql, params
+
+
+def build_zone_matrix(
+    by="bytes", since=None, until=None, observer=None, limit=ZONE_MATRIX_MAX_LIMIT
+):
+    """Traffic per (ingress zone, egress zone, observer) over a window.
+
+    Fetches ``limit + 1`` rows so the caller can report truncation. Rows with an
+    empty zone are excluded: the zone columns are non-Nullable ``LowCardinality(String)``
+    and ingest writes ``''`` when a log line carries no zone.
+    """
+    if by not in ("bytes", "flows"):
+        raise BuilderError("by must be 'bytes' or 'flows'")
+    params: dict = {}
+    conditions = _window(since, until, params)
+    conditions.append("observer_ingress_zone != ''")
+    conditions.append("observer_egress_zone != ''")
+    if observer is not None:
+        conditions.append("observer_hostname = {observer:String}")
+        params["observer"] = observer
+    where = " AND ".join(conditions)
+    limit = _clamp(limit, 1, ZONE_MATRIX_MAX_LIMIT)
+    # Secondary keys make the order (and so which rows survive truncation) deterministic.
+    sql = (
+        "SELECT observer_ingress_zone AS from_zone, observer_egress_zone AS to_zone, "
+        "observer_hostname AS observer, sum(network_bytes) AS bytes, count() AS flows "
+        f"FROM ssdf.events WHERE {where} "
+        f"GROUP BY from_zone, to_zone, observer "
+        f"ORDER BY {by} DESC, from_zone, to_zone, observer LIMIT {limit + 1}"
     )
     return sql, params

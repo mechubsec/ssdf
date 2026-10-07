@@ -142,6 +142,16 @@ def build_app(tier: str = "sovereign") -> FastMCP:
         """Top source/destination IPs by bytes or flow count over a time window."""
         return tools.top_talkers(by=by, side=side, since=since, until=until, limit=limit)
 
+    def zone_matrix(
+        by: str = "bytes",
+        since: str | None = None,
+        until: str | None = None,
+        observer: str | None = None,
+        limit: int = 500,
+    ) -> dict:
+        """Traffic between security zones (ingress -> egress) per observer over a time window."""
+        return tools.zone_matrix(by=by, since=since, until=until, observer=observer, limit=limit)
+
     def run_sql(query: str) -> dict:
         """Run a guarded read-only SELECT against ssdf.* (single statement, enforced LIMIT)."""
         return tools.run_sql(query)
@@ -348,6 +358,7 @@ def build_app(tier: str = "sovereign") -> FastMCP:
         "query_flows": query_flows,
         "describe_schema": describe_schema,
         "top_talkers": top_talkers,
+        "zone_matrix": zone_matrix,
         "run_sql": run_sql,
         "get_entity": get_entity,
         "locate": locate,

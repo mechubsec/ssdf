@@ -109,6 +109,55 @@ def test_top_talkers_invalid_arg_is_validation_error():
     assert out["error"] == "validation"
 
 
+def test_zone_matrix_invalid_arg_is_validation_error():
+    tools = Tools(FakeClient(), max_rows=1000)
+    out = tools.zone_matrix(by="packets")
+    assert out["error"] == "validation"
+
+
+def test_zone_matrix_bad_time_is_validation_error():
+    tools = Tools(FakeClient(), max_rows=1000)
+    assert tools.zone_matrix(since="not-a-time")["error"] == "validation"
+
+
+def _zone_rows(count):
+    return [
+        {
+            "from_zone": f"z{i}",
+            "to_zone": "untrust",
+            "observer": "srx1",
+            "bytes": 100 - i,
+            "flows": 1,
+        }
+        for i in range(count)
+    ]
+
+
+def test_zone_matrix_reports_truncation_and_drops_probe_row():
+    fake = FakeClient(
+        rows=_zone_rows(3), columns=["from_zone", "to_zone", "observer", "bytes", "flows"]
+    )
+    out = Tools(fake, max_rows=1000).zone_matrix(limit=2)
+    assert out["truncated"] is True
+    assert out["row_count"] == 2
+    assert [r["from_zone"] for r in out["rows"]] == ["z0", "z1"]
+    assert "LIMIT 3" in fake.last_sql
+
+
+def test_zone_matrix_not_truncated_when_rows_fit():
+    fake = FakeClient(rows=_zone_rows(2), columns=["from_zone"])
+    out = Tools(fake, max_rows=1000).zone_matrix(limit=2)
+    assert out["truncated"] is False
+    assert out["row_count"] == 2
+    assert len(out["rows"]) == 2
+    assert "elapsed_ms" in out and out["columns"] == ["from_zone"]
+
+
+def test_zone_matrix_upstream_error_passes_through():
+    out = Tools(FakeClient(raise_exc=RuntimeError("ch down")), max_rows=1000).zone_matrix()
+    assert out["error"] == "upstream"
+
+
 class _BoomClient:
     def run(self, sql, params=None):
         raise RuntimeError("CH internal: column observer_hostname on host 198.51.100.151")

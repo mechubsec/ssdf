@@ -40,6 +40,7 @@ SOVEREIGN_TOOLS = PUBLIC_TOOLS | frozenset(
         "query_flows",
         "run_sql",
         "top_talkers",
+        "zone_matrix",
         "configured_policies",
         "observed_by",
         "reidentify",
