@@ -92,3 +92,9 @@ def test_stripped_control_characters_do_not_count_toward_the_cap():
     wrapped = UntrustedText.from_raw(raw)
     assert wrapped.value == "A" * DEFAULT_MAX_LEN
     assert wrapped.truncated is False
+
+
+def test_all_invisible_format_and_selector_characters_are_stripped():
+    # Every Cf/Zl/Zp/Co/Cn code point, plus both variation-selector blocks.
+    raw = "a\U000e0049\U000e0047b؜c­d᠎e⁪f￹g️h\U000e0101ij"
+    assert UntrustedText.from_raw(raw).value == "abcdefghij"

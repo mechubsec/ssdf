@@ -16,20 +16,29 @@ one without re-deriving that from context.
 
 from __future__ import annotations
 
-import re
+import unicodedata
 from dataclasses import dataclass
 
 # Bounds response size for oversized values.
 DEFAULT_MAX_LEN = 512
 
-# C0/C1 controls, DEL, the Unicode line/paragraph separators, and the
-# bidi/format control ranges. Strips the characters a log field could use to
-# fake a line/record boundary (CR/LF, NUL, NEL, LS, PS) or reorder/hide text
-# in what the model reads, without touching the printable text an injection
-# attempt actually needs to read.
-_CONTROL_CHARS = re.compile(
-    r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
-)
+# Unicode categories stripped at the boundary: controls (Cc), format
+# characters (Cf), line/paragraph separators (Zl/Zp), and private-use /
+# surrogate / unassigned code points (Co/Cs/Cn). Variation selectors are
+# category Mn, so they are listed explicitly. Category-based rather than a
+# range list, so newly assigned invisible characters are covered too.
+_STRIP_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Co", "Cs", "Cn"})
+
+
+def _is_stripped(ch: str) -> bool:
+    cp = ord(ch)
+    if 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF:
+        return True
+    return unicodedata.category(ch) in _STRIP_CATEGORIES
+
+
+def _strip_controls(text: str) -> str:
+    return "".join(ch for ch in text if not _is_stripped(ch))
 
 
 @dataclass(frozen=True)
@@ -47,7 +56,7 @@ class UntrustedText:
         cap is applied, so a long run of stripped bytes cannot itself push otherwise-kept
         text out past `max_len`."""
         text = "" if raw is None else str(raw)
-        text = _CONTROL_CHARS.sub("", text)
+        text = _strip_controls(text)
         if len(text) > max_len:
             return cls(value=text[:max_len], truncated=True)
         return cls(value=text, truncated=False)
