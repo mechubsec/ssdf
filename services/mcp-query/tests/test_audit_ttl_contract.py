@@ -36,7 +36,11 @@ pytest.importorskip("cryptography")
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
 from ssdf_mcp_query.audit_chain import compute_row_hash  # noqa: E402
-from ssdf_mcp_query.checkpoint_verify import Checkpoint, canonical_digest  # noqa: E402
+from ssdf_mcp_query.checkpoint_verify import (  # noqa: E402
+    Checkpoint,
+    canonical_digest,
+    key_fingerprint,
+)
 from ssdf_mcp_query.verify_audit import verify_tier  # noqa: E402
 
 _TABLE = "ssdf.audit_ttl_contract"
@@ -190,6 +194,8 @@ def test_ttl_expiry_closes_without_a_checkpoint_but_opens_with_one(raw):
     #    _is_old_enough_to_anchor's production-scale (90-day) threshold for
     #    a head that has, in this test, already aged out of the table.
     signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+    fingerprint = key_fingerprint(verifying_key)
     old_anchor = _sign(
         Checkpoint(
             tier="sovereign",
@@ -198,7 +204,7 @@ def test_ttl_expiry_closes_without_a_checkpoint_but_opens_with_one(raw):
             head_row_hash=rows[1]["row_hash"],
             checkpoint_ts="2026-01-01T00:00:00.000Z",
             signature="",
-            key_id="test",
+            key_id=fingerprint,
         ),
         signing_key,
     )
@@ -217,13 +223,14 @@ def test_ttl_expiry_closes_without_a_checkpoint_but_opens_with_one(raw):
             head_row_hash=rows[3]["row_hash"],
             checkpoint_ts=_format_checkpoint_ts(now + dt.timedelta(seconds=1)),
             signature="",
-            key_id="test",
+            key_id=fingerprint,
         ),
         signing_key,
     )
-    verifying_key = signing_key.public_key().public_bytes_raw()
 
     issues_with_checkpoint = verify_tier(
-        surviving, checkpoints=[old_anchor, recent_anchor], verifying_key=verifying_key
+        surviving,
+        checkpoints=[old_anchor, recent_anchor],
+        keyring={fingerprint: verifying_key},
     )
     assert issues_with_checkpoint == []
