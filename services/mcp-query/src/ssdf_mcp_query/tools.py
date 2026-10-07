@@ -33,6 +33,10 @@ _FLOW_UNTRUSTED_COLUMNS = (
 )
 
 
+# zone_matrix rows: zone names and observer hostnames are log-derived free text.
+_ZONE_MATRIX_UNTRUSTED_COLUMNS = ("from_zone", "to_zone", "observer")
+
+
 def _ok(result: dict, requested_limit: int) -> dict:
     rows = result["rows"]
     return {
@@ -122,7 +126,7 @@ class Tools:
             return result
         rows = result["rows"]
         truncated = len(rows) > clamped
-        rows = rows[:clamped]
+        rows = _wrap_untrusted_columns(rows[:clamped], _ZONE_MATRIX_UNTRUSTED_COLUMNS)
         return {**result, "rows": rows, "row_count": len(rows), "truncated": truncated}
 
     def describe_schema(self) -> dict:

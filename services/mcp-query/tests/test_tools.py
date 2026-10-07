@@ -140,8 +140,29 @@ def test_zone_matrix_reports_truncation_and_drops_probe_row():
     out = Tools(fake, max_rows=1000).zone_matrix(limit=2)
     assert out["truncated"] is True
     assert out["row_count"] == 2
-    assert [r["from_zone"] for r in out["rows"]] == ["z0", "z1"]
+    assert [r["from_zone"]["value"] for r in out["rows"]] == ["z0", "z1"]
     assert "LIMIT 3" in fake.last_sql
+
+
+def test_zone_matrix_wraps_log_derived_columns_after_truncation():
+    fake = FakeClient(rows=_zone_rows(3), columns=["from_zone"])
+    out = Tools(fake, max_rows=1000).zone_matrix(limit=2)
+    assert len(out["rows"]) == 2
+    for row in out["rows"]:
+        for col in ("from_zone", "to_zone", "observer"):
+            assert isinstance(row[col], dict)
+            assert row[col]["untrusted"] is True
+            assert row[col]["truncated"] is False
+        assert row["bytes"] in (100, 99) and row["flows"] == 1  # numerics stay raw
+    assert out["rows"][0]["to_zone"]["value"] == "untrust"
+    assert out["rows"][0]["observer"]["value"] == "srx1"
+
+
+def test_zone_matrix_caps_oversized_zone_text():
+    rows = [{"from_zone": "A" * 600, "to_zone": "b", "observer": "o", "bytes": 1, "flows": 1}]
+    out = Tools(FakeClient(rows=rows), max_rows=1000).zone_matrix()
+    assert out["rows"][0]["from_zone"]["truncated"] is True
+    assert len(out["rows"][0]["from_zone"]["value"]) == 512
 
 
 def test_zone_matrix_not_truncated_when_rows_fit():

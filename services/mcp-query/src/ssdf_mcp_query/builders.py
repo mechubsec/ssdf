@@ -139,7 +139,7 @@ def build_zone_matrix(
         "SELECT observer_ingress_zone AS from_zone, observer_egress_zone AS to_zone, "
         "observer_hostname AS observer, sum(network_bytes) AS bytes, count() AS flows "
         f"FROM ssdf.events WHERE {where} "
-        f"GROUP BY from_zone, to_zone, observer "
+        "GROUP BY from_zone, to_zone, observer "
         f"ORDER BY {by} DESC, from_zone, to_zone, observer LIMIT {limit + 1}"
     )
     return sql, params

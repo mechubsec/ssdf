@@ -70,7 +70,7 @@ def test_zone_matrix_groups_by_zone_pair_and_observer():
     assert "observer_egress_zone AS to_zone" in sql
     assert "observer_hostname AS observer" in sql
     assert "GROUP BY from_zone, to_zone, observer" in sql
-    assert "ORDER BY bytes DESC" in sql
+    assert "ORDER BY bytes DESC, from_zone, to_zone, observer LIMIT 501" in sql
     assert "LIMIT 501" in sql  # one extra row to detect truncation
     assert "since" in params and "until" in params  # default window bound
 
@@ -84,7 +84,7 @@ def test_zone_matrix_excludes_rows_without_zones():
 
 def test_zone_matrix_orders_by_flows():
     sql, _ = build_zone_matrix(by="flows")
-    assert "ORDER BY flows DESC" in sql
+    assert "ORDER BY flows DESC, from_zone, to_zone, observer LIMIT 501" in sql
 
 
 def test_zone_matrix_observer_is_bound_not_inlined():
