@@ -9,6 +9,7 @@ SOVEREIGN_TOOLS = {
     "query_flows",
     "describe_schema",
     "top_talkers",
+    "zone_matrix",
     "run_sql",
     "get_entity",
     "locate",
@@ -111,6 +112,7 @@ def test_public_build_never_exposes_run_sql_or_security_tools(monkeypatch, tmp_p
         "query_flows",
         "describe_schema",
         "top_talkers",
+        "zone_matrix",
         "enforcement_points",
         "explain_access",
     ):
@@ -225,3 +227,23 @@ def test_public_metrics_example_config_is_metrics_only(monkeypatch):
         "top_series",
         "entity_metric_timeseries",
     }
+
+
+def test_zone_matrix_not_on_public_tier(monkeypatch, tmp_path):
+    import ssdf_mcp_query.server as server
+
+    _patch_ch(monkeypatch, server)
+    monkeypatch.setenv(
+        "MCP_CLASSIFICATION_FILE",
+        _classification_file(
+            tmp_path, topology="shareable", identity="shareable", metrics="shareable"
+        ),
+    )
+    assert "zone_matrix" not in _names(server.build_app(tier="public"))
+
+
+def test_zone_matrix_on_sovereign_tier(monkeypatch):
+    import ssdf_mcp_query.server as server
+
+    _patch_ch(monkeypatch, server)
+    assert "zone_matrix" in _names(server.build_app(tier="sovereign"))

@@ -14,6 +14,7 @@ EXPECTED_TOOLS = {
     "query_flows",
     "describe_schema",
     "top_talkers",
+    "zone_matrix",
     "run_sql",
     "get_entity",
     "locate",

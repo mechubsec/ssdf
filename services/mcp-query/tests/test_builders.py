@@ -3,6 +3,7 @@ import pytest
 from ssdf_mcp_query.builders import (
     build_query_flows,
     build_top_talkers,
+    build_zone_matrix,
     FLOW_COLUMNS,
     BuilderError,
 )
@@ -60,3 +61,63 @@ def test_top_talkers_invalid_args_raise():
         build_top_talkers(by="nope", side="src")
     with pytest.raises(BuilderError):
         build_top_talkers(by="bytes", side="nope")
+
+
+def test_zone_matrix_groups_by_zone_pair_and_observer():
+    sql, params = build_zone_matrix(by="bytes")
+    assert "FROM ssdf.events" in sql
+    assert "observer_ingress_zone AS from_zone" in sql
+    assert "observer_egress_zone AS to_zone" in sql
+    assert "observer_hostname AS observer" in sql
+    assert "GROUP BY from_zone, to_zone, observer" in sql
+    assert "ORDER BY bytes DESC, from_zone, to_zone, observer LIMIT 501" in sql
+    assert "LIMIT 501" in sql  # one extra row to detect truncation
+    assert "since" in params and "until" in params  # default window bound
+
+
+def test_zone_matrix_excludes_rows_without_zones():
+    # zone columns are LowCardinality(String), not Nullable: "no zone" is ''
+    sql, _ = build_zone_matrix()
+    assert "observer_ingress_zone != ''" in sql
+    assert "observer_egress_zone != ''" in sql
+
+
+def test_zone_matrix_scopes_to_flow_events():
+    sql, _ = build_zone_matrix()
+    assert "event_action LIKE 'flow_%'" in sql
+
+
+def test_zone_matrix_bytes_is_null_safe():
+    # network_bytes is Nullable(UInt64): an all-NULL group must sum to 0, not NULL
+    sql, _ = build_zone_matrix()
+    assert "sum(ifNull(network_bytes, 0)) AS bytes" in sql
+
+
+def test_zone_matrix_orders_by_flows():
+    sql, _ = build_zone_matrix(by="flows")
+    assert "ORDER BY flows DESC, from_zone, to_zone, observer LIMIT 501" in sql
+
+
+def test_zone_matrix_observer_is_bound_not_inlined():
+    sql, params = build_zone_matrix(observer="srx-edge-1")
+    assert "srx-edge-1" not in sql
+    assert params["observer"] == "srx-edge-1"
+    assert "observer_hostname = {observer:String}" in sql
+
+
+def test_zone_matrix_without_observer_has_no_observer_param():
+    sql, params = build_zone_matrix()
+    assert "observer" not in params
+    assert "{observer:String}" not in sql
+
+
+def test_zone_matrix_rejects_bad_by():
+    with pytest.raises(BuilderError):
+        build_zone_matrix(by="packets")
+
+
+def test_zone_matrix_clamps_limit():
+    sql, _ = build_zone_matrix(limit=10_000)
+    assert "LIMIT 501" in sql
+    sql, _ = build_zone_matrix(limit=0)
+    assert "LIMIT 2" in sql

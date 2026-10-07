@@ -8,7 +8,14 @@ import time
 import uuid
 from typing import Any
 
-from .builders import build_query_flows, build_top_talkers, BuilderError, MAX_LIMIT
+from .builders import (
+    build_query_flows,
+    build_top_talkers,
+    build_zone_matrix,
+    BuilderError,
+    MAX_LIMIT,
+    ZONE_MATRIX_MAX_LIMIT,
+)
 from .sql_guard import guard_sql, GuardError
 from .timeparse import TimeParseError
 from .untrusted_text import UntrustedText
@@ -24,6 +31,10 @@ _FLOW_UNTRUSTED_COLUMNS = (
     "observer_ingress_zone",
     "observer_egress_zone",
 )
+
+
+# zone_matrix rows: zone names and observer hostnames are log-derived free text.
+_ZONE_MATRIX_UNTRUSTED_COLUMNS = ("from_zone", "to_zone", "observer")
 
 
 def _ok(result: dict, requested_limit: int) -> dict:
@@ -98,6 +109,25 @@ class Tools:
         except (BuilderError, TimeParseError, ValueError) as exc:
             return {"error": "validation", "detail": str(exc)}
         return self._safe_execute(sql, params, int(limit))
+
+    def zone_matrix(
+        self, by="bytes", since=None, until=None, observer=None, limit=ZONE_MATRIX_MAX_LIMIT
+    ) -> dict:
+        """Zone-to-zone traffic per observer; flags truncation via a limit+1 probe row."""
+        try:
+            sql, params = build_zone_matrix(
+                by=by, since=since, until=until, observer=observer, limit=limit
+            )
+        except (BuilderError, TimeParseError, ValueError) as exc:
+            return {"error": "validation", "detail": str(exc)}
+        clamped = max(1, min(int(limit), ZONE_MATRIX_MAX_LIMIT))
+        result = self._safe_execute(sql, params, clamped + 1)
+        if "rows" not in result:
+            return result
+        rows = result["rows"]
+        truncated = len(rows) > clamped
+        rows = _wrap_untrusted_columns(rows[:clamped], _ZONE_MATRIX_UNTRUSTED_COLUMNS)
+        return {**result, "rows": rows, "row_count": len(rows), "truncated": truncated}
 
     def describe_schema(self) -> dict:
         try:

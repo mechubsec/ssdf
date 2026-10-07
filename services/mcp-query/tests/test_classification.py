@@ -14,6 +14,7 @@ EXPECTED = {
     "query_flows": {"security_log"},
     "describe_schema": {"security_log"},
     "top_talkers": {"security_log"},
+    "zone_matrix": {"security_log"},
     "run_sql": {"security_log"},
     "get_entity": {"identity"},
     "locate": {"topology"},
@@ -229,3 +230,15 @@ def test_metrics_can_be_flipped_shareable(tmp_path):
     c = load_classification(str(path))
     assert is_tool_shareable(c, "metric_timeseries") is True
     assert is_tool_shareable(c, "reidentify") is False  # identity stays sovereign
+
+
+def test_zone_matrix_is_security_log_and_never_shareable():
+    assert TOOL_DATA_CLASSES["zone_matrix"] == frozenset({"security_log"})
+    assert classes_for_tool("zone_matrix") == frozenset({"security_log"})
+    # security_log is not configurable, so even with every configurable class
+    # flipped shareable the tool stays sovereign-only.
+    everything_shareable = _classification(
+        topology="shareable", identity="shareable", metrics="shareable"
+    )
+    assert is_tool_shareable(everything_shareable, "zone_matrix") is False
+    assert "zone_matrix" not in public_tool_names(everything_shareable, ["zone_matrix"])
