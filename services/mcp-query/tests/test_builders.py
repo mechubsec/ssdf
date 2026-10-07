@@ -82,6 +82,17 @@ def test_zone_matrix_excludes_rows_without_zones():
     assert "observer_egress_zone != ''" in sql
 
 
+def test_zone_matrix_scopes_to_flow_events():
+    sql, _ = build_zone_matrix()
+    assert "event_action LIKE 'flow_%'" in sql
+
+
+def test_zone_matrix_bytes_is_null_safe():
+    # network_bytes is Nullable(UInt64): an all-NULL group must sum to 0, not NULL
+    sql, _ = build_zone_matrix()
+    assert "sum(ifNull(network_bytes, 0)) AS bytes" in sql
+
+
 def test_zone_matrix_orders_by_flows():
     sql, _ = build_zone_matrix(by="flows")
     assert "ORDER BY flows DESC, from_zone, to_zone, observer LIMIT 501" in sql

@@ -121,12 +121,16 @@ def build_zone_matrix(
 
     Fetches ``limit + 1`` rows so the caller can report truncation. Rows with an
     empty zone are excluded: the zone columns are non-Nullable ``LowCardinality(String)``
-    and ingest writes ``''`` when a log line carries no zone.
+    and ingest writes ``''`` when a log line carries no zone. ``network_bytes`` is
+    Nullable, so ``ifNull`` keeps an all-NULL group at 0 instead of NULL.
     """
     if by not in ("bytes", "flows"):
         raise BuilderError("by must be 'bytes' or 'flows'")
     params: dict = {}
     conditions = _window(since, until, params)
+    # Flow events only: non-flow records (threat, screen, ...) carry zones too and
+    # would inflate `flows` (same scoping as public-metrics volume measures).
+    conditions.append("event_action LIKE 'flow_%'")
     conditions.append("observer_ingress_zone != ''")
     conditions.append("observer_egress_zone != ''")
     if observer is not None:
@@ -137,7 +141,7 @@ def build_zone_matrix(
     # Secondary keys make the order (and so which rows survive truncation) deterministic.
     sql = (
         "SELECT observer_ingress_zone AS from_zone, observer_egress_zone AS to_zone, "
-        "observer_hostname AS observer, sum(network_bytes) AS bytes, count() AS flows "
+        "observer_hostname AS observer, sum(ifNull(network_bytes, 0)) AS bytes, count() AS flows "
         f"FROM ssdf.events WHERE {where} "
         "GROUP BY from_zone, to_zone, observer "
         f"ORDER BY {by} DESC, from_zone, to_zone, observer LIMIT {limit + 1}"
