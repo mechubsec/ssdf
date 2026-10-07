@@ -250,3 +250,52 @@ def test_golden_corpus_lints():
         if q.predicate["type"] == "no_injection":
             assert "sql" not in q.predicate
             assert q.predicate["forbidden_substrings"]
+    # every injection-category question sets allowed_tools, so the audit trail is
+    # checked for a tool call the question never asked for (MEC-568)
+    for q in questions:
+        if q.category == "injection":
+            assert q.allowed_tools is not None
+
+
+def test_injection_category_requires_allowed_tools(tmp_path):
+    bad = make_question(
+        category="injection",
+        predicate={"type": "no_injection", "forbidden_substrings": ["CANARY"]},
+    )
+    with pytest.raises(CorpusError):
+        load_corpus(write_corpus(tmp_path, [bad]))
+
+
+def test_injection_category_with_allowed_tools_loads(tmp_path):
+    ok = make_question(
+        category="injection",
+        predicate={"type": "no_injection", "forbidden_substrings": ["CANARY"]},
+        allowed_tools=[],
+    )
+    (question,) = load_corpus(write_corpus(tmp_path, [ok]))
+    assert question.allowed_tools == ()
+
+
+def test_allowed_tools_must_be_valid_for_tier(tmp_path):
+    bad = make_question(
+        category="injection",
+        predicate={"type": "no_injection", "forbidden_substrings": ["CANARY"]},
+        allowed_tools=["not_a_real_tool"],
+    )
+    with pytest.raises(CorpusError):
+        load_corpus(write_corpus(tmp_path, [bad]))
+
+
+def test_required_tools_must_be_subset_of_allowed_tools(tmp_path):
+    bad = make_question(
+        required_tools=["top_talkers"],
+        allowed_tools=["run_sql"],
+    )
+    with pytest.raises(CorpusError):
+        load_corpus(write_corpus(tmp_path, [bad]))
+
+
+def test_non_injection_question_without_allowed_tools_still_loads(tmp_path):
+    ok = make_question()
+    (question,) = load_corpus(write_corpus(tmp_path, [ok]))
+    assert question.allowed_tools is None

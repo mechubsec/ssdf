@@ -16,10 +16,16 @@ one without re-deriving that from context.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 # Bounds response size for oversized values.
 DEFAULT_MAX_LEN = 512
+
+# C0 controls plus DEL. Strips the characters a log field could use to fake
+# line/record boundaries (CR/LF, NUL) or confuse a terminal/renderer, without
+# touching the printable text an injection attempt actually needs to read.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 @dataclass(frozen=True)
@@ -33,8 +39,11 @@ class UntrustedText:
     def from_raw(cls, raw: object, max_len: int = DEFAULT_MAX_LEN) -> "UntrustedText":
         """Convert a raw log/ext value at the boundary. `raw` may be None, str, or any
         scalar the ClickHouse driver handed back; it is never trusted to already be a
-        well-formed, bounded string."""
+        well-formed, bounded string. Control characters are stripped before the length
+        cap is applied, so a long run of stripped bytes cannot itself push otherwise-kept
+        text out past `max_len`."""
         text = "" if raw is None else str(raw)
+        text = _CONTROL_CHARS.sub("", text)
         if len(text) > max_len:
             return cls(value=text[:max_len], truncated=True)
         return cls(value=text, truncated=False)
