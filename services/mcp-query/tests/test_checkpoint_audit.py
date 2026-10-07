@@ -12,11 +12,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import checkpoint_audit  # noqa: E402
 from ssdf_mcp_query.audit_chain import compute_row_hash  # noqa: E402
-from ssdf_mcp_query.checkpoint_verify import canonical_digest  # noqa: E402
+from ssdf_mcp_query.checkpoint_verify import canonical_digest, key_fingerprint  # noqa: E402
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: E402
     Ed25519PrivateKey,
 )
+
+
+def _keyring(verifying_key: bytes) -> dict[str, bytes]:
+    return {key_fingerprint(verifying_key): verifying_key}
 
 
 class _FakeResult:
@@ -229,7 +233,7 @@ def test_sign_checkpoint_raises_when_signature_does_not_verify(monkeypatch):
     private_key = Ed25519PrivateKey.generate()
     verifying_key = private_key.public_key().public_bytes_raw()
     with pytest.raises(RuntimeError, match="invalid signature"):
-        checkpoint_audit.sign_checkpoint("binary", "key", payload, verifying_key=verifying_key)
+        checkpoint_audit.sign_checkpoint("binary", "key", payload, keyring=_keyring(verifying_key))
 
 
 def test_sign_checkpoint_accepts_a_genuinely_valid_signature(monkeypatch):
@@ -245,9 +249,10 @@ def test_sign_checkpoint_accepts_a_genuinely_valid_signature(monkeypatch):
 
     from ssdf_mcp_query.checkpoint_verify import Checkpoint
 
-    unsigned = Checkpoint(signature="", key_id="k1", **payload)
+    key_id = key_fingerprint(verifying_key)
+    unsigned = Checkpoint(signature="", key_id=key_id, **payload)
     signature = base64.b64encode(private_key.sign(canonical_digest(unsigned))).decode()
-    signed = {**payload, "signature": signature, "key_id": "k1"}
+    signed = {**payload, "signature": signature, "key_id": key_id}
 
     class _Proc:
         returncode = 0
@@ -255,7 +260,9 @@ def test_sign_checkpoint_accepts_a_genuinely_valid_signature(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(checkpoint_audit.subprocess, "run", lambda *a, **k: _Proc())
-    out = checkpoint_audit.sign_checkpoint("binary", "key", payload, verifying_key=verifying_key)
+    out = checkpoint_audit.sign_checkpoint(
+        "binary", "key", payload, keyring=_keyring(verifying_key)
+    )
     assert out == signed
 
 
@@ -424,14 +431,15 @@ def test_run_self_verifies_past_an_expired_genesis_via_the_evidence_bridge(monke
         signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
         return ("sovereign", "", row_count, head_row_hash, checkpoint_ts, signature, key_id)
 
+    key_id = key_fingerprint(verifying_key)
     # Anchors the now-expired genesis; old enough to stand in for it.
-    anchor_checkpoint = _sign(genesis_hash, 1, "2026-01-01T00:00:00.000Z", "k1")
+    anchor_checkpoint = _sign(genesis_hash, 1, "2026-01-01T00:00:00.000Z", key_id)
     # The most recent checkpoint, used by compute_next_checkpoint's forward
     # walk -- unrelated to the self-verification bridge above. Dated within
     # a day of `now` (rather than further back) so MEC-1634's
     # stale_checkpoint check does not fire on this fixture's rows, which are
     # all hardcoded to ts=2026-06-10 regardless of `now` (see _audit_row).
-    recent_checkpoint = _sign(s1_hash, 3, "2026-05-31T00:00:00.000Z", "k2")
+    recent_checkpoint = _sign(s1_hash, 3, "2026-05-31T00:00:00.000Z", key_id)
 
     client = _FakeClient(
         audit_rows=[s1_tuple, s2_tuple],
@@ -451,7 +459,7 @@ def test_run_self_verifies_past_an_expired_genesis_via_the_evidence_bridge(monke
     monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", lambda *a, **k: signed)
 
     now = dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc)  # ~151 days after the anchor
-    result = checkpoint_audit.run(client, "binary", "key", now=now, verifying_key=verifying_key)
+    result = checkpoint_audit.run(client, "binary", "key", now=now, keyring=_keyring(verifying_key))
 
     assert result.skipped == [], "self-verification must bridge through audit_evidence, not stall"
     assert result.inserted == [signed]
@@ -483,7 +491,9 @@ def test_run_checkpoints_a_stale_chain_instead_of_skipping_it_forever(monkeypatc
         signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
         return ("sovereign", "", row_count, head_row_hash, checkpoint_ts, signature, key_id)
 
-    checkpoint_row = _sign(genesis_hash, 1, "2026-06-09T23:59:59.000Z", "k1")
+    checkpoint_row = _sign(
+        genesis_hash, 1, "2026-06-09T23:59:59.000Z", key_fingerprint(verifying_key)
+    )
     client = _FakeClient(audit_rows=[genesis_tuple, second_tuple], checkpoint_rows=[checkpoint_row])
 
     signed = {
@@ -498,7 +508,7 @@ def test_run_checkpoints_a_stale_chain_instead_of_skipping_it_forever(monkeypatc
     monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", lambda *a, **k: signed)
 
     now = dt.datetime(2026, 6, 13, tzinfo=dt.timezone.utc)  # checkpoint is well past due
-    result = checkpoint_audit.run(client, "binary", "key", now=now, verifying_key=verifying_key)
+    result = checkpoint_audit.run(client, "binary", "key", now=now, keyring=_keyring(verifying_key))
 
     assert result.skipped == [], "a stale checkpoint must still be extendable, not stuck forever"
     assert result.inserted == [signed]
@@ -601,7 +611,7 @@ def test_run_refuses_to_extend_an_unsigned_previous_checkpoint(monkeypatch):
 
     monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", fail_sign)
 
-    result = checkpoint_audit.run(client, "binary", "key", verifying_key=verifying_key)
+    result = checkpoint_audit.run(client, "binary", "key", keyring=_keyring(verifying_key))
 
     assert result.inserted == []
     assert result.skipped == [("sovereign", "")]
@@ -609,13 +619,14 @@ def test_run_refuses_to_extend_an_unsigned_previous_checkpoint(monkeypatch):
 
 
 def test_main_requires_verify_key_path(monkeypatch):
-    """Without a verifying key, self-verification of a chain whose genesis
-    has expired silently skips the
+    """Without a verifying keyring, self-verification of a chain whose
+    genesis has expired silently skips the
     anchor check instead of failing closed. main() must require the key
-    path up front, the same as the signing key and password."""
+    path(s) up front, the same as the signing key and password."""
     monkeypatch.setattr(sys, "argv", ["checkpoint_audit.py"])
     monkeypatch.setenv("CHECKPOINT_SIGNING_KEY_PATH", "/tmp/signing.key")
     monkeypatch.setenv("CH_CHECKPOINT_PASSWORD", "pw")
+    monkeypatch.delenv("CH_CHECKPOINT_VERIFY_KEY_PATHS", raising=False)
     monkeypatch.delenv("CH_CHECKPOINT_VERIFY_KEY_PATH", raising=False)
 
     assert checkpoint_audit.main() == 2
@@ -627,6 +638,26 @@ def test_main_requires_verify_key_to_be_loadable(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["checkpoint_audit.py"])
     monkeypatch.setenv("CHECKPOINT_SIGNING_KEY_PATH", "/tmp/signing.key")
     monkeypatch.setenv("CH_CHECKPOINT_PASSWORD", "pw")
+    monkeypatch.delenv("CH_CHECKPOINT_VERIFY_KEY_PATHS", raising=False)
     monkeypatch.setenv("CH_CHECKPOINT_VERIFY_KEY_PATH", str(bad_key))
 
     assert checkpoint_audit.main() == 2
+
+
+def test_main_accepts_a_keyring_of_multiple_paths(monkeypatch, tmp_path):
+    """MEC-1610: CH_CHECKPOINT_VERIFY_KEY_PATHS accepts a comma-separated
+    list, loading every path into the keyring rather than only the first."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key_a = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+    key_b = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+    path_a = tmp_path / "a.key"
+    path_b = tmp_path / "b.key"
+    path_a.write_text(base64.b64encode(key_a).decode())
+    path_b.write_text(base64.b64encode(key_b).decode())
+
+    monkeypatch.setenv("CH_CHECKPOINT_VERIFY_KEY_PATHS", f"{path_a},{path_b}")
+    monkeypatch.delenv("CH_CHECKPOINT_VERIFY_KEY_PATH", raising=False)
+
+    keyring = checkpoint_audit.load_checkpoint_verifying_keyring()
+    assert keyring == {**_keyring(key_a), **_keyring(key_b)}

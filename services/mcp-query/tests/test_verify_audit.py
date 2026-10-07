@@ -2,8 +2,12 @@ import base64
 import datetime as dt
 
 from ssdf_mcp_query.audit_chain import compute_row_hash
-from ssdf_mcp_query.checkpoint_verify import Checkpoint
+from ssdf_mcp_query.checkpoint_verify import Checkpoint, key_fingerprint
 from ssdf_mcp_query.verify_audit import verify_tier
+
+
+def _keyring(verifying_key: bytes) -> dict[str, bytes]:
+    return {key_fingerprint(verifying_key): verifying_key}
 
 
 def _chain(n, tier="sovereign", first_prev=""):
@@ -251,6 +255,8 @@ def test_dedup_token_counts_utf8_bytes_not_code_points():
 # that would hide a real cross-implementation mismatch.
 _VERIFYING_KEY = base64.b64decode("eq9vdjiCq9yRMn3C7MQmI6QFOkxq52Bb4PRExbLQ0GM=")
 _OTHER_KEY = base64.b64decode("AtqHG8dIiOhQanjTfmfJcED8/U6XfQLxeyANTVzwusk=")
+_VERIFYING_KEYRING = _keyring(_VERIFYING_KEY)
+_OTHER_KEYRING = _keyring(_OTHER_KEY)
 
 
 def _expired_genesis_scenario():
@@ -299,7 +305,7 @@ def test_expired_genesis_with_valid_checkpoint_verifies_clean():
     issues = verify_tier(
         surviving,
         checkpoints=[checkpoint],
-        verifying_key=_VERIFYING_KEY,
+        keyring=_VERIFYING_KEYRING,
         now=_NOW_CHECKPOINT_OLD_ENOUGH,
     )
     assert issues == []
@@ -310,7 +316,7 @@ def test_expired_genesis_with_checkpoint_but_no_verifying_key_stays_unreachable(
     fail closed to 'unverifiable', not silently trust it."""
     surviving, checkpoint = _expired_genesis_scenario()
     issues = verify_tier(
-        surviving, checkpoints=[checkpoint], verifying_key=None, now=_NOW_CHECKPOINT_OLD_ENOUGH
+        surviving, checkpoints=[checkpoint], keyring=None, now=_NOW_CHECKPOINT_OLD_ENOUGH
     )
     assert any(i["type"] == "unverifiable_checkpoint" for i in issues)
     assert all(
@@ -324,7 +330,7 @@ def test_expired_genesis_with_checkpoint_signed_by_wrong_key_stays_unreachable()
     issues = verify_tier(
         surviving,
         checkpoints=[checkpoint],
-        verifying_key=_OTHER_KEY,
+        keyring=_OTHER_KEYRING,
         now=_NOW_CHECKPOINT_OLD_ENOUGH,
     )
     assert any(i["type"] == "unverifiable_checkpoint" for i in issues)
@@ -345,7 +351,7 @@ def test_a_checkpoint_that_does_not_match_any_dangling_row_does_not_mask_a_gap()
     issues = verify_tier(
         unrelated,
         checkpoints=[checkpoint],
-        verifying_key=_VERIFYING_KEY,
+        keyring=_VERIFYING_KEYRING,
         now=_NOW_CHECKPOINT_OLD_ENOUGH,
     )
     assert any(i["type"] == "missing_predecessor" for i in issues)
@@ -382,7 +388,7 @@ def test_a_checkpoint_near_the_chain_tip_is_not_selected_over_the_matching_one()
     issues = verify_tier(
         surviving,
         checkpoints=[near_tip_checkpoint, matching_checkpoint],
-        verifying_key=verifying_key,
+        keyring=_keyring(verifying_key),
         now=_NOW_CHECKPOINT_OLD_ENOUGH,
     )
     assert issues == []
@@ -398,7 +404,7 @@ def test_a_checkpoint_too_fresh_to_have_expired_rows_is_premature_truncation():
     issues = verify_tier(
         surviving,
         checkpoints=[checkpoint],
-        verifying_key=_VERIFYING_KEY,
+        keyring=_VERIFYING_KEYRING,
         now=_NOW_CHECKPOINT_TOO_FRESH,
     )
     assert any(i["type"] == "premature_truncation" for i in issues)
@@ -419,7 +425,7 @@ def test_genesis_still_present_ignores_a_checkpoint_for_reachability_but_still_c
         signature="not-valid-base64!!",
         key_id="deadbeef",
     )
-    issues = verify_tier(rows, checkpoints=[malformed], verifying_key=_VERIFYING_KEY)
+    issues = verify_tier(rows, checkpoints=[malformed], keyring=_VERIFYING_KEYRING)
     assert issues == [{"type": "unverifiable_checkpoint", "row_hash": "irrelevant"}]
 
 
@@ -451,7 +457,7 @@ def test_checkpoint_does_not_mask_a_real_tamper_on_the_surviving_rows():
     issues = verify_tier(
         surviving,
         checkpoints=[checkpoint],
-        verifying_key=_VERIFYING_KEY,
+        keyring=_VERIFYING_KEYRING,
         now=_NOW_CHECKPOINT_OLD_ENOUGH,
     )
     assert any(i["type"] == "content_edit" for i in issues)
@@ -469,7 +475,7 @@ def _signed_checkpoint(
         head_row_hash=head_row_hash,
         checkpoint_ts=checkpoint_ts,
         signature="",
-        key_id="k1",
+        key_id=key_fingerprint(signing_key.public_key().public_bytes_raw()),
     )
     signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
     return Checkpoint(**{**unsigned.__dict__, "signature": signature})
@@ -502,7 +508,7 @@ def test_bridge_through_evidence_rows_anchors_a_predecessor_the_checkpoint_does_
     now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)  # ~100 days later: old enough
 
     issues_without_bridge = verify_tier(
-        surviving, checkpoints=[checkpoint], verifying_key=verifying_key, now=now
+        surviving, checkpoints=[checkpoint], keyring=_keyring(verifying_key), now=now
     )
     assert any(i["type"] == "missing_predecessor" for i in issues_without_bridge), (
         "the checkpoint head does not match the dangling prev_hash directly, "
@@ -513,7 +519,7 @@ def test_bridge_through_evidence_rows_anchors_a_predecessor_the_checkpoint_does_
         surviving,
         checkpoints=[checkpoint],
         bridge_rows=bridge_rows,
-        verifying_key=verifying_key,
+        keyring=_keyring(verifying_key),
         now=now,
     )
     assert issues_with_bridge == []
@@ -542,7 +548,7 @@ def test_bridge_rejects_a_tampered_intermediate_row():
         surviving,
         checkpoints=[checkpoint],
         bridge_rows=bridge_rows,
-        verifying_key=verifying_key,
+        keyring=_keyring(verifying_key),
         now=now,
     )
     assert any(i["type"] == "content_edit" for i in issues)
@@ -568,7 +574,9 @@ def test_recent_checkpoint_head_missing_is_detected():
     truncated = full_chain[:3]  # rows 4-5 (the checkpointed head) deleted
     now = dt.datetime(2026, 4, 15, tzinfo=dt.timezone.utc)  # 14 days later: not old enough
 
-    issues = verify_tier(truncated, checkpoints=[checkpoint], verifying_key=verifying_key, now=now)
+    issues = verify_tier(
+        truncated, checkpoints=[checkpoint], keyring=_keyring(verifying_key), now=now
+    )
     assert any(
         i["type"] == "checkpoint_head_missing" and i["row_hash"] == full_chain[-1]["row_hash"]
         for i in issues
@@ -591,7 +599,9 @@ def test_old_enough_checkpoint_head_missing_is_not_flagged():
     truncated = full_chain[:3]
     now = dt.datetime(2026, 4, 15, tzinfo=dt.timezone.utc)  # ~104 days later: old enough
 
-    issues = verify_tier(truncated, checkpoints=[checkpoint], verifying_key=verifying_key, now=now)
+    issues = verify_tier(
+        truncated, checkpoints=[checkpoint], keyring=_keyring(verifying_key), now=now
+    )
     assert not any(i["type"] == "checkpoint_head_missing" for i in issues)
 
 
@@ -653,7 +663,9 @@ def test_recent_checkpoint_with_invalid_signature_is_not_skipped_silently():
     truncated = full_chain[:3]
     now = dt.datetime(2026, 4, 15, tzinfo=dt.timezone.utc)  # not old enough to anchor
 
-    issues = verify_tier(truncated, checkpoints=[checkpoint], verifying_key=verifying_key, now=now)
+    issues = verify_tier(
+        truncated, checkpoints=[checkpoint], keyring=_keyring(verifying_key), now=now
+    )
 
     assert any(
         i["type"] == "unverifiable_checkpoint" and i["row_hash"] == full_chain[-1]["row_hash"]
@@ -679,7 +691,7 @@ def test_checkpoint_head_missing_is_not_masked_by_a_replayed_but_too_young_bridg
     live_rows = full_chain[:2] + replacement_tail
 
     issues_alone = verify_tier(
-        live_rows, checkpoints=[checkpoint], verifying_key=verifying_key, now=now
+        live_rows, checkpoints=[checkpoint], keyring=_keyring(verifying_key), now=now
     )
     assert any(i["type"] == "checkpoint_head_missing" for i in issues_alone)
 
@@ -688,7 +700,7 @@ def test_checkpoint_head_missing_is_not_masked_by_a_replayed_but_too_young_bridg
         live_rows,
         checkpoints=[checkpoint],
         bridge_rows=original_tail,
-        verifying_key=verifying_key,
+        keyring=_keyring(verifying_key),
         now=now,
     )
     assert any(i["type"] == "checkpoint_head_missing" for i in issues_with_bridge), (
@@ -720,7 +732,7 @@ def test_checkpoint_head_missing_is_not_masked_by_a_content_tampered_bridge_row(
         live_rows,
         checkpoints=[checkpoint],
         bridge_rows=[bridge_row],
-        verifying_key=verifying_key,
+        keyring=_keyring(verifying_key),
         now=now,
     )
     assert any(i["type"] == "checkpoint_head_missing" for i in issues)
@@ -749,7 +761,7 @@ def test_checkpoint_head_missing_is_not_flagged_when_bridge_row_is_genuinely_arc
         live_rows,
         checkpoints=[checkpoint],
         bridge_rows=[bridge_row],
-        verifying_key=verifying_key,
+        keyring=_keyring(verifying_key),
         now=now,
     )
     assert not any(i["type"] == "checkpoint_head_missing" for i in issues)
@@ -770,7 +782,7 @@ def test_stale_checkpoint_is_flagged_when_the_checkpoint_job_has_stalled():
     checkpoint = _signed_checkpoint(signing_key, rows[1]["row_hash"], "2026-06-10T12:00:01.500Z")
     now = dt.datetime(2026, 6, 14, 12, 0, 0, tzinfo=dt.timezone.utc)  # checkpoint ~4 days stale
 
-    issues = verify_tier(rows, checkpoints=[checkpoint], verifying_key=verifying_key, now=now)
+    issues = verify_tier(rows, checkpoints=[checkpoint], keyring=_keyring(verifying_key), now=now)
     assert any(i["type"] == "stale_checkpoint" for i in issues)
 
 
@@ -787,7 +799,7 @@ def test_stale_checkpoint_is_not_flagged_when_the_checkpoint_covers_all_rows():
     checkpoint = _signed_checkpoint(signing_key, rows[-1]["row_hash"], "2026-06-10T12:00:02.000Z")
     now = dt.datetime(2026, 6, 20, tzinfo=dt.timezone.utc)
 
-    issues = verify_tier(rows, checkpoints=[checkpoint], verifying_key=verifying_key, now=now)
+    issues = verify_tier(rows, checkpoints=[checkpoint], keyring=_keyring(verifying_key), now=now)
     assert not any(i["type"] == "stale_checkpoint" for i in issues)
 
 
@@ -813,7 +825,7 @@ def test_checkpoint_count_regression_is_flagged_when_row_count_does_not_increase
     issues = verify_tier(
         rows,
         checkpoints=[earlier, later],
-        verifying_key=verifying_key,
+        keyring=_keyring(verifying_key),
         now=dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc),
     )
     assert any(
@@ -839,7 +851,7 @@ def test_checkpoint_count_regression_is_not_flagged_when_row_count_increases():
     issues = verify_tier(
         rows,
         checkpoints=[earlier, later],
-        verifying_key=verifying_key,
+        keyring=_keyring(verifying_key),
         now=dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc),
     )
     assert not any(i["type"] == "checkpoint_count_regression" for i in issues)
@@ -866,7 +878,7 @@ def test_main_still_reports_a_chain_whose_rows_are_all_gone(monkeypatch):
 
     class _Config:
         ch_audit_verify_password = "pw"
-        ch_checkpoint_verify_key_path = "unused"
+        ch_checkpoint_verify_key_paths = ("unused",)
 
     monkeypatch.setattr(verify_audit, "load_config", lambda: _Config())
     monkeypatch.setattr(verify_audit, "_fetch_rows", lambda config: [])
@@ -874,6 +886,109 @@ def test_main_still_reports_a_chain_whose_rows_are_all_gone(monkeypatch):
         verify_audit, "_fetch_checkpoints", lambda config: {("sovereign", ""): [checkpoint]}
     )
     monkeypatch.setattr(verify_audit, "_fetch_evidence_rows", lambda config, now: {})
-    monkeypatch.setattr(verify_audit, "_load_verifying_key", lambda config: verifying_key)
+    monkeypatch.setattr(
+        verify_audit, "_load_verifying_keyring", lambda config: _keyring(verifying_key)
+    )
 
     assert verify_audit.main() == 1
+
+
+def test_keyring_verifies_checkpoint_signed_by_either_ring_member():
+    """MEC-1610: a checkpoint verifies against whichever ring member's
+    locally computed fingerprint matches its key_id -- not just the first
+    or "primary" one. Order in the ring must not matter."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key_a = Ed25519PrivateKey.generate()
+    key_b = Ed25519PrivateKey.generate()
+    ring = {
+        **_keyring(key_a.public_key().public_bytes_raw()),
+        **_keyring(key_b.public_key().public_bytes_raw()),
+    }
+
+    rows = _chain(3)
+    checkpoint_signed_by_b = _signed_checkpoint(
+        key_b, rows[1]["row_hash"], "2026-06-10T12:00:01.500Z"
+    )
+
+    issues = verify_tier(
+        rows,
+        checkpoints=[checkpoint_signed_by_b],
+        keyring=ring,
+        now=dt.datetime(2026, 6, 10, 12, 0, 2, tzinfo=dt.timezone.utc),
+    )
+    assert not any(i["type"] == "unverifiable_checkpoint" for i in issues)
+
+
+def test_keyring_rejects_a_checkpoint_whose_key_id_matches_no_local_key():
+    """A checkpoint naming a key_id that is not in the locally loaded
+    keyring must fail closed (unverifiable_checkpoint), never silently pass
+    just because *some* key in the ring happens to verify a signature it
+    was never actually checked against."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing_key = Ed25519PrivateKey.generate()
+    unrelated_key = Ed25519PrivateKey.generate()
+    ring = _keyring(unrelated_key.public_key().public_bytes_raw())
+
+    rows = _chain(3)
+    checkpoint = _signed_checkpoint(signing_key, rows[1]["row_hash"], "2026-06-10T12:00:01.500Z")
+
+    issues = verify_tier(
+        rows,
+        checkpoints=[checkpoint],
+        keyring=ring,
+        now=dt.datetime(2026, 6, 10, 12, 0, 2, tzinfo=dt.timezone.utc),
+    )
+    assert any(i["type"] == "unverifiable_checkpoint" for i in issues)
+
+
+def test_key_rotation_overlap_window_verifies_both_old_and_new_checkpoints():
+    """MEC-1610's core scenario: during the overlap window where both the
+    retiring key and its replacement are present in the ring, checkpoints
+    signed before AND after the rotation must both still verify -- the
+    exact failure mode (every pre-rotation checkpoint going
+    unverifiable_checkpoint for its full ~90-day lifetime) that motivated
+    moving from a single verifying key to a keyring."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    old_key = Ed25519PrivateKey.generate()
+    new_key = Ed25519PrivateKey.generate()
+
+    full_chain = _chain(5)
+    pre_rotation_checkpoint = _signed_checkpoint(
+        old_key, full_chain[0]["row_hash"], "2026-06-11T00:00:00.000Z"
+    )
+    post_rotation_checkpoint = _signed_checkpoint(
+        new_key, full_chain[2]["row_hash"], "2026-06-12T00:00:00.000Z", row_count=3
+    )
+    surviving = full_chain[3:]
+    now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)  # old enough to anchor on the genesis
+
+    overlap_ring = {
+        **_keyring(old_key.public_key().public_bytes_raw()),
+        **_keyring(new_key.public_key().public_bytes_raw()),
+    }
+
+    issues = verify_tier(
+        surviving,
+        checkpoints=[pre_rotation_checkpoint, post_rotation_checkpoint],
+        bridge_rows=full_chain[1:3],
+        keyring=overlap_ring,
+        now=now,
+    )
+    assert issues == []
+
+    # Once the old key is retired from the ring (e.g. after its checkpoints
+    # have left the ~90-day retention window), the pre-rotation checkpoint
+    # alone would go unverifiable again -- but that is expected, not this
+    # test's concern. Here we only assert the overlap window itself is
+    # clean for both checkpoints.
+    new_only_issues = verify_tier(
+        surviving,
+        checkpoints=[pre_rotation_checkpoint, post_rotation_checkpoint],
+        bridge_rows=full_chain[1:3],
+        keyring=_keyring(new_key.public_key().public_bytes_raw()),
+        now=now,
+    )
+    assert any(i["type"] == "unverifiable_checkpoint" for i in new_only_issues)

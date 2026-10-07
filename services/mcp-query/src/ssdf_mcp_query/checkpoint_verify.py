@@ -24,6 +24,7 @@ import base64
 import binascii
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidSignature
@@ -106,3 +107,66 @@ def load_verifying_key(path: str) -> bytes:
         return base64.b64decode(text, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise CheckpointVerificationError(f"invalid verifying key file {path}: {exc}") from exc
+
+
+def key_fingerprint(verifying_key: bytes) -> str:
+    """The same short fingerprint mecmcp-audit's `checkpoint::key_id` computes
+    for a verifying key, so a checkpoint's stored `key_id` can be matched
+    against a locally loaded key (MEC-1610).
+
+    Computed over the key's *canonical base64 encoding*, not its raw bytes --
+    matching the Rust side exactly (`key_id(key) = sha256(encode_verifying_key(key))[..8]`),
+    not merely an encoding that "should be equivalent".
+    """
+    encoded = base64.b64encode(verifying_key).decode("ascii")
+    digest = hashlib.sha256(encoded.encode("utf-8")).digest()
+    return digest[:8].hex()
+
+
+def load_verifying_keyring(paths: list[str]) -> dict[str, bytes]:
+    """Load a keyring from one verifying-key file per path, keyed by each
+    key's locally computed fingerprint (MEC-1610).
+
+    Every key's fingerprint is computed here, from the key material this
+    process itself just read off disk -- never from a `key_id` value stored
+    anywhere else, including ClickHouse's `audit_checkpoints.key_id` column,
+    which is attacker-reachable under this feature's own threat model.
+    """
+    keyring: dict[str, bytes] = {}
+    for path in paths:
+        key = load_verifying_key(path)
+        keyring[key_fingerprint(key)] = key
+    return keyring
+
+
+def checkpoint_verify_key_paths_from_env(
+    paths_var: str = "CH_CHECKPOINT_VERIFY_KEY_PATHS",
+    legacy_single_var: str = "CH_CHECKPOINT_VERIFY_KEY_PATH",
+) -> tuple[str, ...]:
+    """Parse a comma-separated list of verifying-key paths from `paths_var`,
+    falling back to the pre-MEC-1610 single-key `legacy_single_var` so an
+    unrotated deployment's existing env var keeps working untouched."""
+    paths_value = os.environ.get(paths_var)
+    if paths_value is not None:
+        return tuple(p.strip() for p in paths_value.split(",") if p.strip())
+    single = os.environ.get(legacy_single_var)
+    return (single,) if single else ()
+
+
+def verify_checkpoint_signature_from_keyring(
+    checkpoint: Checkpoint, keyring: dict[str, bytes]
+) -> None:
+    """Verify `checkpoint` against whichever keyring entry's locally computed
+    fingerprint matches `checkpoint.key_id` (MEC-1610).
+
+    `key_id` only selects *which* key to try; it carries no trust of its own.
+    A checkpoint naming a `key_id` that matches no locally loaded key reports
+    exactly the same `CheckpointVerificationError` as a bad signature --
+    fails closed either way, never silently skipped.
+    """
+    key = keyring.get(checkpoint.key_id)
+    if key is None:
+        raise CheckpointVerificationError(
+            f"no locally loaded key matches checkpoint key_id {checkpoint.key_id!r}"
+        )
+    verify_checkpoint_signature(checkpoint, key)
