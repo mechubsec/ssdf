@@ -264,6 +264,43 @@ def test_change_impact_truncated_pull_is_reported_not_hidden():
     assert section["result"] == "unknown: candidate pull truncated at 2 rows"
 
 
+def test_change_impact_window_predating_retention_is_reported_not_hidden():
+    """A `since` older than ssdf.events' own retention floor means rows for
+    part of the requested window have already aged out of the source
+    table -- the report must say so (both in `coverage` and in the empty
+    per-rule section) instead of reading as a clean 'no sessions observed'
+    over the full requested window."""
+    policies = [_policy_entity("RULE-A", action="deny")]
+    store = FakeEntityStore(policies)
+    object_book = {"address_books": {"global": {"addresses": {}, "address_sets": {}}}}
+    ch = FakeChClient(object_book=object_book, event_rows=[])
+    tools = ChangeImpactTools(ch, store)
+
+    report = tools.change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        delta=[{"op": "modify", "rule_name": "RULE-A", "fields": {"action": "allow"}}],
+        since="now-45d",
+        until="now",
+    )
+
+    assert report["coverage"]["since_predates_raw_retention"] is True
+    assert report["coverage"]["raw_events_retention_days"] == 30
+    [section] = report["changed_rules"]
+    assert section["result"] == ("unknown: requested window predates raw-events retention (30d)")
+
+    recent_report = tools.change_impact(
+        device_name="vsrx-ci",
+        provider="juniper",
+        delta=[{"op": "modify", "rule_name": "RULE-A", "fields": {"action": "allow"}}],
+        since="now-5d",
+        until="now",
+    )
+    assert recent_report["coverage"]["since_predates_raw_retention"] is False
+    [recent_section] = recent_report["changed_rules"]
+    assert recent_section["result"] == "no historical sessions observed in the analysable scope"
+
+
 def test_change_impact_zone_pairs_restricted_to_changed_rules():
     """The candidate pull's zone-pair filter must come from the rules that
     actually differ (C), not the whole rulebase -- an unrelated zone-pair
