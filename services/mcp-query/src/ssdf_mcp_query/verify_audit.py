@@ -18,6 +18,10 @@ Detects: content edits (recomputed hash != stored), deletions (a prev_hash namin
 a missing row), and insertions/reorders (rows unreachable from genesis). Follows
 the linkage, NOT ts ordering, so same-millisecond ts ties never false-positive.
 
+Checkpoint signatures verify against a keyring (``CH_CHECKPOINT_VERIFY_KEY_PATHS``),
+not a single key — see docs/checkpoint-key-rotation.md for how to rotate the
+verifying key without making every pre-rotation checkpoint unverifiable.
+
 Usage: python -m ssdf_mcp_query.verify_audit
 Exit code 0 = all tiers clean; 1 = at least one issue (or 2 = config error).
 """
@@ -33,7 +37,7 @@ from .audit_chain import compute_row_hash
 from .checkpoint_verify import (
     Checkpoint,
     CheckpointVerificationError,
-    verify_checkpoint_signature,
+    verify_checkpoint_signature_from_keyring,
 )
 from .config import ch_tls_kwargs, load_config
 
@@ -147,17 +151,17 @@ def _is_old_enough_to_anchor(checkpoint_ts: str, now: dt.datetime) -> bool:
 
 
 def _verify_checkpoint_anchor(
-    checkpoint: Checkpoint, verifying_key: bytes | None, now: dt.datetime
+    checkpoint: Checkpoint, keyring: dict[str, bytes] | None, now: dt.datetime
 ) -> dict | None:
     """Whether ``checkpoint`` may be trusted as an anchor: its signature must
-    verify against ``verifying_key``, and it must be old enough that the rows
+    verify against ``keyring``, and it must be old enough that the rows
     it stands in for could actually have expired. Returns the issue to report
     when it fails either check, or ``None`` when it passes.
     """
-    if verifying_key is None:
+    if keyring is None:
         return {"type": "unverifiable_checkpoint", "row_hash": checkpoint.head_row_hash}
     try:
-        verify_checkpoint_signature(checkpoint, verifying_key)
+        verify_checkpoint_signature_from_keyring(checkpoint, keyring)
     except CheckpointVerificationError:
         return {"type": "unverifiable_checkpoint", "row_hash": checkpoint.head_row_hash}
     if not _is_old_enough_to_anchor(checkpoint.checkpoint_ts, now):
@@ -169,7 +173,7 @@ def _anchor_dangling_hash(
     prev_hash: str,
     checkpoints_by_head: dict[str, list[Checkpoint]],
     bridge_by_hash: dict[str, dict],
-    verifying_key: bytes | None,
+    keyring: dict[str, bytes] | None,
     now: dt.datetime,
 ) -> tuple[bool, list[dict]]:
     """Try to anchor one dangling ``prev_hash``: either directly against a
@@ -198,7 +202,7 @@ def _anchor_dangling_hash(
         candidates = checkpoints_by_head.get(current)
         if candidates:
             for checkpoint in candidates:
-                issue = _verify_checkpoint_anchor(checkpoint, verifying_key, now)
+                issue = _verify_checkpoint_anchor(checkpoint, keyring, now)
                 if issue is None:
                     return True, issues
                 issues.append(issue)
@@ -220,17 +224,17 @@ def _checkpoint_head_issues(
     checkpoints: list[Checkpoint],
     by_hash: dict[str, dict],
     bridge_by_hash: dict[str, dict],
-    verifying_key: bytes | None,
+    keyring: dict[str, bytes] | None,
     now: dt.datetime,
 ) -> list[dict]:
     """Every checkpoint's signature is verified regardless of age; age only
     gates the head-presence check."""
-    if verifying_key is None:
+    if keyring is None:
         return []
     issues: list[dict] = []
     for checkpoint in checkpoints:
         try:
-            verify_checkpoint_signature(checkpoint, verifying_key)
+            verify_checkpoint_signature_from_keyring(checkpoint, keyring)
         except CheckpointVerificationError:
             issues.append({"type": "unverifiable_checkpoint", "row_hash": checkpoint.head_row_hash})
             continue
@@ -269,19 +273,19 @@ _STALE_CHECKPOINT_THRESHOLD_DAYS = 2
 
 
 def _verified_checkpoints(
-    checkpoints: list[Checkpoint], verifying_key: bytes | None
+    checkpoints: list[Checkpoint], keyring: dict[str, bytes] | None
 ) -> list[Checkpoint]:
     """Checkpoints whose signature actually verifies. Checks that depend on
     a checkpoint's own claims (``checkpoint_ts``, ``row_count``) rather than
     just its presence must only trust ones that pass this -- an unverified
     claim is exactly as trustworthy as one fabricated by whoever has INSERT
     on ``audit_checkpoints``."""
-    if verifying_key is None:
+    if keyring is None:
         return []
     verified = []
     for checkpoint in checkpoints:
         try:
-            verify_checkpoint_signature(checkpoint, verifying_key)
+            verify_checkpoint_signature_from_keyring(checkpoint, keyring)
         except CheckpointVerificationError:
             continue
         verified.append(checkpoint)
@@ -337,7 +341,7 @@ def _checkpoint_count_regression_issues(verified_checkpoints: list[Checkpoint]) 
 
 def _select_checkpoint_anchors(
     checkpoints: list[Checkpoint],
-    verifying_key: bytes | None,
+    keyring: dict[str, bytes] | None,
     dangling_prev_hashes: set[str],
     bridge_rows: list[dict],
     now: dt.datetime,
@@ -367,7 +371,7 @@ def _select_checkpoint_anchors(
     issues: list[dict] = []
     for prev_hash in dangling_prev_hashes:
         anchored, hash_issues = _anchor_dangling_hash(
-            prev_hash, checkpoints_by_head, bridge_by_hash, verifying_key, now
+            prev_hash, checkpoints_by_head, bridge_by_hash, keyring, now
         )
         if anchored:
             anchors.add(prev_hash)
@@ -380,7 +384,7 @@ def verify_tier(
     rows: list[dict],
     checkpoints: list[Checkpoint] = (),
     bridge_rows: list[dict] = (),
-    verifying_key: bytes | None = None,
+    keyring: dict[str, bytes] | None = None,
     now: dt.datetime | None = None,
     check_freshness: bool = True,
 ) -> list[dict]:
@@ -391,7 +395,7 @@ def verify_tier(
     chain start. A blanked-hash tamper on a chained row is still caught — its
     successor's prev_hash names a now-missing row_hash (missing_predecessor).
 
-    ``checkpoints`` and ``verifying_key`` are only consulted when this
+    ``checkpoints`` and ``keyring`` are only consulted when this
     chain's genesis row is absent from ``rows`` -- i.e. it has expired past
     the 90-day TTL. Callers that never pass them get exactly today's
     behaviour: an expired genesis makes every surviving row ``unreachable``.
@@ -458,14 +462,12 @@ def verify_tier(
     # 1.5 Checkpoint head presence: every checkpoint still within its recent
     # window must have its head findable, independent of whether this
     # chain's genesis survives -- see _checkpoint_head_issues.
-    issues.extend(
-        _checkpoint_head_issues(list(checkpoints), by_hash, bridge_by_hash, verifying_key, now)
-    )
+    issues.extend(_checkpoint_head_issues(list(checkpoints), by_hash, bridge_by_hash, keyring, now))
 
     # 1.6 Checkpoint freshness and count continuity, both independent of
     # whether any particular row or head is currently reachable -- see
     # _stale_checkpoint_issue and _checkpoint_count_regression_issues.
-    verified_checkpoints = _verified_checkpoints(list(checkpoints), verifying_key)
+    verified_checkpoints = _verified_checkpoints(list(checkpoints), keyring)
     if check_freshness:
         stale_issue = _stale_checkpoint_issue(rows, verified_checkpoints, now)
         if stale_issue is not None:
@@ -487,7 +489,7 @@ def verify_tier(
             r["prev_hash"] for r in rows if r["prev_hash"] != "" and r["prev_hash"] not in by_hash
         }
         anchor_hashes, anchor_issues = _select_checkpoint_anchors(
-            list(checkpoints), verifying_key, dangling, list(bridge_rows), now
+            list(checkpoints), keyring, dangling, list(bridge_rows), now
         )
         issues.extend(anchor_issues)
 
@@ -603,18 +605,18 @@ def _fetch_checkpoints(config) -> dict[tuple[str, str], list[Checkpoint]]:
     return by_chain
 
 
-def _load_verifying_key(config) -> bytes | None:
-    """Load the checkpoint verifying key, or None when checkpoint-based
+def _load_verifying_keyring(config) -> dict[str, bytes] | None:
+    """Load the checkpoint verifying keyring, or None when checkpoint-based
     verification is not configured (fail closed to today's behaviour, not to
     an exception, since most deployments will not have rolled this out yet)."""
-    if not config.ch_checkpoint_verify_key_path:
+    if not config.ch_checkpoint_verify_key_paths:
         return None
-    from .checkpoint_verify import load_verifying_key
+    from .checkpoint_verify import load_verifying_keyring
 
     try:
-        return load_verifying_key(config.ch_checkpoint_verify_key_path)
+        return load_verifying_keyring(config.ch_checkpoint_verify_key_paths)
     except CheckpointVerificationError as exc:
-        print(f"warning: could not load checkpoint verifying key: {exc}", file=sys.stderr)
+        print(f"warning: could not load checkpoint verifying keyring: {exc}", file=sys.stderr)
         return None
 
 
@@ -625,7 +627,7 @@ def main() -> int:
         return 2
     rows = _fetch_rows(config)
     checkpoints_by_chain = _fetch_checkpoints(config)
-    verifying_key = _load_verifying_key(config)
+    keyring = _load_verifying_keyring(config)
     now = dt.datetime.now(dt.timezone.utc)
     evidence_by_chain = _fetch_evidence_rows(config, now)
     by_chain: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -643,7 +645,7 @@ def main() -> int:
             chain_rows,
             checkpoints=checkpoints_by_chain.get((tier, server_id), []),
             bridge_rows=evidence_by_chain.get((tier, server_id), []),
-            verifying_key=verifying_key,
+            keyring=keyring,
             now=now,
         )
         # An evidence row with no usable writer cannot be chained to anything,

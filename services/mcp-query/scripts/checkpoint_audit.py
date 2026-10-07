@@ -28,17 +28,21 @@ itself confirmed clean. `compute_next_checkpoint`'s own docstring says
 checkpointing an unverified chain is "the caller's mistake to avoid" -- this
 is that check, and `compute_next_checkpoint` separately refuses outright on
 the one tamper shape it can detect directly while walking the chain, rather
-than quietly picking a branch. `CH_CHECKPOINT_VERIFY_KEY_PATH` is required
+than quietly picking a branch. `CH_CHECKPOINT_VERIFY_KEY_PATHS` is required
 (not merely recommended) so this self-verification step can always anchor
 past an already checkpointed, since-expired predecessor the same way
 verify_audit.py does (including bridging through ssdf.audit_evidence); a job
 that ran without it would silently skip self-verifying any chain whose
 genesis has expired, rather than fail closed up front.
 
+``CH_CHECKPOINT_VERIFY_KEY_PATHS`` is a keyring, not a single key — see
+docs/checkpoint-key-rotation.md for the rotation procedure and the overlap
+window it requires.
+
 Usage (from services/mcp-query, where the package is installed):
     export CH_HOST=... CH_CHECKPOINT_PASSWORD=...
     export CHECKPOINT_SIGNING_KEY_PATH=/etc/ssdf/checkpoint-signing.key
-    export CH_CHECKPOINT_VERIFY_KEY_PATH=/etc/ssdf/checkpoint-verify.key
+    export CH_CHECKPOINT_VERIFY_KEY_PATHS=/etc/ssdf/checkpoint-verify.key
     uv run python scripts/checkpoint_audit.py [--binary mecmcp-audit-checkpoint]
 """
 
@@ -62,8 +66,9 @@ from ssdf_mcp_query.checkpoint_orchestrator import (
 from ssdf_mcp_query.checkpoint_verify import (
     Checkpoint,
     CheckpointVerificationError,
-    load_verifying_key,
-    verify_checkpoint_signature,
+    checkpoint_verify_key_paths_from_env,
+    load_verifying_keyring,
+    verify_checkpoint_signature_from_keyring,
 )
 from ssdf_mcp_query.verify_audit import group_key, verify_tier
 
@@ -198,19 +203,21 @@ def fetch_checkpoints_by_chain(client) -> dict[tuple[str, str], list[Checkpoint]
     return by_chain
 
 
-def load_checkpoint_verifying_key() -> bytes | None:
-    """The checkpoint verifying key for self-verification, or None when it is
-    not configured (fail closed to skipping self-verification for chains
+def load_checkpoint_verifying_keyring() -> dict[str, bytes] | None:
+    """The checkpoint verifying keyring for self-verification, or None when it
+    is not configured (fail closed to skipping self-verification for chains
     whose genesis has expired, not to an exception -- a fresh chain that
     still has its genesis needs no anchor and self-verifies fine either
-    way)."""
-    path = os.environ.get("CH_CHECKPOINT_VERIFY_KEY_PATH")
-    if not path:
+    way). A keyring, not a single key, so self-verification of a previous
+    checkpoint signed before a key rotation does not start failing the
+    moment the old key is retired from a single-key config (MEC-1610)."""
+    paths = checkpoint_verify_key_paths_from_env()
+    if not paths:
         return None
     try:
-        return load_verifying_key(path)
+        return load_verifying_keyring(paths)
     except CheckpointVerificationError as exc:
-        print(f"warning: could not load checkpoint verifying key: {exc}", file=sys.stderr)
+        print(f"warning: could not load checkpoint verifying keyring: {exc}", file=sys.stderr)
         return None
 
 
@@ -238,7 +245,7 @@ def sign_checkpoint(
     binary: str,
     key_path: str,
     payload: dict,
-    verifying_key: bytes | None = None,
+    keyring: dict[str, bytes] | None = None,
 ) -> dict:
     """Shell out to the Rust signer. Deterministic, no model in the loop.
 
@@ -249,7 +256,7 @@ def sign_checkpoint(
     Two additional checks, run after a successful parse: the signer must
     echo back the exact content fields it was asked to sign
     (a signer that silently substituted a different row_count/head_row_hash
-    would otherwise go uncaught), and, when `verifying_key` is given, its
+    would otherwise go uncaught), and, when `keyring` is given, its
     signature must itself verify -- a buggy or compromised signer producing
     output that merely *parses* like a checkpoint must not reach the insert
     path either.
@@ -281,7 +288,7 @@ def sign_checkpoint(
                 f"expected {payload[field_name]!r}"
             )
 
-    if verifying_key is not None:
+    if keyring is not None:
         checkpoint = Checkpoint(
             tier=signed["tier"],
             server_id=signed["server_id"],
@@ -292,7 +299,7 @@ def sign_checkpoint(
             key_id=signed["key_id"],
         )
         try:
-            verify_checkpoint_signature(checkpoint, verifying_key)
+            verify_checkpoint_signature_from_keyring(checkpoint, keyring)
         except CheckpointVerificationError as exc:
             raise RuntimeError(f"{binary} produced an invalid signature: {exc}") from exc
 
@@ -312,7 +319,7 @@ def run(
     binary: str,
     key_path: str,
     now: dt.datetime | None = None,
-    verifying_key: bytes | None = None,
+    keyring: dict[str, bytes] | None = None,
 ) -> RunResult:
     """Checkpoint every chain that has rows newer than its last checkpoint.
 
@@ -341,7 +348,7 @@ def run(
             rows,
             checkpoints=checkpoints_by_chain.get(chain, []),
             bridge_rows=evidence_by_chain.get(chain, []),
-            verifying_key=verifying_key,
+            keyring=keyring,
             now=now,
             check_freshness=False,
         )
@@ -354,7 +361,7 @@ def run(
             result.skipped.append(chain)
             continue
         previous = previous_by_chain.get(chain)
-        if previous is not None and verifying_key is not None:
+        if previous is not None and keyring is not None:
             previous_checkpoint = Checkpoint(
                 tier=previous["tier"],
                 server_id=previous["server_id"],
@@ -365,7 +372,7 @@ def run(
                 key_id=previous["key_id"],
             )
             try:
-                verify_checkpoint_signature(previous_checkpoint, verifying_key)
+                verify_checkpoint_signature_from_keyring(previous_checkpoint, keyring)
             except CheckpointVerificationError as exc:
                 print(
                     f"skipping chain tier={chain[0]} server={chain[1]!r}: "
@@ -400,9 +407,7 @@ def run(
                 )
                 result.skipped.append(chain)
             continue
-        signed = sign_checkpoint(
-            binary, key_path, build_payload(pending, now), verifying_key=verifying_key
-        )
+        signed = sign_checkpoint(binary, key_path, build_payload(pending, now), keyring=keyring)
         insert_checkpoint(client, signed)
         result.inserted.append(signed)
     return result
@@ -425,13 +430,16 @@ def main() -> int:
     if not password:
         print("CH_CHECKPOINT_PASSWORD is required", file=sys.stderr)
         return 2
-    if not os.environ.get("CH_CHECKPOINT_VERIFY_KEY_PATH"):
-        print("CH_CHECKPOINT_VERIFY_KEY_PATH is required", file=sys.stderr)
+    if not checkpoint_verify_key_paths_from_env():
+        print(
+            "CH_CHECKPOINT_VERIFY_KEY_PATHS (or legacy CH_CHECKPOINT_VERIFY_KEY_PATH) is required",
+            file=sys.stderr,
+        )
         return 2
 
-    verifying_key = load_checkpoint_verifying_key()
-    if verifying_key is None:
-        print("could not load CH_CHECKPOINT_VERIFY_KEY_PATH", file=sys.stderr)
+    keyring = load_checkpoint_verifying_keyring()
+    if keyring is None:
+        print("could not load checkpoint verifying keyring", file=sys.stderr)
         return 2
 
     host = os.environ.get("CH_HOST", "127.0.0.1")
@@ -461,7 +469,7 @@ def main() -> int:
     )
 
     try:
-        result = run(client, args.binary, key_path, verifying_key=verifying_key)
+        result = run(client, args.binary, key_path, keyring=keyring)
     except RuntimeError as exc:
         print(f"checkpointing failed: {exc}", file=sys.stderr)
         return 1

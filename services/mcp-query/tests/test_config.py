@@ -234,3 +234,32 @@ def test_load_config_query_limit_defaults(monkeypatch):
     cfg = load_config()
     assert cfg.max_result_rows == 100000
     assert cfg.max_memory_usage == 1_000_000_000
+
+
+def test_checkpoint_verify_key_paths_comma_separated(monkeypatch):
+    monkeypatch.setenv("CH_PASSWORD", "x")
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "t")
+    monkeypatch.delenv("CH_CHECKPOINT_VERIFY_KEY_PATH", raising=False)
+    monkeypatch.setenv("CH_CHECKPOINT_VERIFY_KEY_PATHS", "/etc/ssdf/a.key, /etc/ssdf/b.key")
+    cfg = load_config()
+    assert cfg.ch_checkpoint_verify_key_paths == ("/etc/ssdf/a.key", "/etc/ssdf/b.key")
+
+
+def test_checkpoint_verify_key_paths_falls_back_to_legacy_single_var(monkeypatch):
+    """MEC-1610: an unrotated deployment's existing single-key env var keeps
+    working untouched once the config surface moves to a keyring."""
+    monkeypatch.setenv("CH_PASSWORD", "x")
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "t")
+    monkeypatch.delenv("CH_CHECKPOINT_VERIFY_KEY_PATHS", raising=False)
+    monkeypatch.setenv("CH_CHECKPOINT_VERIFY_KEY_PATH", "/etc/ssdf/checkpoint-verify.key")
+    cfg = load_config()
+    assert cfg.ch_checkpoint_verify_key_paths == ("/etc/ssdf/checkpoint-verify.key",)
+
+
+def test_checkpoint_verify_key_paths_empty_when_unconfigured(monkeypatch):
+    monkeypatch.setenv("CH_PASSWORD", "x")
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "t")
+    monkeypatch.delenv("CH_CHECKPOINT_VERIFY_KEY_PATHS", raising=False)
+    monkeypatch.delenv("CH_CHECKPOINT_VERIFY_KEY_PATH", raising=False)
+    cfg = load_config()
+    assert cfg.ch_checkpoint_verify_key_paths == ()

@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .checkpoint_verify import checkpoint_verify_key_paths_from_env
 from .tokenstore import (
     InsecureTokenFileError,
     assert_file_mode_private,
@@ -52,12 +53,17 @@ class Config:
     ch_audit_user: str = "ssdf_audit"
     ch_audit_password: Secret | None = None
     ch_audit_verify_password: Secret | None = None
-    # MEC-565: path to the base64-encoded Ed25519 verifying key for
-    # ssdf.audit chain checkpoints (checkpoint_verify.load_verifying_key).
-    # None disables checkpoint-based verification; verify_audit.py then falls
-    # back to today's behaviour (an expired genesis reports every surviving
-    # row in that chain as unreachable, same as before this feature existed).
-    ch_checkpoint_verify_key_path: str | None = None
+    # MEC-565/MEC-1610: paths to base64-encoded Ed25519 verifying keys for
+    # ssdf.audit chain checkpoints (checkpoint_verify.load_verifying_keyring).
+    # A keyring, not a single key, so a checkpoint signed before a key
+    # rotation still verifies as long as its key is still in the ring --
+    # otherwise every checkpoint anchored under a retired key reports
+    # unverifiable_checkpoint for its full ~90-day lifetime, which is a
+    # standing incentive to disable verification entirely. Empty disables
+    # checkpoint-based verification; verify_audit.py then falls back to
+    # today's behaviour (an expired genesis reports every surviving row in
+    # that chain as unreachable, same as before this feature existed).
+    ch_checkpoint_verify_key_paths: tuple[str, ...] = ()
     # M16f: default False preserves the existing (best-effort) deploy; set
     # MCP_AUDIT_REQUIRED=1 to refuse startup rather than silently run with
     # audit disabled when CH_AUDIT_PASSWORD is unset.
@@ -211,7 +217,7 @@ def load_config() -> Config:
         ch_audit_user=os.environ.get("CH_AUDIT_USER", "ssdf_audit"),
         ch_audit_password=Secret(audit_password) if audit_password else None,
         ch_audit_verify_password=Secret(audit_verify_password) if audit_verify_password else None,
-        ch_checkpoint_verify_key_path=os.environ.get("CH_CHECKPOINT_VERIFY_KEY_PATH") or None,
+        ch_checkpoint_verify_key_paths=checkpoint_verify_key_paths_from_env(),
         audit_required=os.environ.get("MCP_AUDIT_REQUIRED", "").strip().lower() in ("1", "true"),
         max_execution_time=int(os.environ.get("MCP_MAX_EXEC_SECS", "10")),
         max_result_rows=int(os.environ.get("MCP_MAX_RESULT_ROWS", "100000")),
