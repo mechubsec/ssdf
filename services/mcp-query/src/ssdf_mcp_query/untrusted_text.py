@@ -16,10 +16,29 @@ one without re-deriving that from context.
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 
 # Bounds response size for oversized values.
 DEFAULT_MAX_LEN = 512
+
+# Unicode categories stripped at the boundary: controls (Cc), format
+# characters (Cf), line/paragraph separators (Zl/Zp), and private-use /
+# surrogate / unassigned code points (Co/Cs/Cn). Variation selectors are
+# category Mn, so they are listed explicitly. Category-based rather than a
+# range list, so newly assigned invisible characters are covered too.
+_STRIP_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Co", "Cs", "Cn"})
+
+
+def _is_stripped(ch: str) -> bool:
+    cp = ord(ch)
+    if 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF:
+        return True
+    return unicodedata.category(ch) in _STRIP_CATEGORIES
+
+
+def _strip_controls(text: str) -> str:
+    return "".join(ch for ch in text if not _is_stripped(ch))
 
 
 @dataclass(frozen=True)
@@ -33,8 +52,11 @@ class UntrustedText:
     def from_raw(cls, raw: object, max_len: int = DEFAULT_MAX_LEN) -> "UntrustedText":
         """Convert a raw log/ext value at the boundary. `raw` may be None, str, or any
         scalar the ClickHouse driver handed back; it is never trusted to already be a
-        well-formed, bounded string."""
+        well-formed, bounded string. Control characters are stripped before the length
+        cap is applied, so a long run of stripped bytes cannot itself push otherwise-kept
+        text out past `max_len`."""
         text = "" if raw is None else str(raw)
+        text = _strip_controls(text)
         if len(text) > max_len:
             return cls(value=text[:max_len], truncated=True)
         return cls(value=text, truncated=False)
