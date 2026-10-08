@@ -22,6 +22,36 @@ Checkpoint signatures verify against a keyring (``CH_CHECKPOINT_VERIFY_KEY_PATHS
 not a single key — see docs/checkpoint-key-rotation.md for how to rotate the
 verifying key without making every pre-rotation checkpoint unverifiable.
 
+Finding types (the ``type`` field of each reported issue):
+
+- ``content_edit`` — a stored row_hash no longer matches its recomputed hash.
+- ``missing_predecessor`` — a row's prev_hash names no present row and no
+  trusted anchor.
+- ``unreachable`` — a row is not reachable from genesis or a trusted anchor.
+- ``duplicate_row`` — the same row_hash appears more than once in a tier.
+- ``fork`` — two or more rows share the same prev_hash.
+- ``unverifiable_checkpoint`` — a checkpoint's signature does not verify
+  against the configured keyring.
+- ``checkpoint_head_missing`` — a still-young checkpoint's head row is absent
+  from both ``ssdf.audit`` and a vouching bridge row.
+- ``stale_checkpoint`` — a chain has rows newer than its latest verified
+  checkpoint, and that checkpoint is itself overdue on the nominal schedule.
+- ``checkpoint_count_regression`` — a chain's verified checkpoints do not
+  have strictly increasing ``row_count`` in checkpoint_ts order.
+- ``unidentified_writer`` — an evidence-tier row's ``args`` carry no usable
+  ``server_id`` to group it by writer.
+- ``premature_truncation`` — informational: something in the anchor path
+  looks younger than the TTL schedule says it should. Two distinct triggers
+  share this type: (1) the checkpoint being used as an anchor is itself not
+  old enough that the rows it stands in for could have legitimately expired
+  (see ``_is_old_enough_to_anchor``); (2) the first evidence-tier row the
+  bridge walk had to traverse to reach that anchor has a ``ts`` newer than
+  the TTL schedule would allow for a row no longer in ``ssdf.audit`` (see
+  ``_anchor_dangling_hash``) — the bridge still succeeds and no data is
+  lost, but the row left the live table earlier than its normal retention
+  age, which is itself worth surfacing (a misconfigured retention job, or an
+  attempt to shrink the live table's forensic window).
+
 Usage: python -m ssdf_mcp_query.verify_audit
 Exit code 0 = all tiers clean; 1 = at least one issue (or 2 = config error).
 """
@@ -175,7 +205,7 @@ def _anchor_dangling_hash(
     bridge_by_hash: dict[str, dict],
     keyring: dict[str, bytes] | None,
     now: dt.datetime,
-) -> tuple[bool, list[dict]]:
+) -> tuple[bool, list[dict], list[dict]]:
     """Try to anchor one dangling ``prev_hash``: either directly against a
     checkpoint whose ``head_row_hash`` matches it, or by walking backward
     through evidence-tier rows (``bridge_by_hash``) until reaching one that
@@ -194,30 +224,69 @@ def _anchor_dangling_hash(
 
     Bounded by the number of distinct bridge rows available, so a cyclic or
     unresolvable bridge terminates rather than looping forever.
+
+    Returns ``(anchored, issues, info_issues)``. ``issues`` follows the
+    caller's existing discard-on-success convention (a failed earlier
+    candidate's issue is noise once a later one succeeds, so the caller only
+    keeps it when ``anchored`` is False). ``info_issues`` is returned
+    regardless of ``anchored`` and is always reported by the caller: on a
+    successful bridge (walk length > 0), it holds the TTL check
+    ``_premature_bridge_departure_issue`` runs against the first bridge row
+    traversed -- the one nearest the dangling hash, i.e. the row that most
+    recently left ``ssdf.audit``. A direct match (walk length zero, no bridge
+    row involved) has nothing to check there.
     """
     current = prev_hash
     visited: set[str] = set()
     issues: list[dict] = []
+    first_bridge_row: dict | None = None
     for _ in range(len(bridge_by_hash) + 1):
         candidates = checkpoints_by_head.get(current)
         if candidates:
             for checkpoint in candidates:
                 issue = _verify_checkpoint_anchor(checkpoint, keyring, now)
                 if issue is None:
-                    return True, issues
+                    return True, issues, _premature_bridge_departure_issue(first_bridge_row, now)
                 issues.append(issue)
-            return False, issues
+            return False, issues, []
         if current in visited:
-            return False, issues
+            return False, issues, []
         visited.add(current)
         bridge_row = bridge_by_hash.get(current)
         if bridge_row is None:
-            return False, issues
+            return False, issues, []
+        if first_bridge_row is None:
+            first_bridge_row = bridge_row
         if compute_row_hash(bridge_row["prev_hash"], bridge_row) != bridge_row["row_hash"]:
             issues.append({"type": "content_edit", "row_hash": bridge_row["row_hash"]})
-            return False, issues
+            return False, issues, []
         current = bridge_row["prev_hash"]
-    return False, issues
+    return False, issues, []
+
+
+def _premature_bridge_departure_issue(
+    first_bridge_row: dict | None, now: dt.datetime
+) -> list[dict]:
+    """Whether the row nearest the dangling predecessor — the first one a
+    successful bridge walk actually had to traverse — left ``ssdf.audit``
+    earlier than the TTL schedule would have evicted it.
+
+    The bridge having succeeded already means no data was lost; this is a
+    separate, informational signal about *why* the row was already gone from
+    the live table: ordinary TTL expiry, or something else worth knowing
+    about (a misconfigured retention job, or an attempt to shrink the live
+    table's forensic window). ``first_bridge_row is None`` covers the
+    walk-length-zero case — a dangling hash matching a checkpoint head
+    directly, with no bridge row in between — which has nothing to check.
+    """
+    if first_bridge_row is None:
+        return []
+    ts = first_bridge_row["ts"]
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    if now - ts < dt.timedelta(days=_AUDIT_TTL_DAYS - _CHECKPOINT_INTERVAL_SLACK_DAYS):
+        return [{"type": "premature_truncation", "row_hash": first_bridge_row["row_hash"]}]
+    return []
 
 
 def _checkpoint_head_issues(
@@ -370,9 +439,10 @@ def _select_checkpoint_anchors(
     anchors: set[str] = set()
     issues: list[dict] = []
     for prev_hash in dangling_prev_hashes:
-        anchored, hash_issues = _anchor_dangling_hash(
+        anchored, hash_issues, info_issues = _anchor_dangling_hash(
             prev_hash, checkpoints_by_head, bridge_by_hash, keyring, now
         )
+        issues.extend(info_issues)
         if anchored:
             anchors.add(prev_hash)
         else:
