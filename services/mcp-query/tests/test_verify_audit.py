@@ -555,6 +555,89 @@ def test_bridge_rejects_a_tampered_intermediate_row():
     assert any(i["type"] == "missing_predecessor" for i in issues)
 
 
+def _custom_row(ts, prev_hash, row_count=0):
+    """Like ``_chain``'s per-row construction, but with a caller-chosen
+    ``ts`` -- needed to put a bridge row at an arbitrary distance from
+    ``now`` without disturbing the hash (``ts`` is itself part of the
+    canonical form, so it cannot be patched onto an already-hashed row)."""
+    row = dict(
+        ts=ts,
+        principal="agent",
+        tier="sovereign",
+        tool="t",
+        args="{}",
+        data_classes=["topology"],
+        decision="allow",
+        row_count=row_count,
+        error="",
+    )
+    row["prev_hash"] = prev_hash
+    row["row_hash"] = compute_row_hash(prev_hash, row)
+    return row
+
+
+def test_bridge_flags_premature_truncation_when_the_bridged_row_left_early():
+    """A row can be bridged in cleanly -- the chain still verifies, nothing
+    is lost -- and still have left ssdf.audit long before its normal TTL
+    would have evicted it. That is itself a signal worth surfacing (e.g. a
+    misconfigured retention job, or an attempt to shrink the live table's
+    forensic window), separate from the chain-integrity verdict."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+
+    genesis = _custom_row(dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc), "")
+    # Left ssdf.audit only 9 days before `now` -- far short of the ~88-day
+    # TTL-minus-slack a row must reach before its absence is ordinary.
+    bridge_row = _custom_row(dt.datetime(2026, 9, 10, tzinfo=dt.timezone.utc), genesis["row_hash"])
+    surviving_row = _custom_row(
+        dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc), bridge_row["row_hash"]
+    )
+    checkpoint = _signed_checkpoint(signing_key, genesis["row_hash"], "2026-06-01T00:00:00.000Z")
+    now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)
+
+    issues = verify_tier(
+        [surviving_row],
+        checkpoints=[checkpoint],
+        bridge_rows=[bridge_row],
+        keyring=_keyring(verifying_key),
+        now=now,
+    )
+    assert any(i["type"] == "premature_truncation" for i in issues)
+    # The chain still verifies -- this is informational, not a failure.
+    assert not any(i["type"] in ("missing_predecessor", "unreachable") for i in issues)
+
+
+def test_bridge_does_not_flag_premature_truncation_on_ordinary_ttl_expiry():
+    """The common case: a bridged row that left ssdf.audit right on the
+    normal TTL schedule must not be flagged -- only an early departure is a
+    signal, and false positives on routine expiry would make the finding
+    noise rather than signal."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+
+    genesis = _custom_row(dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc), "")
+    # ~110 days before `now`, well past the ~88-day TTL-minus-slack boundary.
+    bridge_row = _custom_row(dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc), genesis["row_hash"])
+    surviving_row = _custom_row(
+        dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc), bridge_row["row_hash"]
+    )
+    checkpoint = _signed_checkpoint(signing_key, genesis["row_hash"], "2026-06-01T00:00:00.000Z")
+    now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)
+
+    issues = verify_tier(
+        [surviving_row],
+        checkpoints=[checkpoint],
+        bridge_rows=[bridge_row],
+        keyring=_keyring(verifying_key),
+        now=now,
+    )
+    assert issues == []
+
+
 def test_recent_checkpoint_head_missing_is_detected():
     """A checkpoint anchored at the current chain tip followed by deletion
     of the rows at and after that head must be caught immediately, not only

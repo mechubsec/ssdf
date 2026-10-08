@@ -352,14 +352,28 @@ def run(
             now=now,
             check_freshness=False,
         )
-        if issues:
+        # premature_truncation (the bridge-row-ts trigger) is informational:
+        # the chain still verifies and nothing is lost, so it must not stall
+        # this job the way a real integrity issue does -- the anchor failure
+        # it would accompany, if any, is independently caught as
+        # missing_predecessor/unreachable below.
+        blocking_issues = [i for i in issues if i["type"] != "premature_truncation"]
+        if blocking_issues:
             print(
                 f"skipping chain tier={chain[0]} server={chain[1]!r}: "
-                f"{len(issues)} unresolved issue(s), refusing to checkpoint an unverified chain",
+                f"{len(blocking_issues)} unresolved issue(s), refusing to checkpoint an "
+                "unverified chain",
                 file=sys.stderr,
             )
             result.skipped.append(chain)
             continue
+        if issues:
+            print(
+                f"chain tier={chain[0]} server={chain[1]!r}: {len(issues)} informational "
+                "premature_truncation finding(s) (bridged row left ssdf.audit earlier than "
+                "its normal TTL; chain still verifies)",
+                file=sys.stderr,
+            )
         previous = previous_by_chain.get(chain)
         if previous is not None and keyring is not None:
             previous_checkpoint = Checkpoint(
