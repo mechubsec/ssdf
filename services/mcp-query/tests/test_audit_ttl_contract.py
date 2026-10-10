@@ -155,20 +155,23 @@ def test_ttl_expiry_closes_without_a_checkpoint_but_opens_with_one(raw):
 
     _insert(raw, rows)
 
-    before = raw.query(f"SELECT count() FROM {_TABLE}").result_rows[0][0]
-    assert before == 4
-
     # Force TTL eviction now, rather than waiting for ClickHouse's own
     # schedule: `OPTIMIZE ... FINAL` runs the identical merge-time TTL
-    # enforcement a background merge would, just on demand.
+    # enforcement a background merge would, just on demand. We can't assert
+    # a pre-eviction count here: ClickHouse's own background merge pool can
+    # race this check and evict the expired rows before we ever query, so
+    # the only deterministic state to converge on is the post-eviction one
+    # (2 fresh rows survive, the 2 expired ones don't).
     deadline = time.monotonic() + 30
-    remaining = before
-    while remaining == before:
+    remaining = raw.query(f"SELECT count() FROM {_TABLE}").result_rows[0][0]
+    while remaining != 2:
         raw.command(f"OPTIMIZE TABLE {_TABLE} FINAL")
         remaining = raw.query(f"SELECT count() FROM {_TABLE}").result_rows[0][0]
-        if remaining == before:
+        if remaining != 2:
             if time.monotonic() > deadline:
-                pytest.fail("ClickHouse TTL did not evict the expired rows within 30s")
+                pytest.fail(
+                    f"ClickHouse TTL did not converge on 2 surviving rows within 30s (got {remaining})"
+                )
             time.sleep(1)
 
     surviving_raw = raw.query(f"SELECT {', '.join(_COLUMNS)} FROM {_TABLE} ORDER BY ts").result_rows
