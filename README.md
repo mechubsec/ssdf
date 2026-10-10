@@ -48,6 +48,53 @@ security products ──────► Vector VRL ──────► ClickHo
                                 public-metrics · health
 ```
 
+## MCP tiers
+
+The MCP tool surface (`services/mcp-query`) runs as two separate processes behind
+the nginx edge, not one server with a permission flag:
+
+- **Sovereign (`:30032`)** — the full tool set: raw flow/log queries, arbitrary
+  guarded SQL, topology and entity resolution, configured-policy and rule-history
+  tools, change-impact analysis, and ingest/fabric liveness. Tokens for this tier
+  must carry a `local_only` attestation, so a hosted-model credential cannot
+  authenticate to it at all.
+- **Public (`:30033`)** — a separate process, separate ClickHouse user/database
+  (`ssdf_public`), and secure-by-default: every data class a tool can return
+  (`security_log`, `firewall_config`, `topology`, `identity`, `metrics`) starts
+  labeled `sovereign`, and only `topology`, `identity`, and `metrics` can be
+  flipped to `shareable` by an operator-supplied classification file
+  (`MCP_CLASSIFICATION_FILE`, see `services/mcp-query/infra/ssdf-mcp-public.service`).
+  A tool is only registered on this tier if *every* data class it can return is
+  `shareable`. With no classification file, the public tier registers **zero**
+  tools. Raw log/flow queries (`query_flows`, `describe_schema`, `top_talkers`)
+  and arbitrary SQL (`run_sql`) can never be shareable — `run_sql` is excluded
+  outright regardless of configuration — so the public tier never exposes raw
+  security-log or firewall-config data. The tools that *can* become shareable are
+  entity resolution and topology adjacency (`get_entity`, `locate`, `neighbors`,
+  `find_path`, `topology_snapshot`) and de-identified aggregate metrics
+  (`metric_timeseries`, `top_series`, `entity_metric_timeseries`, which use
+  opaque per-entity surrogates, not real IP/MAC). Tools that return any
+  `firewall_config` data (e.g. `enforcement_points`) stay sovereign-only even
+  then, since `firewall_config` is not configurable. A fixed set — access/audit
+  tools (`explain_access`, `configured_policies`, `observed_by`, `reidentify`,
+  `recent_alerts`, `rule_history`, `rule_usage`, `unused_rules`, `explain_rule`,
+  `change_impact`) and liveness tools (`ingest_status`, `fabric_status`) — is
+  never constructed on the public process at all, not just filtered out. See
+  `services/mcp-query/src/ssdf_mcp_query/classification.py` and `server.py` for
+  the authoritative tool/data-class mapping.
+
+## Deployment
+
+SSDF ships as a **reference deployment**, not a quick-start installer: each
+component (ClickHouse, Vector, the Python services, nginx) is a separate
+systemd unit on its own host, applied by the scripts and unit files in
+`infra/` and `services/*/infra/`, with TLS termination per
+[`infra/nginx/`](infra/nginx/). There is no single install command and no
+Docker Compose path (see [CONTRIBUTING.md](CONTRIBUTING.md)). For dev-only
+setup (syncing the Python projects and pre-commit hooks), see
+[CONTRIBUTING.md's Setup section](CONTRIBUTING.md#setup); for ingest
+onboarding per vendor, see [`onboarding/`](onboarding).
+
 ## Ingest sources
 
 | Port | Proto | Source | Notes |
