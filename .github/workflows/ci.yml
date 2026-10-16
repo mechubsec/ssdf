@@ -17,6 +17,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Least privilege: every job only checks out and builds/tests. No job pushes,
+# comments or signs, so read-only repository contents is all the token needs.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
