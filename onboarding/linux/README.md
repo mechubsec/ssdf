@@ -15,13 +15,13 @@ in `ssdf.host_log_senders`.
 
 1. Install Vector: Arch `pacman -S vector`; Debian/Ubuntu via the upstream
    Vector apt repository.
-2. Copy `vector-agent.toml` to `/etc/vector/vector.toml`.
-3. Set the config path and ingest address in `/etc/default/vector` (the
-   packaged unit runs `vector` without `--config`, and its default config is
+2. Copy `vector-agent.toml` to `/etc/vector/vector.toml` and set the `ssdf`
+   sink `address` to your ingest host (`<ingest-ip>:6000`).
+3. Point the service at it in `/etc/default/vector` (the packaged unit runs
+   `vector` without `--config`, and its default config is
    `/etc/vector/vector.yaml`):
 
        VECTOR_CONFIG=/etc/vector/vector.toml
-       SSDF_INGEST_ADDR=198.51.100.150:6000
 
 4. Make sure the `vector` service user can read the journal and has a
    writable `data_dir` (the disk buffer lives there):

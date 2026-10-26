@@ -150,8 +150,6 @@ jobs:
           USERNAME_HASH_KEY: throwaway-ci-key
         run: vector test infra/vector/vector.toml
       - name: vector test (Linux host-log agent)
-        env:
-          SSDF_INGEST_ADDR: 127.0.0.1:6000
         run: vector test onboarding/linux/vector-agent.toml
       - name: vector validate fails closed without USERNAME_HASH_KEY (F4)
         env:
