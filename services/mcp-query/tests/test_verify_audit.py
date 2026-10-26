@@ -1160,3 +1160,36 @@ def test_relabelling_rows_as_evidence_does_not_skip_the_content_check():
         row["args"] = '{"server_id":"junos-950"}'
     assert all(i["type"] == "content_edit" for i in verify_tier(rows))
     assert len(verify_tier(rows)) == 3
+
+
+def test_relabelled_and_rehashed_chain_is_caught_by_its_checkpoint():
+    """Rewriting every hash defeats any unanchored chain, Python-hashed ones too (the
+    hash is unkeyed); the signed checkpoint is the defence. Moving a checkpointed
+    sovereign chain into an evidence group with writer-shaped hashes leaves the
+    checkpoint's head missing."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from ssdf_mcp_query.checkpoint_verify import canonical_digest
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+    original = _chain(3)
+    unsigned = Checkpoint(
+        tier="sovereign",
+        server_id="",
+        row_count=3,
+        head_row_hash=original[-1]["row_hash"],
+        checkpoint_ts="2026-06-10T13:00:00.000Z",
+        signature="",
+        key_id=key_fingerprint(verifying_key),
+    )
+    signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
+    checkpoint = Checkpoint(**{**unsigned.__dict__, "signature": signature})
+    moved = _writer_hashed_evidence_chain(
+        3, "junos-950", dt.datetime(2026, 6, 10, 12, tzinfo=dt.timezone.utc)
+    )
+    now = dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc)
+    assert verify_tier(moved) == []  # the forged group alone looks clean...
+    sovereign_issues = verify_tier(
+        [], checkpoints=[checkpoint], keyring=_keyring(verifying_key), now=now
+    )
+    assert any(i["type"] == "checkpoint_head_missing" for i in sovereign_issues)  # ...this is not
