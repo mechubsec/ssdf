@@ -5,7 +5,10 @@ from ssdf_mcp_query.tools import Tools
 
 
 class FakeClient:
-    def __init__(self, rows=None, columns=None, raise_exc=None):
+    def __init__(self, rows=None, columns=None, raise_exc=None, queued_rows=None):
+        # queued_rows: per-call row lists consumed in order (multi-query tools)
+        self._queued = list(queued_rows or [])
+        self.all_sql = []
         self._rows = rows or []
         self._columns = columns or []
         self._raise = raise_exc
@@ -15,8 +18,12 @@ class FakeClient:
     def run(self, sql, params=None):
         self.last_sql = sql
         self.last_params = params
+        self.all_sql.append(sql)
         if self._raise:
             raise self._raise
+        if self._queued:
+            queued = self._queued.pop(0)
+            return {"columns": [], "rows": queued, "row_count": len(queued)}
         return {"columns": self._columns, "rows": self._rows, "row_count": len(self._rows)}
 
 
@@ -176,6 +183,68 @@ def test_zone_matrix_not_truncated_when_rows_fit():
 
 def test_zone_matrix_upstream_error_passes_through():
     out = Tools(FakeClient(raise_exc=RuntimeError("ch down")), max_rows=1000).zone_matrix()
+    assert out["error"] == "upstream"
+
+
+def _pattern_row(i=0, **over):
+    row = {
+        "host": "h1",
+        "source": "journald",
+        "unit": "sshd",
+        "kind": "error",
+        "pattern": f"fail <n> {i}",
+        "worst_severity": 3,
+        "occurrences": 10 - i,
+        "first_seen": "2026-10-01T00:00:00+00:00",
+        "last_seen": "2026-10-01T01:00:00+00:00",
+        "sample": "fail 42",
+        "total_patterns": 5,
+    }
+    return {**row, **over}
+
+
+_SENDER = {"host": "h1", "source": "journald", "last_seen": "2026-10-01T01:00:00", "lines_24h": 7}
+
+
+def test_host_log_patterns_reply_shape_and_wrapping():
+    fake = FakeClient(queued_rows=[[_pattern_row(sample="x" * 600)], [dict(_SENDER)]])
+    out = Tools(fake, max_rows=1000).host_log_patterns()
+    assert len(fake.all_sql) == 2 and "host_log_senders" in fake.all_sql[1]
+    row = out["patterns"][0]
+    assert row["severity"] == 3 and row["count"] == 10 and row["kind"] == "error"
+    assert row["source"] == "journald" and row["first_seen"].startswith("2026-10-01")
+    for col in ("host", "unit", "pattern"):
+        assert row[col]["untrusted"] is True and len(row[col]["value"]) <= 512
+    assert row["sample"]["untrusted"] is True
+    assert len(row["sample"]["value"]) == 500 and row["sample"]["truncated"] is True
+    assert out["sources"][0]["host"]["value"] == "h1"
+    assert out["sources"][0]["source"] == "journald" and out["sources"][0]["lines_24h"] == 7
+
+
+def test_host_log_patterns_truncated_flag():
+    rows = [_pattern_row(i) for i in range(2)]
+    out = Tools(FakeClient(queued_rows=[rows, []]), max_rows=1000).host_log_patterns(limit=2)
+    assert out["total_patterns"] == 5 and out["truncated"] is True
+    rows = [_pattern_row(i, total_patterns=2) for i in range(2)]
+    out = Tools(FakeClient(queued_rows=[rows, []]), max_rows=1000).host_log_patterns()
+    assert out["truncated"] is False
+
+
+def test_host_log_patterns_empty_still_returns_sources():
+    out = Tools(FakeClient(queued_rows=[[], [dict(_SENDER)]]), max_rows=1000).host_log_patterns()
+    assert out["patterns"] == [] and out["total_patterns"] == 0 and out["truncated"] is False
+    assert len(out["sources"]) == 1
+
+
+def test_host_log_patterns_validation_errors():
+    tools = Tools(FakeClient(), max_rows=1000)
+    assert tools.host_log_patterns(min_severity=9)["error"] == "validation"
+    assert tools.host_log_patterns(min_severity=True)["error"] == "validation"
+    assert tools.host_log_patterns(since="not-a-time")["error"] == "validation"
+
+
+def test_host_log_patterns_upstream_error_passes_through():
+    out = Tools(FakeClient(raise_exc=RuntimeError("ch down")), max_rows=1000).host_log_patterns()
     assert out["error"] == "upstream"
 
 

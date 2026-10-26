@@ -10,6 +10,7 @@ SOVEREIGN_TOOLS = {
     "describe_schema",
     "top_talkers",
     "zone_matrix",
+    "host_log_patterns",
     "run_sql",
     "get_entity",
     "locate",
@@ -113,6 +114,7 @@ def test_public_build_never_exposes_run_sql_or_security_tools(monkeypatch, tmp_p
         "describe_schema",
         "top_talkers",
         "zone_matrix",
+        "host_log_patterns",
         "enforcement_points",
         "explain_access",
     ):
@@ -247,3 +249,17 @@ def test_zone_matrix_on_sovereign_tier(monkeypatch):
 
     _patch_ch(monkeypatch, server)
     assert "zone_matrix" in _names(server.build_app(tier="sovereign"))
+
+
+def test_host_log_patterns_not_public_but_on_sovereign(monkeypatch, tmp_path):
+    import ssdf_mcp_query.server as server
+
+    _patch_ch(monkeypatch, server)
+    monkeypatch.setenv(
+        "MCP_CLASSIFICATION_FILE",
+        _classification_file(
+            tmp_path, topology="shareable", identity="shareable", metrics="shareable"
+        ),
+    )
+    assert "host_log_patterns" not in _names(server.build_app(tier="public"))
+    assert "host_log_patterns" in _names(server.build_app(tier="sovereign"))

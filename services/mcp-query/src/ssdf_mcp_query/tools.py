@@ -9,10 +9,13 @@ import uuid
 from typing import Any
 
 from .builders import (
+    build_host_log_patterns,
+    build_host_log_sources,
     build_query_flows,
     build_top_talkers,
     build_zone_matrix,
     BuilderError,
+    HOST_LOG_PATTERNS_MAX_LIMIT,
     MAX_LIMIT,
     ZONE_MATRIX_MAX_LIMIT,
 )
@@ -35,6 +38,10 @@ _FLOW_UNTRUSTED_COLUMNS = (
 
 # zone_matrix rows: zone names and observer hostnames are log-derived free text.
 _ZONE_MATRIX_UNTRUSTED_COLUMNS = ("from_zone", "to_zone", "observer")
+
+
+# host_log_patterns: every syslog sender is attacker-influenced; source/kind are fixed enums.
+_HOST_LOG_SAMPLE_MAX_LEN = 500
 
 
 def _ok(result: dict, requested_limit: int) -> dict:
@@ -128,6 +135,51 @@ class Tools:
         truncated = len(rows) > clamped
         rows = _wrap_untrusted_columns(rows[:clamped], _ZONE_MATRIX_UNTRUSTED_COLUMNS)
         return {**result, "rows": rows, "row_count": len(rows), "truncated": truncated}
+
+    def host_log_patterns(self, since=None, until=None, min_severity=3, limit=300) -> dict:
+        """Normalized host-log error patterns plus per-sender liveness (two fixed queries)."""
+        try:
+            sql, params = build_host_log_patterns(
+                since=since, until=until, min_severity=min_severity, limit=limit
+            )
+        except (BuilderError, TimeParseError, ValueError) as exc:
+            return {"error": "validation", "detail": str(exc)}
+        clamped = max(1, min(int(limit), HOST_LOG_PATTERNS_MAX_LIMIT))
+        found = self._safe_execute(sql, params, clamped)
+        if "rows" not in found:
+            return found
+        sources_sql, sources_params = build_host_log_sources()
+        senders = self._safe_execute(sources_sql, sources_params, 1000)
+        if "rows" not in senders:
+            return senders
+        patterns = [
+            {
+                "host": UntrustedText.from_raw(row["host"]).to_response(),
+                "source": row["source"],
+                "unit": UntrustedText.from_raw(row["unit"]).to_response(),
+                "kind": row["kind"],
+                "severity": row["worst_severity"],
+                "pattern": UntrustedText.from_raw(row["pattern"]).to_response(),
+                "count": row["occurrences"],
+                "first_seen": row["first_seen"],
+                "last_seen": row["last_seen"],
+                "sample": UntrustedText.from_raw(
+                    row["sample"], max_len=_HOST_LOG_SAMPLE_MAX_LEN
+                ).to_response(),
+            }
+            for row in found["rows"]
+        ]
+        total = found["rows"][0]["total_patterns"] if found["rows"] else 0
+        sources = [
+            {**row, "host": UntrustedText.from_raw(row["host"]).to_response()}
+            for row in senders["rows"]
+        ]
+        return {
+            "patterns": patterns,
+            "total_patterns": total,
+            "truncated": total > len(patterns),
+            "sources": sources,
+        }
 
     def describe_schema(self) -> dict:
         try:

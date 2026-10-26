@@ -26,6 +26,7 @@ TOOL_DATA_CLASSES: dict[str, frozenset[str]] = {
     "describe_schema": frozenset({"security_log"}),
     "top_talkers": frozenset({"security_log"}),
     "zone_matrix": frozenset({"security_log"}),
+    "host_log_patterns": frozenset({"security_log"}),
     "run_sql": frozenset({"security_log"}),
     "get_entity": frozenset({"identity"}),
     "locate": frozenset({"topology"}),

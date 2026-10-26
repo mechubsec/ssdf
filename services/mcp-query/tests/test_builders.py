@@ -1,6 +1,11 @@
 # tests/test_builders.py
 import pytest
 from ssdf_mcp_query.builders import (
+    HOST_LOG_PATTERNS_MAX_LIMIT,
+    _HOST_LOG_NORMALIZERS,
+    _ch_literal,
+    build_host_log_patterns,
+    build_host_log_sources,
     build_query_flows,
     build_top_talkers,
     build_zone_matrix,
@@ -121,3 +126,57 @@ def test_zone_matrix_clamps_limit():
     assert "LIMIT 501" in sql
     sql, _ = build_zone_matrix(limit=0)
     assert "LIMIT 2" in sql
+
+
+def test_host_log_patterns_normalizes_in_contract_order():
+    sql, _ = build_host_log_patterns()
+    assert [rep for _, rep in _HOST_LOG_NORMALIZERS] == [
+        "<uuid>", "<ip>", r"\1<ipv-six>", "<hex>", "<n>", " ",
+    ]  # fmt: skip
+    # each step wraps the previous one, so its arguments read left to right in order
+    positions = [
+        sql.index(f"{_ch_literal(rx)}, {_ch_literal(rep)})") for rx, rep in _HOST_LOG_NORMALIZERS
+    ]
+    assert positions == sorted(positions)
+    assert "'\\\\d+', '<n>'" in sql  # backslashes doubled for the ClickHouse literal
+    assert "'\\\\1<ipv-six>'" in sql
+    assert "replaceAll(" in sql and "'<ipv-six>', '<ip6>')" in sql
+    assert "substringUTF8(trimBoth(replaceAll(" in sql and ", 1, 300)" in sql
+
+
+def test_host_log_patterns_kind_and_severity_filter():
+    sql, params = build_host_log_patterns(min_severity=5)
+    assert "systemd-coredump%" in sql and "dumped core" in sql
+    assert "Failed with result|entered failed state" in sql
+    assert "kind != 'error' OR severity <= {min_severity:UInt8}" in sql
+    assert params["min_severity"] == 5 and "{min_severity:UInt8}" in sql
+
+
+def test_host_log_patterns_grouping_order_and_total():
+    sql, params = build_host_log_patterns()
+    assert "FROM ssdf.host_logs" in sql and "count() OVER () AS total_patterns" in sql
+    assert "GROUP BY host, source, unit, kind, pattern" in sql
+    assert (
+        "ORDER BY occurrences DESC, last_seen DESC, host, source, unit, kind, pattern LIMIT 300"
+        in sql
+    )
+    assert "since" in params and "until" in params and params["min_severity"] == 3
+
+
+def test_host_log_patterns_validates_min_severity():
+    for bad in (-1, 8, True, "3", 2.5, None):
+        with pytest.raises(BuilderError):
+            build_host_log_patterns(min_severity=bad)
+
+
+def test_host_log_patterns_clamps_limit():
+    assert HOST_LOG_PATTERNS_MAX_LIMIT == 500
+    assert "LIMIT 500" in build_host_log_patterns(limit=10_000)[0]
+    assert build_host_log_patterns(limit=0)[0].endswith("LIMIT 1")
+
+
+def test_host_log_sources_sums_summing_merge_tree():
+    sql, params = build_host_log_sources()
+    assert params == {} and "FROM ssdf.host_log_senders" in sql
+    assert "sumIf(lines, minute >= now() - INTERVAL 24 HOUR) AS lines_24h" in sql
+    assert "minute >= now() - INTERVAL 7 DAY" in sql

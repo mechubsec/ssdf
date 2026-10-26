@@ -15,6 +15,7 @@ EXPECTED = {
     "describe_schema": {"security_log"},
     "top_talkers": {"security_log"},
     "zone_matrix": {"security_log"},
+    "host_log_patterns": {"security_log"},
     "run_sql": {"security_log"},
     "get_entity": {"identity"},
     "locate": {"topology"},
@@ -242,3 +243,11 @@ def test_zone_matrix_is_security_log_and_never_shareable():
     )
     assert is_tool_shareable(everything_shareable, "zone_matrix") is False
     assert "zone_matrix" not in public_tool_names(everything_shareable, ["zone_matrix"])
+
+
+def test_host_log_patterns_is_security_log_and_never_shareable():
+    assert classes_for_tool("host_log_patterns") == frozenset({"security_log"})
+    everything_shareable = _classification(
+        topology="shareable", identity="shareable", metrics="shareable"
+    )
+    assert is_tool_shareable(everything_shareable, "host_log_patterns") is False

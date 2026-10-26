@@ -8,6 +8,7 @@ from .timeparse import parse_time
 MAX_LIMIT = 1000
 TOP_MAX_LIMIT = 100
 ZONE_MATRIX_MAX_LIMIT = 500
+HOST_LOG_PATTERNS_MAX_LIMIT = 500
 
 FLOW_COLUMNS = [
     "timestamp",
@@ -147,3 +148,82 @@ def build_zone_matrix(
         f"ORDER BY {by} DESC, from_zone, to_zone, observer LIMIT {limit + 1}"
     )
     return sql, params
+
+
+# host_log_patterns message normalization, applied in this order (callers key memory
+# on the result, so the contract is fixed). Python raw strings; rendered into SQL by
+# _ch_literal. The IPv6 step emits a digit-free token so step 5 cannot touch it; it is
+# swapped for <ip6> afterwards. \1 keeps the guard character in front of the address.
+_HOST_LOG_NORMALIZERS = (
+    (r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<uuid>"),
+    (r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b", "<ip>"),
+    (
+        r"(?i)(^|[^0-9a-z_:])((?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}"
+        r"|(?:[0-9a-f]{1,4}:){1,7}:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?"
+        r"|::[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})",
+        r"\1<ipv-six>",
+    ),
+    (r"(?i)0x[0-9a-f]+|[0-9a-f]{8,}", "<hex>"),
+    (r"\d+", "<n>"),
+    (r"\s+", " "),
+)
+
+HOST_LOG_SOURCES_SQL = (
+    "SELECT host, source, max(minute) AS last_seen, "
+    "sumIf(lines, minute >= now() - INTERVAL 24 HOUR) AS lines_24h "
+    "FROM ssdf.host_log_senders WHERE minute >= now() - INTERVAL 7 DAY "
+    "GROUP BY host, source ORDER BY host, source LIMIT 1000"
+)
+
+
+def _ch_literal(text: str) -> str:
+    """Render a constant as a ClickHouse string literal (backslashes doubled)."""
+    return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _host_log_pattern_expr() -> str:
+    expr = "message"
+    for regex, replacement in _HOST_LOG_NORMALIZERS:
+        expr = f"replaceRegexpAll({expr}, {_ch_literal(regex)}, {_ch_literal(replacement)})"
+    return f"substringUTF8(trimBoth(replaceAll({expr}, '<ipv-six>', '<ip6>')), 1, 300)"
+
+
+def build_host_log_patterns(since=None, until=None, min_severity=3, limit=300):
+    """Normalized message patterns from ssdf.host_logs over a window, most frequent first.
+
+    ``total_patterns`` (count() OVER ()) is the group count before LIMIT. Lines of kind
+    crash/unit_failed are kept at any severity; plain errors need severity <= min_severity.
+    """
+    if isinstance(min_severity, bool) or not isinstance(min_severity, int):
+        raise BuilderError("min_severity must be an integer 0-7")
+    if not 0 <= min_severity <= 7:
+        raise BuilderError("min_severity must be between 0 and 7")
+    params: dict = {"min_severity": min_severity}
+    where = " AND ".join(_window(since, until, params))
+    limit = _clamp(limit, 1, HOST_LOG_PATTERNS_MAX_LIMIT)
+    kind_expr = (
+        "multiIf(unit LIKE 'systemd-coredump%' AND position(message, 'dumped core') > 0, 'crash', "
+        "unit IN ('systemd', 'init.scope') "
+        "AND match(message, 'Failed with result|entered failed state'), 'unit_failed', 'error')"
+    )
+    inner = (
+        f"SELECT host, source, unit, severity, timestamp, message, {kind_expr} AS kind, "
+        f"{_host_log_pattern_expr()} AS pattern "
+        f"FROM ssdf.host_logs WHERE {where} "
+        "AND (kind != 'error' OR severity <= {min_severity:UInt8})"
+    )
+    # worst_severity/occurrences avoid aliases that shadow columns/functions; tools.py renames.
+    sql = (
+        "SELECT host, source, unit, kind, pattern, min(severity) AS worst_severity, "
+        "count() AS occurrences, min(timestamp) AS first_seen, max(timestamp) AS last_seen, "
+        "any(message) AS sample, count() OVER () AS total_patterns "
+        f"FROM ({inner}) GROUP BY host, source, unit, kind, pattern "
+        "ORDER BY occurrences DESC, last_seen DESC, host, source, unit, kind, pattern "
+        f"LIMIT {limit}"
+    )
+    return sql, params
+
+
+def build_host_log_sources():
+    """Per-(host, source) sender liveness from the SummingMergeTree minute rollup."""
+    return HOST_LOG_SOURCES_SQL, {}
