@@ -4,9 +4,8 @@
 # Do not write the env-interpolation syntax in comments: Vector expands it
 # across the whole file, comments included.
 #
-# Only errors reach the wire. Ingest keeps warning-and-worse, systemd unit
-# failures and coredumps; the same filter runs here so a chatty host does not
-# ship its whole journal. A 5-minute heartbeat proves the agent is alive even
+# Ships warning-and-worse, systemd unit failures and coredumps (the rule ingest
+# applies too), so a chatty host does not ship its whole journal. A 5-minute heartbeat proves the agent is alive even
 # when the host logs nothing at warning or above.
 
 [sources.journal]

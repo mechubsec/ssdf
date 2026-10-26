@@ -33,13 +33,14 @@ The security path is unchanged: the facility filter is the coarse gate and Vecto
 `proxmox_sec` filter still applies its app + known-pattern allow-list, so non-security
 daemon noise never reaches `ssdf.events`. The extra conditions (warnings and worse,
 unit failures, coredumps) feed the same stream into `ssdf.host_logs` as
-`source = 'proxmox'`, where Vector keeps only errors.
+`source = 'proxmox'`, where Vector keeps warnings and worse.
 
 Apply this on **every PVE node** in the cluster, each forwarding to the same address
 (the ingest host must allow each node on UDP 517).
 
 ## 2. Restart + verify on the wire
-On pve3:  systemctl restart rsyslog
+On pve3:  rsyslogd -N1 && systemctl restart rsyslog   # validate first
+Rollback: restore the previous drop-in (or remove it) and restart rsyslog the same way.
 On guest 700 (was ct102): tcpdump -n -A -i any udp port 517 -c 20
 Trip an event (e.g. from another host: `ssh baduser@pve3` with a wrong password) and
 confirm the line arrives.

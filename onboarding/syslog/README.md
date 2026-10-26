@@ -24,12 +24,17 @@ of the example one:
 - It is ONE rule on purpose: separate rules for each condition would forward a
   line matching several of them more than once.
 - `impstats` emits a stats line every 300 s. It is the liveness heartbeat: the
-  ingest host counts every received line per minute but stores only errors.
+  ingest host counts every received line per minute but stores only warnings
+  and worse, unit failures and coredumps.
 - `action.resumeRetryCount="-1"` with the LinkedList queue retries forever and
   buffers in memory while the ingest host is down.
 
-Apply with `systemctl restart rsyslog`, then check with
-`logger -p user.err ssdf-canary`.
+Validate before restarting, so a bad drop-in never stops a working daemon:
+
+    rsyslogd -N1 && systemctl restart rsyslog
+
+Then check with `logger -p user.err ssdf-canary`. Rollback: remove the drop-in
+and `systemctl restart rsyslog`.
 
 ## UDP fallback
 

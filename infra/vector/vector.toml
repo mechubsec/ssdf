@@ -75,8 +75,9 @@ address = "0.0.0.0:6000"
 type = "socket"
 mode = "tcp"
 address = "0.0.0.0:519"
-max_length = 102400
 framing.method = "octet_counting"
+# The frame cap must live here: with framing set, a top-level max_length is ignored for TCP.
+framing.octet_counting.max_length = 102400
 
 # UDP fallback for appliances that cannot do TCP.
 [sources.host_syslog_udp]
