@@ -41,7 +41,13 @@ clickhouse_connect = pytest.importorskip("clickhouse_connect")
 
 from ssdf_common.config import Secret  # noqa: E402
 from ssdf_mcp_query.alerts import build_recent_alerts_sql  # noqa: E402
-from ssdf_mcp_query.builders import build_query_flows, build_top_talkers  # noqa: E402
+from ssdf_mcp_query.builders import (  # noqa: E402
+    build_host_log_patterns,
+    build_host_log_patterns_count,
+    build_host_log_sources,
+    build_query_flows,
+    build_top_talkers,
+)
 from ssdf_mcp_query.clickhouse import ClickHouseClient  # noqa: E402
 from ssdf_mcp_query.config import Config  # noqa: E402
 from ssdf_mcp_query.entitystore import (  # noqa: E402
@@ -376,6 +382,9 @@ ALL_BUILDERS = {
     ),
     "query_flows": lambda: build_query_flows(limit=10),
     "top_talkers": lambda: build_top_talkers(limit=10),
+    "host_log_patterns": lambda: build_host_log_patterns(limit=10, offset=5, host="contract-a"),
+    "host_log_patterns_count": lambda: build_host_log_patterns_count(host="contract-a"),
+    "host_log_sources": build_host_log_sources,
 }
 
 
@@ -385,6 +394,72 @@ def test_builder_sql_is_accepted_by_clickhouse(ch, name):
     sql, params = ALL_BUILDERS[name]()
     result = ch.run(sql, params)
     assert "rows" in result, f"{name}: no rows key in {result!r}"
+
+
+# --- host_log_patterns paging ------------------------------------------------
+#
+# host_logs has no tenant column, so these rows use their own contract-* hosts.
+# The window is pinned and absolute, as a paging caller must pin it.
+
+_HL_SINCE = _iso(_NOW - dt.timedelta(hours=2))
+_HL_UNTIL = _iso(_NOW)
+
+
+@pytest.fixture(scope="module")
+def host_log_rows(raw):
+    raw.command("DELETE FROM ssdf.host_logs WHERE host LIKE 'contract-%'")
+    at = _NOW - dt.timedelta(hours=1)
+    lines = (
+        [("contract-b", "journald", "systemd-coredump@1-2-3.service", 2, "Process 42 dumped core")]
+        + [("contract-a", "journald", "systemd", 5, "x.service: Failed with result 'exit-code'")]
+        * 2
+        + [("contract-a", "syslog", "sshd", 3, f"error {i}") for i in range(5)]
+        + [("contract-a", "syslog", "cron", 3, "tick")] * 3
+        + [("contract-b", "syslog", "cron", 3, "tick")] * 3
+        + [("contract-a", "journald", "app", 3, "dup")] * 2
+        + [("contract-a", "syslog", "app", 3, "dup")] * 2
+        + [("contract-a", "syslog", "noise", 6, "info only")]  # severity 6 > min_severity 3
+    )
+    raw.insert(
+        "ssdf.host_logs",
+        [[at, host, source, unit, sev, msg, msg] for host, source, unit, sev, msg in lines],
+        column_names=["timestamp", "host", "source", "unit", "severity", "message", "raw"],
+    )
+    yield
+    raw.command("DELETE FROM ssdf.host_logs WHERE host LIKE 'contract-%'")
+
+
+def _hl_page(ch, **kw):
+    sql, params = build_host_log_patterns(since=_HL_SINCE, until=_HL_UNTIL, **kw)
+    return ch.run(sql, params)["rows"]
+
+
+def test_host_log_patterns_order_and_offset_paging(ch, host_log_rows):
+    full = _hl_page(ch, limit=100)
+    got = [(r["kind"], r["host"], r["unit"], r["source"], int(r["occurrences"])) for r in full]
+    assert got == [
+        ("crash", "contract-b", "systemd-coredump@1-2-3.service", "journald", 1),
+        ("unit_failed", "contract-a", "systemd", "journald", 2),
+        ("error", "contract-a", "sshd", "syslog", 5),  # "error <n>" x5
+        ("error", "contract-a", "cron", "syslog", 3),  # count tie: host breaks it
+        ("error", "contract-b", "cron", "syslog", 3),
+        ("error", "contract-a", "app", "journald", 2),  # host/unit/pattern tie: source breaks it
+        ("error", "contract-a", "app", "syslog", 2),
+    ]
+    assert {int(r["total_patterns"]) for r in full} == {7}
+    paged = [r for off in (0, 3, 6) for r in _hl_page(ch, limit=3, offset=off)]
+    assert [(r["host"], r["source"], r["unit"], r["kind"], r["pattern"]) for r in paged] == [
+        (r["host"], r["source"], r["unit"], r["kind"], r["pattern"]) for r in full
+    ]
+    assert _hl_page(ch, limit=3, offset=7) == []  # past the end: no row carries the total
+    sql, params = build_host_log_patterns_count(since=_HL_SINCE, until=_HL_UNTIL)
+    assert int(ch.run(sql, params)["rows"][0]["total_patterns"]) == 7
+    only_b = _hl_page(ch, limit=100, host="contract-b")
+    assert [(r["kind"], r["unit"]) for r in only_b] == [
+        ("crash", "systemd-coredump@1-2-3.service"),
+        ("error", "cron"),
+    ]
+    assert {int(r["total_patterns"]) for r in only_b} == {2}
 
 
 # --- Regressions, each pinned to a bug that shipped -------------------------

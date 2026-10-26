@@ -31,7 +31,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-MIGRATIONS = ("001_events", "002_topology", "004_entities", "006_observer_hostname")
+MIGRATIONS = (
+    "001_events",
+    "002_topology",
+    "004_entities",
+    "006_observer_hostname",
+    "028_host_logs",
+)
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
@@ -57,6 +63,9 @@ def apply(host: str, port: int, repo_root: pathlib.Path) -> int:
             print(f"missing migration: {path}", file=sys.stderr)
             return 2
         for statement in statements(path.read_text()):
+            # The throwaway server has no ssdf_ro user; grants are access, not schema.
+            if statement.upper().startswith("GRANT "):
+                continue
             # POST with the statement as the body: over HTTP, GET implies
             # readonly mode and ClickHouse refuses DDL sent that way.
             try:
