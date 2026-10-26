@@ -377,13 +377,13 @@ of them.
 
 | User | Used by | Reads | Writes |
 |---|---|---|---|
-| *(Vector)* | ingest (guest 700) | — | `events` |
+| *(Vector)* | ingest (guest 700) | — | `events`, `host_logs`, `host_log_lines` |
 | `ssdf_topo` | topo resolver | `events`, `topo_observations`, `graph_*` | `topo_observations`, `graph_nodes`, `graph_edges` |
 | `ssdf_entity` | entity + policy resolvers | `events`, `topo_observations`, `graph_nodes`, `entities`, `entity_edges` | `entities`, `entity_edges` |
 | `ssdf_entity_maint` | `reconcile_assets` | `topo_observations`, `entities`, `entity_edges` | the same two tables, plus `ALTER DELETE` |
 | `ssdf_health` | health poller | — | `health_metrics` |
 | `ssdf_pubmetrics` | public-metrics resolver | `events`, its own outputs | `metric_timeseries`, `entity_series`, `pseudonym_map` |
-| `ssdf_ro` | sovereign MCP (guest 702), incl. `run_sql` | `events`, `topo_observations`, `graph_*`, `entities`, `entity_edges`, `health_metrics`, `pseudonym_map`, `ssdf_public.*` | — (`readonly=1`, capped time, rows and memory) |
+| `ssdf_ro` | sovereign MCP (guest 702), incl. `run_sql` | `events`, `topo_observations`, `graph_*`, `entities`, `entity_edges`, `health_metrics`, `pseudonym_map`, `host_logs`, `host_log_senders`, `ssdf_public.*` | — (`readonly=1`, capped time, rows and memory) |
 | `ssdf_public` | public MCP (guest 703) | `ssdf_public.*` **only** | — |
 | `ssdf_view_definer` | public views | `graph_*`, `view_pseudonym_key` | — |
 | `ssdf_audit` | both MCP tiers | — | `audit` (insert only) |

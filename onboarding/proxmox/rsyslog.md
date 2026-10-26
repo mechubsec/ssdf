@@ -20,14 +20,27 @@ rsyslog is not installed on a stock PVE host — install it first if needed:
   apt-get install -y rsyslog   # adds the package to the hypervisor; reversible
 Create `/etc/rsyslog.d/49-ssdf.conf` on pve3:
 
-  auth,authpriv,daemon.*  @198.51.100.150:517;RSYSLOG_SyslogProtocol23Format
+  if (prifilt("auth,authpriv,daemon.*") or prifilt("*.warning")
+      or ($programname == "systemd" and re_match($msg, "Failed with result|entered failed state"))
+      or ($programname == "systemd-coredump" and $msg contains "dumped core")) then {
+      action(type="omfwd" target="198.51.100.150" port="517" protocol="udp"
+             template="RSYSLOG_SyslogProtocol23Format")
+  }
 
-(single `@` = UDP; `RSYSLOG_SyslogProtocol23Format` = RFC5424 with offset timestamp.)
-The facility filter is the coarse gate; Vector's `proxmox_sec` filter does the fine
-app + known-pattern gate, so non-security daemon noise is dropped at ingest.
+(`protocol="udp"` = plain UDP; `RSYSLOG_SyslogProtocol23Format` = RFC5424 with offset
+timestamp.) It is ONE rule so a line matching several conditions is sent once.
+The security path is unchanged: the facility filter is the coarse gate and Vector's
+`proxmox_sec` filter still applies its app + known-pattern allow-list, so non-security
+daemon noise never reaches `ssdf.events`. The extra conditions (warnings and worse,
+unit failures, coredumps) feed the same stream into `ssdf.host_logs` as
+`source = 'proxmox'`, where Vector keeps warnings and worse.
+
+Apply this on **every PVE node** in the cluster, each forwarding to the same address
+(the ingest host must allow each node on UDP 517).
 
 ## 2. Restart + verify on the wire
-On pve3:  systemctl restart rsyslog
+On pve3:  rsyslogd -N1 && systemctl restart rsyslog   # validate first
+Rollback: restore the previous drop-in (or remove it) and restart rsyslog the same way.
 On guest 700 (was ct102): tcpdump -n -A -i any udp port 517 -c 20
 Trip an event (e.g. from another host: `ssh baduser@pve3` with a wrong password) and
 confirm the line arrives.

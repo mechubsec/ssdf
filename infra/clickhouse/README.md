@@ -31,6 +31,7 @@ This directory contains ClickHouse DDL and configuration for SSDF.
 - `025_flow_tuples_daily.sql` - Daily flow-tuple rollup
 - `026_events_ocsf_export.sql` - OCSF Network Activity export for events
 - `027_events_ocsf_authentication.sql` - OCSF Authentication export for events
+- `028_host_logs.sql` - Host logs table and per-minute sender liveness
 
 Run migrations with: `python3 ../scripts/run_migrations.py` (see
 `scripts/MIGRATION_RUNNER.md`). The `ssdf.migrations_applied` tracking table

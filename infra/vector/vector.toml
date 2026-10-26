@@ -56,6 +56,36 @@ mode = "udp"
 address = "0.0.0.0:518"
 max_length = 102400
 
+# Host logs — warning-and-worse system logs from Linux hosts, Proxmox nodes and
+# Junos devices land in ssdf.host_logs (see the hl_* transforms below). These
+# sources feed only the host-log chain; the Proxmox and Junos sources above
+# also fan out to it without any change to their own chains.
+#
+# Vector agents on Linux hosts ship journald events here (vector-to-vector).
+[sources.host_agents]
+type = "vector"
+address = "0.0.0.0:6000"
+
+# Generic RFC5424 syslog (rsyslog on Debian guests, appliances) on port 519.
+# octet_counting accepts both RFC6587 octet-counted frames and plain
+# newline-delimited ones: a frame that does not start with a length prefix
+# falls back to newline framing (verified against Vector 0.56.0 with a
+# mixed-frame stream), so one TCP source serves rsyslog and simpler senders.
+[sources.host_syslog_tcp]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:519"
+framing.method = "octet_counting"
+# The frame cap must live here: with framing set, a top-level max_length is ignored for TCP.
+framing.octet_counting.max_length = 102400
+
+# UDP fallback for appliances that cannot do TCP.
+[sources.host_syslog_udp]
+type = "socket"
+mode = "udp"
+address = "0.0.0.0:519"
+max_length = 102400
+
 # UDP/514 carries TWO streams, because the fleet's `system syslog host` statement
 # cannot be moved to 518: Junos 25.4R1.12 accepts `port 518` and then ignores it
 # (verified live on vsrx-prod 2026-08-19 — 108 packets still went to 514, zero to
@@ -1233,6 +1263,158 @@ if perr != null {
 }
 '''
 
+# ---------------- host logs (ssdf.host_logs) ----------------
+#
+# Every host-log line is tagged with its origin, parsed into the 7-column
+# host_logs shape (hl_syslog / hl_journald), counted for sender liveness at
+# any severity (hl_lines), then filtered to errors, unit failures and
+# coredumps (hl_keep). The tags are extra consumers of sources that already
+# feed the security chains, so those chains are unaffected.
+[transforms.hl_tag_syslog]
+type = "remap"
+inputs = ["host_syslog_tcp", "host_syslog_udp"]
+source = '''
+.ssdf_source = "syslog"
+'''
+
+[transforms.hl_tag_proxmox]
+type = "remap"
+inputs = ["proxmox_syslog"]
+source = '''
+.ssdf_source = "proxmox"
+'''
+
+[transforms.hl_tag_junos]
+type = "remap"
+inputs = ["junos_sys_syslog", "srx_syslog"]
+source = '''
+.ssdf_source = "junos"
+'''
+
+# Syslog line -> host_logs row. host is the first DNS label of the sender's
+# hostname (IP-literal hostnames are kept whole); a missing or "-" hostname
+# falls back to the socket peer address in .host. For Junos the security
+# stream is excluded with the same RT_ predicate as srx_sec above: that
+# stream is the firehose and already feeds ssdf.events. Templated unit
+# instances such as systemd-coredump@0-1234-0.service collapse to
+# systemd-coredump@.service so unit stays low-cardinality.
+[transforms.hl_syslog]
+type = "remap"
+inputs = ["hl_tag_syslog", "hl_tag_proxmox", "hl_tag_junos"]
+source = '''
+raw = string(.message) ?? ""
+parsed, err = parse_syslog(raw)
+if err != null {
+    abort
+}
+source = string(.ssdf_source) ?? "syslog"
+unit = string(parsed.appname) ?? ""
+if source == "junos" {
+    msg_id = string(parsed.msgid) ?? ""
+    if starts_with(unit, "RT_") || starts_with(msg_id, "RT_") {
+        abort
+    }
+}
+hostname = downcase(string(parsed.hostname) ?? "")
+host = hostname
+if !match(hostname, r'^[0-9.]+$') && !contains(hostname, ":") {
+    host = string(split(hostname, ".", limit: 2)[0]) ?? ""
+}
+if host == "" || host == "-" {
+    host = string(.host) ?? "unknown"
+}
+unit_parts, unit_err = parse_regex(unit, r'^(?P<prefix>[^@]+)@\d+-.*\.service$')
+if unit_err == null {
+    unit = (string(unit_parts.prefix) ?? "") + "@.service"
+}
+ts = parsed.timestamp
+if !is_timestamp(ts) {
+    ts = now()
+}
+sev_map = {"emerg": 0, "alert": 1, "crit": 2, "err": 3, "warning": 4, "notice": 5, "info": 6, "debug": 7}
+sev = get(sev_map, [string(parsed.severity) ?? ""]) ?? null
+severity = 6
+if is_integer(sev) {
+    severity = int(sev) ?? 6
+}
+. = {
+    "timestamp": ts,
+    "host": host,
+    "source": source,
+    "unit": unit,
+    "severity": severity,
+    "message": truncate(string(parsed.message) ?? "", limit: 4096),
+    "raw": raw,
+}
+'''
+
+# journald event from a Vector agent -> host_logs row. unit prefers the user
+# unit, then the system unit, then the syslog identifier; raw keeps the whole
+# received event as JSON. Same templated-unit collapse as hl_syslog.
+[transforms.hl_journald]
+type = "remap"
+inputs = ["host_agents"]
+source = '''
+raw = encode_json(.)
+priority = 6
+if exists(.PRIORITY) {
+    priority = to_int(.PRIORITY) ?? 6
+}
+if priority < 0 {
+    priority = 0
+}
+if priority > 7 {
+    priority = 7
+}
+unit = string(._SYSTEMD_USER_UNIT) ?? string(._SYSTEMD_UNIT) ?? string(.SYSLOG_IDENTIFIER) ?? ""
+unit_parts, unit_err = parse_regex(unit, r'^(?P<prefix>[^@]+)@\d+-.*\.service$')
+if unit_err == null {
+    unit = (string(unit_parts.prefix) ?? "") + "@.service"
+}
+host = downcase(string(split(string(.host) ?? "", ".", limit: 2)[0]) ?? "")
+ts = .timestamp
+if !is_timestamp(ts) {
+    ts = now()
+}
+. = {
+    "timestamp": ts,
+    "host": host,
+    "source": "journald",
+    "unit": unit,
+    "severity": priority,
+    "message": truncate(string(.message) ?? "", limit: 4096),
+    "raw": raw,
+}
+'''
+
+# Liveness tap: every parsed line, any severity, as {host, source}. Feeds the
+# Null-engine host_log_lines table whose materialized view counts per minute.
+[transforms.hl_lines]
+type = "remap"
+inputs = ["hl_syslog", "hl_journald"]
+source = '''
+. = {"host": .host, "source": .source}
+'''
+
+# What is stored: errors or worse; warnings except Junos (its `any info`
+# stream makes warnings noise, so Junos keeps err-or-worse only); systemd
+# unit failures; and coredump notices, which journald logs at notice/info.
+[transforms.hl_keep]
+type = "filter"
+inputs = ["hl_syslog", "hl_journald"]
+condition.type = "vrl"
+condition.source = '''
+sev = int!(.severity)
+source = string!(.source)
+unit = string!(.unit)
+msg = string!(.message)
+is_severe = sev <= 3 || (sev == 4 && source != "junos")
+is_unit_failure = (unit == "systemd" || unit == "init.scope") &&
+    match(msg, r'Failed with result|entered failed state')
+is_coredump = starts_with(unit, "systemd-coredump") && contains(msg, "dumped core")
+is_severe || is_unit_failure || is_coredump
+'''
+
 # L1 (CH TLS): the endpoint is env-overridable so the live host can flip to
 # https without a config fork — set CH_PROTO=https + CH_HTTP_PORT=8443 in the
 # Vector env drop-in. With only CH_HOST set (the historical env), this resolves
@@ -1244,7 +1426,9 @@ if perr != null {
 # `[sinks.clickhouse.tls] ca_file = "${CH_CA_FILE:-}"` would resolve to an
 # empty-string path when unset, breaking plain-http operation, and Vector has
 # no env-gated way to omit a tls block entirely. The live https override on
-# the host therefore also appends, alongside the env flip:
+# the host therefore also appends, alongside the env flip, a tls block for
+# EVERY ClickHouse sink (clickhouse, clickhouse_host_logs and
+# clickhouse_host_log_lines), each of the form:
 #   [sinks.clickhouse.tls]
 #   ca_file = "/etc/vector/ssdf-ca.crt"
 [sinks.clickhouse]
@@ -1257,6 +1441,34 @@ skip_unknown_fields = false
 date_time_best_effort = true
 
 [sinks.clickhouse.batch]
+max_events = 1000
+timeout_secs = 5
+
+# Host-log sinks: same endpoint and batching as the events sink. Each of these
+# needs the same appended tls block on the live host (see the L1 note above).
+[sinks.clickhouse_host_logs]
+type = "clickhouse"
+inputs = ["hl_keep"]
+endpoint = "${CH_PROTO:-http}://${CH_HOST}:${CH_HTTP_PORT:-8123}"
+database = "ssdf"
+table = "host_logs"
+skip_unknown_fields = false
+date_time_best_effort = true
+
+[sinks.clickhouse_host_logs.batch]
+max_events = 1000
+timeout_secs = 5
+
+[sinks.clickhouse_host_log_lines]
+type = "clickhouse"
+inputs = ["hl_lines"]
+endpoint = "${CH_PROTO:-http}://${CH_HOST}:${CH_HTTP_PORT:-8123}"
+database = "ssdf"
+table = "host_log_lines"
+skip_unknown_fields = false
+date_time_best_effort = true
+
+[sinks.clickhouse_host_log_lines.batch]
 max_events = 1000
 timeout_secs = 5
 
@@ -2678,4 +2890,209 @@ type = "vrl"
 source = '''
 assert_eq!(.event_action, "unknown")
 assert_eq!(.event_outcome, "success")
+'''
+
+# ---------------- host-log tests ----------------
+
+[[tests]]
+name = "host_log_proxmox_error_kept"
+[[tests.inputs]]
+insert_at = "hl_tag_proxmox"
+type = "raw"
+value = "<27>1 2026-10-20T10:00:00.000000+00:00 PVE3.example.com pvestatd 1234 - - storage 'nas' is not online"
+[[tests.outputs]]
+extract_from = "hl_keep"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.source, "proxmox")
+assert_eq!(.severity, 3)
+assert_eq!(.host, "pve3")
+assert_eq!(.unit, "pvestatd")
+assert_eq!(.message, "storage 'nas' is not online")
+assert_eq!(.timestamp, t'2026-10-20T10:00:00Z')
+assert_eq!(length(.), 7)
+'''
+
+[[tests]]
+name = "host_log_proxmox_info_counted_not_kept"
+no_outputs_from = ["hl_keep"]
+[[tests.inputs]]
+insert_at = "hl_tag_proxmox"
+type = "raw"
+value = "<38>1 2026-10-20T10:00:01.000000+00:00 pve3 sshd 99 - - Accepted publickey for root from 198.51.100.9 port 4000 ssh2"
+[[tests.outputs]]
+extract_from = "hl_lines"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(., {"host": "pve3", "source": "proxmox"})
+'''
+
+[[tests]]
+name = "host_log_junos_error_kept"
+[[tests.inputs]]
+insert_at = "hl_tag_junos"
+type = "raw"
+value = '<187>1 2026-10-20T10:00:02.000Z vsrx-a chassisd 1500 CHASSISD_SNMP_TRAP7 [junos@2636.1.1.1.2.36 trap-name="x"] SNMP trap: fan failure'
+[[tests.outputs]]
+extract_from = "hl_keep"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.source, "junos")
+assert_eq!(.severity, 3)
+assert_eq!(.host, "vsrx-a")
+assert_eq!(.unit, "chassisd")
+'''
+
+[[tests]]
+name = "host_log_junos_warning_not_kept"
+no_outputs_from = ["hl_keep"]
+[[tests.inputs]]
+insert_at = "hl_tag_junos"
+type = "raw"
+value = '<188>1 2026-10-20T10:00:03.000Z vsrx-a mib2d 1600 - [junos@2636.1.1.1.2.36 x="y"] warning level event'
+
+[[tests]]
+name = "host_log_junos_security_stream_excluded"
+no_outputs_from = ["hl_syslog"]
+[[tests.inputs]]
+insert_at = "hl_tag_junos"
+type = "raw"
+value = '<14>1 2026-10-20T10:00:04.000Z vsrx-a RT_FLOW - RT_FLOW_SESSION_CREATE [junos@2636.1.1.1.2.36 source-address="192.0.2.10"]'
+
+[[tests]]
+name = "host_log_generic_syslog_warning_kept"
+[[tests.inputs]]
+insert_at = "hl_tag_syslog"
+type = "raw"
+value = "<12>1 2026-10-20T10:00:05.000Z nas1.example.com smartd 55 - - Device /dev/sda has a bad sector"
+[[tests.outputs]]
+extract_from = "hl_keep"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.source, "syslog")
+assert_eq!(.severity, 4)
+assert_eq!(.host, "nas1")
+assert_eq!(.unit, "smartd")
+'''
+
+[[tests]]
+name = "host_log_syslog_nil_hostname_uses_peer"
+[[tests.inputs]]
+insert_at = "hl_tag_syslog"
+type = "log"
+[tests.inputs.log_fields]
+message = "<11>1 2026-10-20T10:00:06.000Z - app 1 - - something failed"
+host = "198.51.100.77"
+[[tests.outputs]]
+extract_from = "hl_keep"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.host, "198.51.100.77")
+assert_eq!(.severity, 3)
+'''
+
+[[tests]]
+name = "host_log_journald_error_kept"
+[[tests.inputs]]
+insert_at = "hl_journald"
+type = "log"
+[tests.inputs.log_fields]
+message = "disk on fire"
+host = "Box1.example.com"
+PRIORITY = "3"
+SYSLOG_IDENTIFIER = "kernel"
+[[tests.outputs]]
+extract_from = "hl_keep"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.source, "journald")
+assert_eq!(.host, "box1")
+assert_eq!(.unit, "kernel")
+assert_eq!(.severity, 3)
+assert_eq!(.message, "disk on fire")
+assert!(is_timestamp(.timestamp))
+assert_eq!(length(.), 7)
+assert_eq!(parse_json!(.raw).message, "disk on fire")
+'''
+
+[[tests]]
+name = "host_log_journald_unit_failure_kept"
+[[tests.inputs]]
+insert_at = "hl_journald"
+type = "log"
+[tests.inputs.log_fields]
+message = "foo.service: Failed with result 'exit-code'."
+host = "box1"
+PRIORITY = "5"
+SYSLOG_IDENTIFIER = "systemd"
+_SYSTEMD_UNIT = "init.scope"
+[[tests.outputs]]
+extract_from = "hl_keep"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.unit, "init.scope")
+assert_eq!(.severity, 5)
+'''
+
+[[tests]]
+name = "host_log_journald_coredump_kept_and_unit_collapsed"
+[[tests.inputs]]
+insert_at = "hl_journald"
+type = "log"
+[tests.inputs.log_fields]
+message = "Process 42 (foo) of user 0 dumped core."
+host = "box1"
+PRIORITY = "2"
+SYSLOG_IDENTIFIER = "systemd-coredump"
+_SYSTEMD_UNIT = "systemd-coredump@0-1234-0.service"
+[[tests.outputs]]
+extract_from = "hl_keep"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.unit, "systemd-coredump@.service")
+assert_eq!(.severity, 2)
+'''
+
+[[tests]]
+name = "host_log_journald_heartbeat_counted_not_kept"
+no_outputs_from = ["hl_keep"]
+[[tests.inputs]]
+insert_at = "hl_journald"
+type = "log"
+[tests.inputs.log_fields]
+message = "ssdf-heartbeat"
+host = "box1"
+PRIORITY = "7"
+SYSLOG_IDENTIFIER = "ssdf-heartbeat"
+[[tests.outputs]]
+extract_from = "hl_lines"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(., {"host": "box1", "source": "journald"})
+'''
+
+[[tests]]
+name = "host_log_message_capped_at_4096"
+[[tests.inputs]]
+insert_at = "hl_journald"
+type = "log"
+[tests.inputs.log_fields]
+message = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+host = "box1"
+PRIORITY = "3"
+[[tests.outputs]]
+extract_from = "hl_journald"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(strlen(string!(.message)), 4096)
 '''
