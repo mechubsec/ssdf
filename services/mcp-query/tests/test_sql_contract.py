@@ -41,7 +41,13 @@ clickhouse_connect = pytest.importorskip("clickhouse_connect")
 
 from ssdf_common.config import Secret  # noqa: E402
 from ssdf_mcp_query.alerts import build_recent_alerts_sql  # noqa: E402
-from ssdf_mcp_query.builders import build_query_flows, build_top_talkers  # noqa: E402
+from ssdf_mcp_query.builders import (  # noqa: E402
+    build_host_log_patterns,
+    build_host_log_patterns_count,
+    build_host_log_sources,
+    build_query_flows,
+    build_top_talkers,
+)
 from ssdf_mcp_query.clickhouse import ClickHouseClient  # noqa: E402
 from ssdf_mcp_query.config import Config  # noqa: E402
 from ssdf_mcp_query.entitystore import (  # noqa: E402
@@ -376,6 +382,9 @@ ALL_BUILDERS = {
     ),
     "query_flows": lambda: build_query_flows(limit=10),
     "top_talkers": lambda: build_top_talkers(limit=10),
+    "host_log_patterns": lambda: build_host_log_patterns(limit=10, offset=5, host="contract-a"),
+    "host_log_patterns_count": lambda: build_host_log_patterns_count(host="contract-a"),
+    "host_log_sources": build_host_log_sources,
 }
 
 
@@ -385,6 +394,84 @@ def test_builder_sql_is_accepted_by_clickhouse(ch, name):
     sql, params = ALL_BUILDERS[name]()
     result = ch.run(sql, params)
     assert "rows" in result, f"{name}: no rows key in {result!r}"
+
+
+# --- host_log_patterns paging ------------------------------------------------
+#
+# host_logs has no tenant column. Isolation instead: fixture rows carry a fixed
+# raw marker AND sit 10 years ahead, a pair no real host log can have, so cleanup
+# can safely purge every run's fixtures, including ones a killed run abandoned,
+# and the future window keeps ambient rows out of the reads. The window is
+# pinned and absolute, as a paging caller must pin it.
+
+_HL_A = f"contract-{uuid.uuid4().hex[:8]}-a"
+_HL_B = _HL_A[:-1] + "b"
+_HL_AT = _NOW + dt.timedelta(days=3650)
+_HL_SINCE = _iso(_HL_AT - dt.timedelta(hours=1))
+_HL_UNTIL = _iso(_HL_AT + dt.timedelta(hours=1))
+_HL_MARKER = "ssdf-contract-fixture"
+_HL_DELETE = (
+    f"DELETE FROM ssdf.host_logs WHERE raw = '{_HL_MARKER}' "
+    "AND timestamp > now64(3) + INTERVAL 3000 DAY"
+)
+
+
+@pytest.fixture(scope="module")
+def host_log_rows(raw):
+    raw.command(_HL_DELETE)
+    lines = (
+        [(_HL_B, "journald", "systemd-coredump@1-2-3.service", 2, "Process 42 dumped core")]
+        + [(_HL_A, "journald", "systemd", 5, "x.service: Failed with result 'exit-code'")] * 2
+        + [(_HL_A, "syslog", "sshd", 3, f"error {i}") for i in range(5)]
+        + [(_HL_A, "syslog", "cron", 3, "tick")] * 3
+        + [(_HL_B, "syslog", "cron", 3, "tick")] * 3
+        + [(_HL_A, "journald", "app", 3, "dup")] * 2
+        + [(_HL_A, "syslog", "app", 3, "dup")] * 2
+        + [(_HL_A, "syslog", "noise", 6, "info only")]  # severity 6 > min_severity 3
+    )
+    raw.insert(
+        "ssdf.host_logs",
+        [
+            [_HL_AT, host, source, unit, sev, msg, _HL_MARKER]
+            for host, source, unit, sev, msg in lines
+        ],
+        column_names=["timestamp", "host", "source", "unit", "severity", "message", "raw"],
+    )
+    yield
+    raw.command(_HL_DELETE)
+
+
+def _hl_page(ch, **kw):
+    sql, params = build_host_log_patterns(since=_HL_SINCE, until=_HL_UNTIL, **kw)
+    return ch.run(sql, params)["rows"]
+
+
+def test_host_log_patterns_order_and_offset_paging(ch, host_log_rows):
+    full = _hl_page(ch, limit=100)
+    got = [(r["kind"], r["host"], r["unit"], r["source"], int(r["occurrences"])) for r in full]
+    assert got == [
+        ("crash", _HL_B, "systemd-coredump@1-2-3.service", "journald", 1),
+        ("unit_failed", _HL_A, "systemd", "journald", 2),
+        ("error", _HL_A, "sshd", "syslog", 5),  # "error <n>" x5
+        ("error", _HL_A, "cron", "syslog", 3),  # count tie: host breaks it
+        ("error", _HL_B, "cron", "syslog", 3),
+        ("error", _HL_A, "app", "journald", 2),  # host/unit/pattern tie: source breaks it
+        ("error", _HL_A, "app", "syslog", 2),
+    ]
+    assert {int(r["total_patterns"]) for r in full} == {7}
+    paged = [r for off in (0, 3, 6) for r in _hl_page(ch, limit=3, offset=off)]
+    assert [(r["host"], r["source"], r["unit"], r["kind"], r["pattern"]) for r in paged] == [
+        (r["host"], r["source"], r["unit"], r["kind"], r["pattern"]) for r in full
+    ]
+    assert _hl_page(ch, limit=3, offset=7) == []  # past the end: no row carries the total
+    sql, params = build_host_log_patterns_count(since=_HL_SINCE, until=_HL_UNTIL)
+    assert int(ch.run(sql, params)["rows"][0]["total_patterns"]) == 7
+    only_b = _hl_page(ch, limit=100, host=_HL_B)
+    assert [(r["kind"], r["unit"]) for r in only_b] == [
+        ("crash", "systemd-coredump@1-2-3.service"),
+        ("error", "cron"),
+    ]
+    assert {int(r["total_patterns"]) for r in only_b} == {2}
 
 
 # --- Regressions, each pinned to a bug that shipped -------------------------

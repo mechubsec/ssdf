@@ -2,9 +2,11 @@
 import pytest
 from ssdf_mcp_query.builders import (
     HOST_LOG_PATTERNS_MAX_LIMIT,
+    HOST_LOG_PATTERNS_MAX_OFFSET,
     _HOST_LOG_NORMALIZERS,
     _ch_literal,
     build_host_log_patterns,
+    build_host_log_patterns_count,
     build_host_log_sources,
     build_query_flows,
     build_top_talkers,
@@ -157,10 +159,44 @@ def test_host_log_patterns_grouping_order_and_total():
     assert "FROM ssdf.host_logs" in sql and "count() OVER () AS total_patterns" in sql
     assert "GROUP BY host, source, unit, kind, pattern" in sql
     assert (
-        "ORDER BY occurrences DESC, last_seen DESC, host, source, unit, kind, pattern LIMIT 300"
-        in sql
+        "ORDER BY indexOf(['crash', 'unit_failed', 'error'], kind), occurrences DESC, "
+        "host, unit, pattern, source LIMIT 300 OFFSET 0" in sql
     )
+    assert "last_seen DESC" not in sql  # last_seen moves as rows arrive; not a stable sort key
     assert "since" in params and "until" in params and params["min_severity"] == 3
+    assert "host" not in params and "{host:String}" not in sql
+
+
+def test_host_log_patterns_offset_pages():
+    assert HOST_LOG_PATTERNS_MAX_OFFSET == 100_000
+    assert build_host_log_patterns(limit=500, offset=500)[0].endswith("LIMIT 500 OFFSET 500")
+    for bad in (-1, HOST_LOG_PATTERNS_MAX_OFFSET + 1, True, "1", 1.5, None):
+        with pytest.raises(BuilderError):
+            build_host_log_patterns(offset=bad)
+
+
+def test_host_log_patterns_host_filter_is_bound():
+    sql, params = build_host_log_patterns(host="strix'; DROP TABLE x")
+    assert params["host"] == "strix'; DROP TABLE x" and "host = {host:String}" in sql
+    assert "DROP TABLE" not in sql
+    for bad in ("", 5, True):
+        with pytest.raises(BuilderError):
+            build_host_log_patterns(host=bad)
+
+
+def test_host_log_patterns_count_matches_page_filters():
+    page_sql, page_params = build_host_log_patterns(
+        since="2026-10-01T00:00:00Z", until="2026-10-02T00:00:00Z", min_severity=4, host="h1"
+    )
+    sql, params = build_host_log_patterns_count(
+        since="2026-10-01T00:00:00Z", until="2026-10-02T00:00:00Z", min_severity=4, host="h1"
+    )
+    assert params == page_params
+    assert sql.startswith("SELECT count() AS total_patterns FROM (SELECT 1 FROM (")
+    assert sql.endswith("GROUP BY host, source, unit, kind, pattern)")
+    inner = sql[len("SELECT count() AS total_patterns FROM (SELECT 1 FROM (") :]
+    assert inner.split(") GROUP BY")[0] in page_sql  # identical inner filter query
+    assert "LIMIT" not in sql and "OFFSET" not in sql
 
 
 def test_host_log_patterns_validates_min_severity():
@@ -172,7 +208,7 @@ def test_host_log_patterns_validates_min_severity():
 def test_host_log_patterns_clamps_limit():
     assert HOST_LOG_PATTERNS_MAX_LIMIT == 500
     assert "LIMIT 500" in build_host_log_patterns(limit=10_000)[0]
-    assert build_host_log_patterns(limit=0)[0].endswith("LIMIT 1")
+    assert build_host_log_patterns(limit=0)[0].endswith("LIMIT 1 OFFSET 0")
 
 
 def test_host_log_sources_sums_summing_merge_tree():
