@@ -160,6 +160,19 @@ def _parse_checkpoint_ts(checkpoint_ts: str) -> dt.datetime:
     )
 
 
+def _content_recomputable(row: dict) -> bool:
+    """Whether SSDF can recompute this row's ``row_hash`` from its stored columns.
+
+    Evidence-tier rows are written by mecmcp-audit, whose ``row_hash`` digests the
+    whole EvidenceRecord. That includes a nanosecond ``timestamp`` and fields
+    (``kind``, ``outcome``, ...) that ssdf.audit never stores, so no reader can
+    recompute it. Their integrity here rests on linkage, reachability and signed
+    checkpoints; content integrity lives in the writer's own signed segments.
+    See docs/audit-evidence-contract-v1.md, "Hash Chain Integrity".
+    """
+    return row.get("tier") != "evidence"
+
+
 def _is_old_enough_to_anchor(checkpoint_ts: str, now: dt.datetime) -> bool:
     """Whether the rows a checkpoint stands in for could actually have
     expired by ``now``.
@@ -257,7 +270,10 @@ def _anchor_dangling_hash(
             return False, issues, []
         if first_bridge_row is None:
             first_bridge_row = bridge_row
-        if compute_row_hash(bridge_row["prev_hash"], bridge_row) != bridge_row["row_hash"]:
+        if (
+            _content_recomputable(bridge_row)
+            and compute_row_hash(bridge_row["prev_hash"], bridge_row) != bridge_row["row_hash"]
+        ):
             issues.append({"type": "content_edit", "row_hash": bridge_row["row_hash"]})
             return False, issues, []
         current = bridge_row["prev_hash"]
@@ -330,6 +346,8 @@ def _bridge_row_vouches_for_head(bridge_row: dict, now: dt.datetime) -> bool:
         ts = ts.replace(tzinfo=dt.timezone.utc)
     if now - ts < dt.timedelta(days=_AUDIT_TTL_DAYS - _CHECKPOINT_INTERVAL_SLACK_DAYS):
         return False
+    if not _content_recomputable(bridge_row):
+        return True
     return compute_row_hash(bridge_row["prev_hash"], bridge_row) == bridge_row["row_hash"]
 
 
@@ -524,9 +542,10 @@ def verify_tier(
             for child_hash in children:
                 issues.append({"type": "fork", "row_hash": child_hash})
 
-    # 1. Content integrity: each stored row_hash must equal H(prev_hash, fields).
+    # 1. Content integrity: each stored row_hash must equal H(prev_hash, fields),
+    #    for every row SSDF can recompute (not evidence; see _content_recomputable).
     for r in rows:
-        if compute_row_hash(r["prev_hash"], r) != r["row_hash"]:
+        if _content_recomputable(r) and compute_row_hash(r["prev_hash"], r) != r["row_hash"]:
             issues.append({"type": "content_edit", "row_hash": r["row_hash"]})
 
     # 1.5 Checkpoint head presence: every checkpoint still within its recent
@@ -725,7 +744,11 @@ def main() -> int:
         legacy = sum(1 for r in chain_rows if r["row_hash"] == "")
         status = "OK" if not issues else f"{len(issues)} ISSUE(S)"
         writer = f" server={server_id}" if server_id else ""
-        print(f"tier={tier}{writer} rows={len(chain_rows)} legacy_unhashed={legacy} {status}")
+        # Say so rather than let OK imply the rows' content was checked.
+        content = " content=writer-hashed(not-recomputed)" if tier == "evidence" else ""
+        print(
+            f"tier={tier}{writer} rows={len(chain_rows)} legacy_unhashed={legacy}{content} {status}"
+        )
         for issue in issues:
             print(f"  {issue['type']}: row_hash={issue['row_hash'][:16]}…")
     return 0 if total == 0 else 1

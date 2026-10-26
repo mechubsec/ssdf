@@ -1075,3 +1075,74 @@ def test_key_rotation_overlap_window_verifies_both_old_and_new_checkpoints():
         now=now,
     )
     assert any(i["type"] == "unverifiable_checkpoint" for i in new_only_issues)
+
+
+# Evidence rows carry mecmcp-audit's own digest (sha256 of the full EvidenceRecord,
+# incl. a nanosecond timestamp ssdf.audit never stores), which SSDF cannot recompute.
+# _evidence_chain above hashes them the Python way, which no real writer does.
+def _writer_hashed_evidence_chain(n, server_id, ts0):
+    import hashlib
+
+    rows, prev = [], ""
+    for i, row in enumerate(_evidence_chain(n, server_id)):
+        row["ts"] = ts0 + dt.timedelta(seconds=i)
+        row["prev_hash"] = prev
+        row["row_hash"] = "sha256:" + hashlib.sha256(f"record-{server_id}-{i}".encode()).hexdigest()
+        prev = row["row_hash"]
+        rows.append(row)
+    return rows
+
+
+def test_writer_hashed_evidence_rows_verify_on_linkage():
+    rows = _writer_hashed_evidence_chain(
+        4, "junos-950", dt.datetime(2026, 8, 24, tzinfo=dt.timezone.utc)
+    )
+    assert compute_row_hash(rows[1]["prev_hash"], rows[1]) != rows[1]["row_hash"]  # really opaque
+    assert verify_tier(rows) == []
+
+
+def test_writer_hashed_evidence_rows_still_report_a_deleted_row():
+    rows = _writer_hashed_evidence_chain(
+        4, "junos-950", dt.datetime(2026, 8, 24, tzinfo=dt.timezone.utc)
+    )
+    del rows[1]
+    types = {i["type"] for i in verify_tier(rows)}
+    assert "missing_predecessor" in types and "unreachable" in types
+    assert "content_edit" not in types
+
+
+def test_sovereign_rows_are_still_content_checked():
+    rows = _chain(3)
+    rows[1]["tool"] = "TAMPERED"
+    assert any(i["type"] == "content_edit" for i in verify_tier(rows))
+
+
+def test_bridge_through_writer_hashed_evidence_rows_anchors():
+    """The bridge walk must not demand a recomputable hash from evidence rows either."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from ssdf_mcp_query.checkpoint_verify import canonical_digest
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+    full = _writer_hashed_evidence_chain(
+        5, "junos-950", dt.datetime(2026, 6, 10, tzinfo=dt.timezone.utc)
+    )
+    unsigned = Checkpoint(
+        tier="evidence",
+        server_id="junos-950",
+        row_count=1,
+        head_row_hash=full[0]["row_hash"],
+        checkpoint_ts="2026-06-11T00:00:00.000Z",
+        signature="",
+        key_id=key_fingerprint(verifying_key),
+    )
+    signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
+    checkpoint = Checkpoint(**{**unsigned.__dict__, "signature": signature})
+    issues = verify_tier(
+        full[3:],
+        checkpoints=[checkpoint],
+        bridge_rows=full[1:3],
+        keyring=_keyring(verifying_key),
+        now=dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc),
+    )
+    assert issues == []
