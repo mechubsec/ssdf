@@ -14,6 +14,10 @@
 # `vector test` needs a value too; CI and local runs export a fixed
 # throwaway test key (see the [[tests]] blocks below) that must never be
 # reused as a real USERNAME_HASH_KEY.
+#
+# Vector 0.57+ interpolates environment variables only when started with
+# --dangerously-allow-env-var-interpolation (or the matching VECTOR_ env var).
+# This file depends on interpolation, so add that before upgrading past 0.56.
 
 [sources.srx_syslog]
 type = "socket"

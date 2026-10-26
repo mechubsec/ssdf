@@ -1,8 +1,7 @@
 # SSDF host-log agent (Linux): ships journald errors to the SSDF ingest host.
-# Generic config. The ingest address comes from the environment in the sink
-# only (SSDF_INGEST_ADDR=<ingest-ip>:6000, e.g. in /etc/default/vector).
-# Do not write the env-interpolation syntax in comments: Vector expands it
-# across the whole file, comments included.
+# Generic config: set the sink address to your ingest host before installing.
+# It is a literal, not an env reference, because Vector 0.57+ only interpolates
+# environment variables with --dangerously-allow-env-var-interpolation.
 #
 # Ships warning-and-worse, systemd unit failures and coredumps (the rule ingest
 # applies too), so a chatty host does not ship its whole journal. A 5-minute heartbeat proves the agent is alive even
@@ -48,7 +47,7 @@ source = '''
 [sinks.ssdf]
 type = "vector"
 inputs = ["host_errors", "heartbeat_tag"]
-address = "${SSDF_INGEST_ADDR}"
+address = "198.51.100.150:6000"  # your ingest host, TCP 6000
 
 [sinks.ssdf.buffer]
 type = "disk"
