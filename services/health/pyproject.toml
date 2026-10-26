@@ -5,7 +5,7 @@ description = "SSDF M13a host resource-pressure poller (MCP -> ssdf.health_metri
 requires-python = ">=3.11"
 dependencies = [
     "clickhouse-connect>=0.8",
-    "fastmcp>=2.0",
+    "fastmcp>=3.4.11,<4",
     "defusedxml>=0.7",
     "ssdf-common",
 ]

@@ -4,7 +4,7 @@ version = "0.2.0"
 description = "SSDF M2 read-only MCP query layer over ssdf.events (ClickHouse)"
 requires-python = ">=3.11"
 dependencies = [
-    "fastmcp>=2.0",
+    "fastmcp>=3.4.11,<4",
     "clickhouse-connect>=0.8",
     "sqlglot>=25.0",
     "networkx>=3.0",

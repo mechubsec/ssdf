@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "clickhouse-connect>=0.8",
     "defusedxml>=0.7",
-    "fastmcp>=2.0",
+    "fastmcp>=3.4.11,<4",
     "ssdf-common",
 ]
 
