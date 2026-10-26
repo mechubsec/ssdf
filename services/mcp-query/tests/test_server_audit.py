@@ -15,6 +15,7 @@ EXPECTED_TOOLS = {
     "describe_schema",
     "top_talkers",
     "zone_matrix",
+    "host_log_patterns",
     "run_sql",
     "get_entity",
     "locate",
