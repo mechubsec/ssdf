@@ -1075,3 +1075,121 @@ def test_key_rotation_overlap_window_verifies_both_old_and_new_checkpoints():
         now=now,
     )
     assert any(i["type"] == "unverifiable_checkpoint" for i in new_only_issues)
+
+
+# Evidence rows carry mecmcp-audit's own digest (sha256 of the full EvidenceRecord,
+# incl. a nanosecond timestamp ssdf.audit never stores), which SSDF cannot recompute.
+# _evidence_chain above hashes them the Python way, which no real writer does.
+def _writer_hashed_evidence_chain(n, server_id, ts0):
+    import hashlib
+
+    rows, prev = [], ""
+    for i, row in enumerate(_evidence_chain(n, server_id)):
+        row["ts"] = ts0 + dt.timedelta(seconds=i)
+        row["prev_hash"] = prev
+        row["row_hash"] = "sha256:" + hashlib.sha256(f"record-{server_id}-{i}".encode()).hexdigest()
+        prev = row["row_hash"]
+        rows.append(row)
+    return rows
+
+
+def test_writer_hashed_evidence_rows_verify_on_linkage():
+    rows = _writer_hashed_evidence_chain(
+        4, "junos-950", dt.datetime(2026, 8, 24, tzinfo=dt.timezone.utc)
+    )
+    assert compute_row_hash(rows[1]["prev_hash"], rows[1]) != rows[1]["row_hash"]  # really opaque
+    assert verify_tier(rows) == []
+
+
+def test_writer_hashed_evidence_rows_still_report_a_deleted_row():
+    rows = _writer_hashed_evidence_chain(
+        4, "junos-950", dt.datetime(2026, 8, 24, tzinfo=dt.timezone.utc)
+    )
+    del rows[1]
+    types = {i["type"] for i in verify_tier(rows)}
+    assert "missing_predecessor" in types and "unreachable" in types
+    assert "content_edit" not in types
+
+
+def test_sovereign_rows_are_still_content_checked():
+    rows = _chain(3)
+    rows[1]["tool"] = "TAMPERED"
+    assert any(i["type"] == "content_edit" for i in verify_tier(rows))
+
+
+def test_writer_hashed_evidence_rows_never_extend_a_bridge():
+    """A bridge row's prev_hash is only as trustworthy as the hash covering it, and
+    SSDF cannot recompute a writer hash, so an opaque row must not carry an anchor
+    across deleted rows: the gap stays reported (fail closed)."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from ssdf_mcp_query.checkpoint_verify import canonical_digest
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+    full = _writer_hashed_evidence_chain(
+        5, "junos-950", dt.datetime(2026, 6, 10, tzinfo=dt.timezone.utc)
+    )
+    unsigned = Checkpoint(
+        tier="evidence",
+        server_id="junos-950",
+        row_count=1,
+        head_row_hash=full[0]["row_hash"],
+        checkpoint_ts="2026-06-11T00:00:00.000Z",
+        signature="",
+        key_id=key_fingerprint(verifying_key),
+    )
+    signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
+    checkpoint = Checkpoint(**{**unsigned.__dict__, "signature": signature})
+    forged = dict(full[2], prev_hash=full[0]["row_hash"])  # skips the deleted full[1]
+    issues = verify_tier(
+        full[3:],
+        checkpoints=[checkpoint],
+        bridge_rows=[forged],
+        keyring=_keyring(verifying_key),
+        now=dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc),
+    )
+    assert any(i["type"] == "missing_predecessor" for i in issues)
+
+
+def test_relabelling_rows_as_evidence_does_not_skip_the_content_check():
+    """tier is mutable: a sovereign chain moved into an evidence group keeps its
+    bare-hex hashes, so its rows are still recomputed and the edit is caught."""
+    rows = _chain(3)
+    for row in rows:
+        row["tier"] = "evidence"
+        row["args"] = '{"server_id":"junos-950"}'
+    assert all(i["type"] == "content_edit" for i in verify_tier(rows))
+    assert len(verify_tier(rows)) == 3
+
+
+def test_relabelled_and_rehashed_chain_is_caught_by_its_checkpoint():
+    """Rewriting every hash defeats any unanchored chain, Python-hashed ones too (the
+    hash is unkeyed); the signed checkpoint is the defence. Moving a checkpointed
+    sovereign chain into an evidence group with writer-shaped hashes leaves the
+    checkpoint's head missing."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from ssdf_mcp_query.checkpoint_verify import canonical_digest
+
+    signing_key = Ed25519PrivateKey.generate()
+    verifying_key = signing_key.public_key().public_bytes_raw()
+    original = _chain(3)
+    unsigned = Checkpoint(
+        tier="sovereign",
+        server_id="",
+        row_count=3,
+        head_row_hash=original[-1]["row_hash"],
+        checkpoint_ts="2026-06-10T13:00:00.000Z",
+        signature="",
+        key_id=key_fingerprint(verifying_key),
+    )
+    signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
+    checkpoint = Checkpoint(**{**unsigned.__dict__, "signature": signature})
+    moved = _writer_hashed_evidence_chain(
+        3, "junos-950", dt.datetime(2026, 6, 10, 12, tzinfo=dt.timezone.utc)
+    )
+    now = dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc)
+    assert verify_tier(moved) == []  # the forged group alone looks clean...
+    sovereign_issues = verify_tier(
+        [], checkpoints=[checkpoint], keyring=_keyring(verifying_key), now=now
+    )
+    assert any(i["type"] == "checkpoint_head_missing" for i in sovereign_issues)  # ...this is not

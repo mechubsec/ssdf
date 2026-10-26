@@ -26,8 +26,9 @@ def ts_ms_iso(ts: _dt.datetime) -> str:
 #
 #   - rows written before these columns existed have all three empty, serialise
 #     as the original nine-element form, and verify against their stored hash
-#   - the same is true of `tier="evidence"` rows from mecmcp-audit, which never
-#     set them -- so this change does not require a coordinated release
+#   - `tier="evidence"` rows from mecmcp-audit never set them either, but their
+#     row_hash is mecmcp-audit's own digest and is not recomputed here at all
+#     (verify_audit._content_recomputable)
 #   - rows that DO carry attribution serialise as twelve elements, so the
 #     attribution is covered by the hash rather than sitting outside it
 #

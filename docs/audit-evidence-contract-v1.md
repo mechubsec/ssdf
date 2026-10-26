@@ -294,7 +294,21 @@ Evidence records participate in a hash chain **per writer**, keyed
 1. **First evidence record of a `server_id`** has `prev_hash = ""` (chain start)
 2. **Subsequent records** include `prev_hash = <previous row_hash>`, where
    "previous" means this writer's previous record, across all of its runs
-3. **row_hash** computation includes: `(ts, principal, tool, args, prev_hash)`
+3. **row_hash** is the writer's digest of its full EvidenceRecord: the
+   sorted-key canonical JSON of `kind`, `request_id`, `changeset_id`,
+   `device_id`, `principal`, `diff_hash`, `timestamp`, `run_id`, `server_id`,
+   `segment_seq`, `prev_hash` and, where present, `approver`, `decision`,
+   `outcome`, `error` and `metadata`, as `sha256:<hex>`
+   (mecmcp-audit `sinks/ssdf.rs` `compute_record_hash`). It includes the
+   record's nanosecond `timestamp` and fields that ssdf.audit does not store,
+   so **SSDF cannot recompute it**. `verify_audit.py` therefore checks evidence
+   rows for linkage, reachability and checkpoint anchoring only, never content,
+   and prints `content=writer-hashed(not-recomputed)` for the tier. Content
+   integrity for evidence rows rests on the writer's signed segments. The
+   exemption needs both `tier = 'evidence'` and a `sha256:<hex>` row_hash, and
+   writer-hashed rows are never used to bridge to a checkpoint (their
+   `prev_hash` link cannot be authenticated), so evidence chains anchor only
+   directly on a checkpoint head.
 
 ### Why per writer
 
