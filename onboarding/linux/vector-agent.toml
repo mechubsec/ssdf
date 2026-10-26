@@ -1,0 +1,120 @@
+# SSDF host-log agent (Linux): ships journald errors to the SSDF ingest host.
+# Generic config. The ingest address comes from the environment in the sink
+# only (SSDF_INGEST_ADDR=<ingest-ip>:6000, e.g. in /etc/default/vector).
+# Do not write the env-interpolation syntax in comments: Vector expands it
+# across the whole file, comments included.
+#
+# Only errors reach the wire. Ingest keeps warning-and-worse, systemd unit
+# failures and coredumps; the same filter runs here so a chatty host does not
+# ship its whole journal. A 5-minute heartbeat proves the agent is alive even
+# when the host logs nothing at warning or above.
+
+[sources.journal]
+type = "journald"
+since_now = true
+
+[transforms.host_errors]
+type = "filter"
+inputs = ["journal"]
+condition.type = "vrl"
+condition.source = '''
+priority = to_int(.PRIORITY) ?? 6
+ident = string(.SYSLOG_IDENTIFIER) ?? ""
+unit = string(._SYSTEMD_UNIT) ?? ""
+msg = string(.message) ?? ""
+is_severe = priority <= 4
+is_unit_failure = (ident == "systemd" || unit == "init.scope") &&
+    match(msg, r'Failed with result|entered failed state')
+is_coredump = ident == "systemd-coredump" && contains(msg, "dumped core")
+is_severe || is_unit_failure || is_coredump
+'''
+
+[sources.heartbeat]
+type = "exec"
+mode = "scheduled"
+command = ["echo", "ssdf-heartbeat"]
+scheduled.exec_interval_secs = 300
+
+[transforms.heartbeat_tag]
+type = "remap"
+inputs = ["heartbeat"]
+source = '''
+.PRIORITY = "7"
+.SYSLOG_IDENTIFIER = "ssdf-heartbeat"
+'''
+
+# drop_newest, not block: if the ingest host is unreachable long enough to
+# fill the disk buffer, losing the newest errors is better than stalling the
+# journald reader. The disk buffer rides out ordinary ingest restarts.
+[sinks.ssdf]
+type = "vector"
+inputs = ["host_errors", "heartbeat_tag"]
+address = "${SSDF_INGEST_ADDR}"
+
+[sinks.ssdf.buffer]
+type = "disk"
+max_size = 268435488
+when_full = "drop_newest"
+
+[[tests]]
+name = "warning_kept"
+[[tests.inputs]]
+insert_at = "host_errors"
+type = "log"
+[tests.inputs.log_fields]
+message = "something is wrong"
+PRIORITY = "4"
+SYSLOG_IDENTIFIER = "app"
+[[tests.outputs]]
+extract_from = "host_errors"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.message, "something is wrong")
+'''
+
+[[tests]]
+name = "info_dropped"
+no_outputs_from = ["host_errors"]
+[[tests.inputs]]
+insert_at = "host_errors"
+type = "log"
+[tests.inputs.log_fields]
+message = "all fine"
+PRIORITY = "6"
+SYSLOG_IDENTIFIER = "app"
+
+[[tests]]
+name = "unit_failure_at_notice_kept"
+[[tests.inputs]]
+insert_at = "host_errors"
+type = "log"
+[tests.inputs.log_fields]
+message = "foo.service: Failed with result 'exit-code'."
+PRIORITY = "5"
+SYSLOG_IDENTIFIER = "systemd"
+_SYSTEMD_UNIT = "init.scope"
+[[tests.outputs]]
+extract_from = "host_errors"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.PRIORITY, "5")
+'''
+
+[[tests]]
+name = "coredump_kept"
+[[tests.inputs]]
+insert_at = "host_errors"
+type = "log"
+[tests.inputs.log_fields]
+message = "Process 42 (foo) of user 0 dumped core."
+PRIORITY = "6"
+SYSLOG_IDENTIFIER = "systemd-coredump"
+[[tests.outputs]]
+extract_from = "host_errors"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.SYSLOG_IDENTIFIER, "systemd-coredump")
+'''
