@@ -148,13 +148,14 @@ jobs:
           TZ: UTC
           CH_HOST: unused
           USERNAME_HASH_KEY: throwaway-ci-key
-          OBSERVER_HOSTNAME_RE: panosvm|vsrx-(prod|ci|core-a|br05|isp-[ab])
+          OBSERVER_HOSTNAME_RE: panosvm|edge-fw01|vsrx-(prod|ci|core-a|br05|isp-[ab])
         run: vector test infra/vector/vector.toml
       - name: vector test (Linux host-log agent)
         run: vector test onboarding/linux/vector-agent.toml
       - name: vector validate fails closed without USERNAME_HASH_KEY (F4)
         env:
           CH_HOST: unused
+          OBSERVER_HOSTNAME_RE: panosvm
         run: |
           if vector validate --no-environment infra/vector/vector.toml; then
             echo "expected 'vector validate' to fail with USERNAME_HASH_KEY unset (F4 fail-closed)" >&2

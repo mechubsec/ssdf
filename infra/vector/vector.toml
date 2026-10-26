@@ -1691,6 +1691,50 @@ source = '''
 assert_eq!(.observer_hostname, "")
 '''
 
+# edge-fw01 is only in the test OBSERVER_HOSTNAME_RE (never in the old hard-coded fleet
+# regex), so these prove each transform reads the env allow-list.
+[[tests]]
+name = "srx_observer_hostname_from_env_allowlist"
+[[tests.inputs]]
+insert_at = "srx_ecs"
+type = "raw"
+value = '<14>1 2026-06-08T12:00:00.000Z edge-fw01 RT_FLOW - RT_FLOW_SESSION_CLOSE [junos@2636.1.1.1.2.36 source-address="10.65.1.10" source-port="51514" destination-address="10.66.2.20" destination-port="443" protocol-id="6" policy-name="baseline-permit(global)" source-zone-name="trust" destination-zone-name="untrust" bytes-from-client="1500" bytes-from-server="6000" username="N/A"]'
+[[tests.outputs]]
+extract_from = "srx_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.observer_hostname, "edge-fw01")
+'''
+
+[[tests]]
+name = "panos_observer_hostname_from_env_allowlist"
+[[tests.inputs]]
+insert_at = "panos_ecs"
+type = "raw"
+value = '<14>Jun 06 23:20:00 edge-fw01.example.com ,2026/06/06 23:20:00,007054000012345,TRAFFIC,end,,2026/06/06 23:20:00,203.0.113.50,198.51.100.20,0.0.0.0,0.0.0.0,allow-trust-to-untrust,,,ssl,vsys1,trust,untrust,ethernet1/2,ethernet1/1,,,40001,1,52344,443,0,0,0x0,tcp,allow,8000,3000,5000,40,2026/06/06 23:19:30,30,any,,1001,0x0,203.0.113.0-203.0.113.255,US,,22,18,tcp-fin'
+[[tests.outputs]]
+extract_from = "panos_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.observer_hostname, "edge-fw01.example.com")
+'''
+
+[[tests]]
+name = "junos_sys_observer_hostname_from_env_allowlist"
+[[tests.inputs]]
+insert_at = "junos_sys_ecs"
+type = "raw"
+value = "<37>1 2026-07-06T03:50:42.589Z Edge-FW01 sshd - SSHD_LOGIN_FAILED [junos@2636.1.1.1.2.129 username=\"baduser\" source-address=\"198.51.100.148\"] Login failed for user 'baduser' from host '198.51.100.148'"
+[[tests.outputs]]
+extract_from = "junos_sys_ecs"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.observer_hostname, "Edge-FW01")
+'''
+
 [[tests]]
 name = "panos_observer_hostname_unknown_is_blanked"
 [[tests.inputs]]
