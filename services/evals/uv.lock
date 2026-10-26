@@ -1479,12 +1479,14 @@ source = { editable = "../common" }
 dependencies = [
     { name = "clickhouse-connect" },
     { name = "fastmcp" },
+    { name = "opentelemetry-api" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "clickhouse-connect", specifier = ">=0.8" },
-    { name = "fastmcp", specifier = ">=2.0" },
+    { name = "fastmcp", specifier = ">=3.4.11,<4" },
+    { name = "opentelemetry-api", specifier = ">=1.45.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
 ]
 provides-extras = ["dev"]
