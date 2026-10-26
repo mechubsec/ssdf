@@ -141,7 +141,7 @@ def test_host_log_patterns_normalizes_in_contract_order():
     assert "'\\\\d+', '<n>'" in sql  # backslashes doubled for the ClickHouse literal
     assert "'\\\\1<ipv-six>'" in sql
     assert "replaceAll(" in sql and "'<ipv-six>', '<ip6>')" in sql
-    assert "substring(trimBoth(replaceAll(" in sql and ", 1, 300)" in sql
+    assert "substringUTF8(trimBoth(replaceAll(" in sql and ", 1, 300)" in sql
 
 
 def test_host_log_patterns_kind_and_severity_filter():

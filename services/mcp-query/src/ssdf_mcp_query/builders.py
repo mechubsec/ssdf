@@ -185,7 +185,7 @@ def _host_log_pattern_expr() -> str:
     expr = "message"
     for regex, replacement in _HOST_LOG_NORMALIZERS:
         expr = f"replaceRegexpAll({expr}, {_ch_literal(regex)}, {_ch_literal(replacement)})"
-    return f"substring(trimBoth(replaceAll({expr}, '<ipv-six>', '<ip6>')), 1, 300)"
+    return f"substringUTF8(trimBoth(replaceAll({expr}, '<ipv-six>', '<ip6>')), 1, 300)"
 
 
 def build_host_log_patterns(since=None, until=None, min_severity=3, limit=300):
