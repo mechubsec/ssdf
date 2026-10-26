@@ -3,6 +3,9 @@
 # SSDF ingest hardening (security review 2026-06-10, finding H1).
 # Restrict UDP 514 (SRX) / 515 (PAN-OS) / 516 (UniFi) / 517 (Proxmox host) / 518 (Junos SYSTEM)
 # to the vSRX test fleet + panosvm + UniFi controller + pve3 host.
+# Host-log ports (TCP 6000 Vector agents, TCP/UDP 519 generic syslog) follow the
+# same pattern. The addresses below are placeholders: the real sender
+# allow-lists are deployment-specific and kept by the operator.
 # Dedicated table; does not touch the default `inet filter` table.
 # The `table ... / delete table ...` prologue makes reloads idempotent.
 
@@ -36,7 +39,18 @@ table inet ssdf_ingest {
         udp dport 518 ip saddr 198.51.100.219-198.51.100.245 accept
         udp dport 518 ip saddr 198.51.100.150-198.51.100.175 accept
 
+        # Host logs: a second Proxmox node on UDP 517 (same stream as above).
+        udp dport 517 ip saddr 198.51.100.202 accept
+
+        # Host logs: Vector agents on Linux hosts ship journald events on TCP 6000.
+        tcp dport 6000 ip saddr 203.0.113.0/28 accept
+
+        # Host logs: generic syslog senders (rsyslog, appliances) on TCP and UDP 519.
+        tcp dport 519 ip saddr 192.0.2.0/28 accept
+        udp dport 519 ip saddr 192.0.2.0/28 accept
+
         # Everything else hitting the ingest ports is dropped.
-        udp dport { 514, 515, 516, 517, 518 } drop
+        udp dport { 514, 515, 516, 517, 518, 519 } drop
+        tcp dport { 519, 6000 } drop
     }
 }
