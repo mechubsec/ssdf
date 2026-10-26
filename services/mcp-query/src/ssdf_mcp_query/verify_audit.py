@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sys
 from collections import defaultdict
 
@@ -160,6 +161,9 @@ def _parse_checkpoint_ts(checkpoint_ts: str) -> dt.datetime:
     )
 
 
+_WRITER_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
 def _content_recomputable(row: dict) -> bool:
     """Whether SSDF can recompute this row's ``row_hash`` from its stored columns.
 
@@ -169,8 +173,13 @@ def _content_recomputable(row: dict) -> bool:
     recompute it. Their integrity here rests on linkage, reachability and signed
     checkpoints; content integrity lives in the writer's own signed segments.
     See docs/audit-evidence-contract-v1.md, "Hash Chain Integrity".
+
+    ``tier`` is itself mutable stored content, so it alone must not switch the
+    check off: only an evidence row that also carries the writer's hash shape
+    (``sha256:<hex>``; SSDF's own rows are bare hex) is exempt. A sovereign row
+    relabelled ``evidence`` keeps its bare-hex hash and is still recomputed.
     """
-    return row.get("tier") != "evidence"
+    return not (row.get("tier") == "evidence" and _WRITER_HASH.match(row.get("row_hash") or ""))
 
 
 def _is_old_enough_to_anchor(checkpoint_ts: str, now: dt.datetime) -> bool:
@@ -270,10 +279,11 @@ def _anchor_dangling_hash(
             return False, issues, []
         if first_bridge_row is None:
             first_bridge_row = bridge_row
-        if (
-            _content_recomputable(bridge_row)
-            and compute_row_hash(bridge_row["prev_hash"], bridge_row) != bridge_row["row_hash"]
-        ):
+        if not _content_recomputable(bridge_row):
+            # Its prev_hash is covered only by a digest SSDF cannot recompute, so
+            # the link is unauthenticated: never extend an anchor through it.
+            return False, issues, []
+        if compute_row_hash(bridge_row["prev_hash"], bridge_row) != bridge_row["row_hash"]:
             issues.append({"type": "content_edit", "row_hash": bridge_row["row_hash"]})
             return False, issues, []
         current = bridge_row["prev_hash"]
@@ -347,7 +357,7 @@ def _bridge_row_vouches_for_head(bridge_row: dict, now: dt.datetime) -> bool:
     if now - ts < dt.timedelta(days=_AUDIT_TTL_DAYS - _CHECKPOINT_INTERVAL_SLACK_DAYS):
         return False
     if not _content_recomputable(bridge_row):
-        return True
+        return False  # unauthenticated link, as in _anchor_dangling_hash
     return compute_row_hash(bridge_row["prev_hash"], bridge_row) == bridge_row["row_hash"]
 
 

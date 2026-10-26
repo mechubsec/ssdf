@@ -1117,8 +1117,10 @@ def test_sovereign_rows_are_still_content_checked():
     assert any(i["type"] == "content_edit" for i in verify_tier(rows))
 
 
-def test_bridge_through_writer_hashed_evidence_rows_anchors():
-    """The bridge walk must not demand a recomputable hash from evidence rows either."""
+def test_writer_hashed_evidence_rows_never_extend_a_bridge():
+    """A bridge row's prev_hash is only as trustworthy as the hash covering it, and
+    SSDF cannot recompute a writer hash, so an opaque row must not carry an anchor
+    across deleted rows: the gap stays reported (fail closed)."""
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from ssdf_mcp_query.checkpoint_verify import canonical_digest
 
@@ -1138,11 +1140,23 @@ def test_bridge_through_writer_hashed_evidence_rows_anchors():
     )
     signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
     checkpoint = Checkpoint(**{**unsigned.__dict__, "signature": signature})
+    forged = dict(full[2], prev_hash=full[0]["row_hash"])  # skips the deleted full[1]
     issues = verify_tier(
         full[3:],
         checkpoints=[checkpoint],
-        bridge_rows=full[1:3],
+        bridge_rows=[forged],
         keyring=_keyring(verifying_key),
         now=dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc),
     )
-    assert issues == []
+    assert any(i["type"] == "missing_predecessor" for i in issues)
+
+
+def test_relabelling_rows_as_evidence_does_not_skip_the_content_check():
+    """tier is mutable: a sovereign chain moved into an evidence group keeps its
+    bare-hex hashes, so its rows are still recomputed and the edit is caught."""
+    rows = _chain(3)
+    for row in rows:
+        row["tier"] = "evidence"
+        row["args"] = '{"server_id":"junos-950"}'
+    assert all(i["type"] == "content_edit" for i in verify_tier(rows))
+    assert len(verify_tier(rows)) == 3

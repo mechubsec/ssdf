@@ -304,7 +304,11 @@ Evidence records participate in a hash chain **per writer**, keyed
    so **SSDF cannot recompute it**. `verify_audit.py` therefore checks evidence
    rows for linkage, reachability and checkpoint anchoring only, never content,
    and prints `content=writer-hashed(not-recomputed)` for the tier. Content
-   integrity for evidence rows rests on the writer's signed segments.
+   integrity for evidence rows rests on the writer's signed segments. The
+   exemption needs both `tier = 'evidence'` and a `sha256:<hex>` row_hash, and
+   writer-hashed rows are never used to bridge to a checkpoint (their
+   `prev_hash` link cannot be authenticated), so evidence chains anchor only
+   directly on a checkpoint head.
 
 ### Why per writer
 
