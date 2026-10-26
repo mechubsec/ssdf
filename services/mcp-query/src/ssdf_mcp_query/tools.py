@@ -10,6 +10,7 @@ from typing import Any
 
 from .builders import (
     build_host_log_patterns,
+    build_host_log_patterns_count,
     build_host_log_sources,
     build_query_flows,
     build_top_talkers,
@@ -136,11 +137,18 @@ class Tools:
         rows = _wrap_untrusted_columns(rows[:clamped], _ZONE_MATRIX_UNTRUSTED_COLUMNS)
         return {**result, "rows": rows, "row_count": len(rows), "truncated": truncated}
 
-    def host_log_patterns(self, since=None, until=None, min_severity=3, limit=300) -> dict:
-        """Normalized host-log error patterns plus per-sender liveness (two fixed queries)."""
+    def host_log_patterns(
+        self, since=None, until=None, min_severity=3, limit=300, offset=0, host=None
+    ) -> dict:
+        """One page of normalized host-log error patterns plus per-sender liveness."""
         try:
             sql, params = build_host_log_patterns(
-                since=since, until=until, min_severity=min_severity, limit=limit
+                since=since,
+                until=until,
+                min_severity=min_severity,
+                limit=limit,
+                offset=offset,
+                host=host,
             )
         except (BuilderError, TimeParseError, ValueError) as exc:
             return {"error": "validation", "detail": str(exc)}
@@ -148,6 +156,20 @@ class Tools:
         found = self._safe_execute(sql, params, clamped)
         if "rows" not in found:
             return found
+        if found["rows"]:
+            total = found["rows"][0]["total_patterns"]
+        elif offset:
+            # A page past the end has no row to carry count() OVER (); count separately,
+            # over the same resolved window.
+            count_sql, count_params = build_host_log_patterns_count(
+                since=params["since"], until=params["until"], min_severity=min_severity, host=host
+            )
+            counted = self._safe_execute(count_sql, count_params, 1)
+            if "rows" not in counted:
+                return counted
+            total = counted["rows"][0]["total_patterns"] if counted["rows"] else 0
+        else:
+            total = 0
         sources_sql, sources_params = build_host_log_sources()
         senders = self._safe_execute(sources_sql, sources_params, 1000)
         if "rows" not in senders:
@@ -169,7 +191,6 @@ class Tools:
             }
             for row in found["rows"]
         ]
-        total = found["rows"][0]["total_patterns"] if found["rows"] else 0
         sources = [
             {**row, "host": UntrustedText.from_raw(row["host"]).to_response()}
             for row in senders["rows"]
@@ -177,7 +198,7 @@ class Tools:
         return {
             "patterns": patterns,
             "total_patterns": total,
-            "truncated": total > len(patterns),
+            "truncated": total > offset + len(patterns),
             "sources": sources,
         }
 

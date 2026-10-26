@@ -230,6 +230,32 @@ def test_host_log_patterns_truncated_flag():
     assert out["truncated"] is False
 
 
+def test_host_log_patterns_offset_and_host_pass_through():
+    fake = FakeClient(queued_rows=[[_pattern_row(i) for i in range(2)], []])
+    out = Tools(fake, max_rows=1000).host_log_patterns(limit=2, offset=2, host="h1")
+    assert "LIMIT 2 OFFSET 2" in fake.all_sql[0] and len(fake.all_sql) == 2
+    assert out["total_patterns"] == 5 and out["truncated"] is True  # 2 + 2 < 5
+    fake = FakeClient(queued_rows=[[_pattern_row(i) for i in range(2)], []])
+    out = Tools(fake, max_rows=1000).host_log_patterns(limit=2, offset=3)
+    assert out["truncated"] is False  # 3 + 2 == 5: last page
+
+
+def test_host_log_patterns_page_past_end_counts_separately():
+    fake = FakeClient(queued_rows=[[], [{"total_patterns": 7}], [dict(_SENDER)]])
+    out = Tools(fake, max_rows=1000).host_log_patterns(
+        since="2026-10-01T00:00:00Z", until="2026-10-02T00:00:00Z", offset=500
+    )
+    assert len(fake.all_sql) == 3 and fake.all_sql[1].startswith("SELECT count() AS total_patterns")
+    assert out["patterns"] == [] and out["total_patterns"] == 7 and out["truncated"] is False
+    assert len(out["sources"]) == 1
+
+
+def test_host_log_patterns_validation_errors_offset_and_host():
+    tools = Tools(FakeClient(), max_rows=1000)
+    assert tools.host_log_patterns(offset=-1)["error"] == "validation"
+    assert tools.host_log_patterns(host="")["error"] == "validation"
+
+
 def test_host_log_patterns_empty_still_returns_sources():
     out = Tools(FakeClient(queued_rows=[[], [dict(_SENDER)]]), max_rows=1000).host_log_patterns()
     assert out["patterns"] == [] and out["total_patterns"] == 0 and out["truncated"] is False

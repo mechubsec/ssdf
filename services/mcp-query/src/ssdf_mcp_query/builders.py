@@ -9,6 +9,7 @@ MAX_LIMIT = 1000
 TOP_MAX_LIMIT = 100
 ZONE_MATRIX_MAX_LIMIT = 500
 HOST_LOG_PATTERNS_MAX_LIMIT = 500
+HOST_LOG_PATTERNS_MAX_OFFSET = 100_000
 
 FLOW_COLUMNS = [
     "timestamp",
@@ -188,38 +189,67 @@ def _host_log_pattern_expr() -> str:
     return f"substringUTF8(trimBoth(replaceAll({expr}, '<ipv-six>', '<ip6>')), 1, 300)"
 
 
-def build_host_log_patterns(since=None, until=None, min_severity=3, limit=300):
-    """Normalized message patterns from ssdf.host_logs over a window, most frequent first.
-
-    ``total_patterns`` (count() OVER ()) is the group count before LIMIT. Lines of kind
-    crash/unit_failed are kept at any severity; plain errors need severity <= min_severity.
-    """
+def _host_log_lines(since, until, min_severity, host, params):
+    """Filtered, kind-tagged, normalized ssdf.host_logs lines (inner query of both builders)."""
     if isinstance(min_severity, bool) or not isinstance(min_severity, int):
         raise BuilderError("min_severity must be an integer 0-7")
     if not 0 <= min_severity <= 7:
         raise BuilderError("min_severity must be between 0 and 7")
-    params: dict = {"min_severity": min_severity}
-    where = " AND ".join(_window(since, until, params))
-    limit = _clamp(limit, 1, HOST_LOG_PATTERNS_MAX_LIMIT)
+    params["min_severity"] = min_severity
+    conditions = _window(since, until, params)
+    if host is not None:
+        if not isinstance(host, str) or not host:
+            raise BuilderError("host must be a non-empty string")
+        params["host"] = host
+        conditions.append("host = {host:String}")
     kind_expr = (
         "multiIf(unit LIKE 'systemd-coredump%' AND position(message, 'dumped core') > 0, 'crash', "
         "unit IN ('systemd', 'init.scope') "
         "AND match(message, 'Failed with result|entered failed state'), 'unit_failed', 'error')"
     )
-    inner = (
+    return (
         f"SELECT host, source, unit, severity, timestamp, message, {kind_expr} AS kind, "
         f"{_host_log_pattern_expr()} AS pattern "
-        f"FROM ssdf.host_logs WHERE {where} "
+        f"FROM ssdf.host_logs WHERE {' AND '.join(conditions)} "
         "AND (kind != 'error' OR severity <= {min_severity:UInt8})"
     )
+
+
+def build_host_log_patterns(since=None, until=None, min_severity=3, limit=300, offset=0, host=None):
+    """Normalized message patterns from ssdf.host_logs over a window, one page at a time.
+
+    Order is total, so offset paging is stable for a fixed since/until: kind (crash,
+    unit_failed, error), then count desc, then host, unit, pattern, source.
+    ``total_patterns`` (count() OVER ()) is the group count before LIMIT/OFFSET. Lines of
+    kind crash/unit_failed are kept at any severity; plain errors need severity <= min_severity.
+    """
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise BuilderError(f"offset must be an integer 0-{HOST_LOG_PATTERNS_MAX_OFFSET}")
+    if not 0 <= offset <= HOST_LOG_PATTERNS_MAX_OFFSET:
+        raise BuilderError(f"offset must be between 0 and {HOST_LOG_PATTERNS_MAX_OFFSET}")
+    params: dict = {}
+    inner = _host_log_lines(since, until, min_severity, host, params)
+    limit = _clamp(limit, 1, HOST_LOG_PATTERNS_MAX_LIMIT)
     # worst_severity/occurrences avoid aliases that shadow columns/functions; tools.py renames.
     sql = (
         "SELECT host, source, unit, kind, pattern, min(severity) AS worst_severity, "
         "count() AS occurrences, min(timestamp) AS first_seen, max(timestamp) AS last_seen, "
         "any(message) AS sample, count() OVER () AS total_patterns "
         f"FROM ({inner}) GROUP BY host, source, unit, kind, pattern "
-        "ORDER BY occurrences DESC, last_seen DESC, host, source, unit, kind, pattern "
-        f"LIMIT {limit}"
+        "ORDER BY indexOf(['crash', 'unit_failed', 'error'], kind), occurrences DESC, "
+        "host, unit, pattern, source "
+        f"LIMIT {limit} OFFSET {offset}"
+    )
+    return sql, params
+
+
+def build_host_log_patterns_count(since=None, until=None, min_severity=3, host=None):
+    """Pattern-group count for the same filters; used when a page past the end has no rows."""
+    params: dict = {}
+    inner = _host_log_lines(since, until, min_severity, host, params)
+    sql = (
+        "SELECT count() AS total_patterns FROM "
+        f"(SELECT 1 FROM ({inner}) GROUP BY host, source, unit, kind, pattern)"
     )
     return sql, params
 

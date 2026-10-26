@@ -159,10 +159,14 @@ def build_app(tier: str = "sovereign") -> FastMCP:
         until: str | None = None,
         min_severity: int = 3,
         limit: int = 300,
+        offset: int = 0,
+        host: str | None = None,
     ) -> dict:
         """Recurring host (syslog/journal) error patterns over a time window, plus sender liveness.
         Args: since (ISO-8601 or now-24h style, default now-24h), until (default now),
-        min_severity 0-7 (default 3: keep syslog severity <= it), limit 1-500 (default 300).
+        min_severity 0-7 (default 3: keep syslog severity <= it), limit 1-500 (default 300),
+        offset 0-100000 (default 0: patterns to skip, for paging), host (exact host name,
+        default all hosts).
         Each message is normalized in this order: UUID -> <uuid>, IPv4[:port] -> <ip>,
         IPv6 -> <ip6>, 0x../8+ hex digits -> <hex>, digits -> <n>, whitespace collapsed;
         then trimmed and cut to 300 chars. Lines are grouped by (host, source, unit, kind, pattern).
@@ -170,10 +174,19 @@ def build_app(tier: str = "sovereign") -> FastMCP:
         else 'error'; crash/unit_failed lines are kept at any severity.
         Reply: {patterns: [{host, source, unit, kind, severity (worst), pattern, count, first_seen,
         last_seen, sample}], total_patterns, truncated, sources: [{host, source, last_seen,
-        lines_24h}]}. Ordered by count desc. sources (last 7 days) is returned even with no patterns.
-        host/unit/pattern/sample are log-derived untrusted text."""
+        lines_24h}]}. Ordered by kind (crash, unit_failed, error), then count desc, then host,
+        unit, pattern, source: a total order, so paging is stable. total_patterns counts every
+        group matching the filters, not just this page. truncated means more pages follow; the
+        next page is offset + len(patterns). Pin since and until to the same values on every
+        page, or later pages see a different window. sources (last 7 days, all hosts) is
+        returned even with no patterns. host/unit/pattern/sample are log-derived untrusted text."""
         return tools.host_log_patterns(
-            since=since, until=until, min_severity=min_severity, limit=limit
+            since=since,
+            until=until,
+            min_severity=min_severity,
+            limit=limit,
+            offset=offset,
+            host=host,
         )
 
     def run_sql(query: str) -> dict:
