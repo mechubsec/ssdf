@@ -398,17 +398,22 @@ def test_builder_sql_is_accepted_by_clickhouse(ch, name):
 
 # --- host_log_patterns paging ------------------------------------------------
 #
-# host_logs has no tenant column. Isolation instead: hosts unique to this run
-# (cleanup deletes exactly those names) and a window ten years ahead, where no
-# real host log can sit, so a populated server cannot touch the reads either.
-# The window is pinned and absolute, as a paging caller must pin it.
+# host_logs has no tenant column. Isolation instead: fixture rows carry a fixed
+# raw marker AND sit 10 years ahead, a pair no real host log can have, so cleanup
+# can safely purge every run's fixtures, including ones a killed run abandoned,
+# and the future window keeps ambient rows out of the reads. The window is
+# pinned and absolute, as a paging caller must pin it.
 
 _HL_A = f"contract-{uuid.uuid4().hex[:8]}-a"
 _HL_B = _HL_A[:-1] + "b"
 _HL_AT = _NOW + dt.timedelta(days=3650)
 _HL_SINCE = _iso(_HL_AT - dt.timedelta(hours=1))
 _HL_UNTIL = _iso(_HL_AT + dt.timedelta(hours=1))
-_HL_DELETE = f"DELETE FROM ssdf.host_logs WHERE host IN ('{_HL_A}', '{_HL_B}')"
+_HL_MARKER = "ssdf-contract-fixture"
+_HL_DELETE = (
+    f"DELETE FROM ssdf.host_logs WHERE raw = '{_HL_MARKER}' "
+    "AND timestamp > now64(3) + INTERVAL 3000 DAY"
+)
 
 
 @pytest.fixture(scope="module")
@@ -426,7 +431,10 @@ def host_log_rows(raw):
     )
     raw.insert(
         "ssdf.host_logs",
-        [[_HL_AT, host, source, unit, sev, msg, msg] for host, source, unit, sev, msg in lines],
+        [
+            [_HL_AT, host, source, unit, sev, msg, _HL_MARKER]
+            for host, source, unit, sev, msg in lines
+        ],
         column_names=["timestamp", "host", "source", "unit", "severity", "message", "raw"],
     )
     yield
