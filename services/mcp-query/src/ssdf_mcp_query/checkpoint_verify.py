@@ -30,6 +30,12 @@ from dataclasses import dataclass
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+# A checkpoint with this signed row_count is an operator-attested bootstrap
+# (scripts/checkpoint_audit.py --bootstrap): the normal job's counts are
+# running totals >= 1, so 0 never occurs otherwise. row_count is inside the
+# signed digest, so DB-only access cannot turn a normal checkpoint into one.
+BOOTSTRAP_ROW_COUNT = 0
+
 _CHECKPOINT_FIELDS = ("checkpoint_ts", "head_row_hash", "row_count", "server_id", "tier")
 
 
@@ -50,6 +56,13 @@ class Checkpoint:
     checkpoint_ts: str
     signature: str
     key_id: str
+
+
+def is_bootstrap(checkpoint: Checkpoint) -> bool:
+    """Whether ``checkpoint`` carries the bootstrap marker (signed row_count 0).
+
+    Only meaningful for a checkpoint whose signature has verified."""
+    return checkpoint.row_count == BOOTSTRAP_ROW_COUNT
 
 
 def canonical_digest(checkpoint: Checkpoint) -> bytes:

@@ -63,3 +63,6 @@ Rust/Python boundary (`mecmcp-audit::checkpoint::key_id` and
 `ssdf_mcp_query.checkpoint_verify.key_fingerprint`). It identifies which key
 signed a checkpoint; it carries no trust of its own and is never read from
 ClickHouse to select a verification key.
+
+To bootstrap a chain whose genesis expired before checkpointing, see
+[checkpoint-bootstrap.md](checkpoint-bootstrap.md).

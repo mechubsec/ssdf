@@ -12,7 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import checkpoint_audit  # noqa: E402
 from ssdf_mcp_query.audit_chain import compute_row_hash  # noqa: E402
-from ssdf_mcp_query.checkpoint_verify import canonical_digest, key_fingerprint  # noqa: E402
+from ssdf_mcp_query.checkpoint_verify import (  # noqa: E402
+    Checkpoint,
+    canonical_digest,
+    key_fingerprint,
+)
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: E402
     Ed25519PrivateKey,
@@ -661,3 +665,349 @@ def test_main_accepts_a_keyring_of_multiple_paths(monkeypatch, tmp_path):
 
     keyring = checkpoint_audit.load_checkpoint_verifying_keyring()
     assert keyring == {**_keyring(key_a), **_keyring(key_b)}
+
+
+# --- one-time bootstrap (--bootstrap) -----------------------------------------
+
+_BOOT_NOW = dt.datetime(2026, 9, 20, tzinfo=dt.timezone.utc)
+_REAL_SIGN_CHECKPOINT = checkpoint_audit.sign_checkpoint
+
+
+def _real_signer(signing_key):
+    """Stands in for the Rust binary: really signs the payload it is handed."""
+    from ssdf_mcp_query.checkpoint_verify import Checkpoint
+
+    key_id = key_fingerprint(signing_key.public_key().public_bytes_raw())
+
+    def sign(binary, key_path, payload, keyring=None, allow_bootstrap=False):
+        if payload["row_count"] == 0 and not allow_bootstrap:
+            raise RuntimeError("bootstrap refused")
+        unsigned = Checkpoint(**payload, signature="", key_id=key_id)
+        signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
+        return {**payload, "signature": signature, "key_id": key_id}
+
+    return sign
+
+
+def _truncated_client(surviving_count=3, checkpoint_rows=()):
+    """(client, expired_genesis_hash, surviving_hashes) for a chain whose
+    genesis expired before checkpointing was ever enabled."""
+    _, genesis_hash = _audit_row(0, "sovereign", "")
+    tuples, prev, hashes = [], genesis_hash, []
+    for i in range(1, surviving_count + 1):
+        values, prev = _audit_row(i, "sovereign", prev)
+        tuples.append(values)
+        hashes.append(prev)
+    client = _FakeClient(audit_rows=tuples, checkpoint_rows=checkpoint_rows)
+    return client, genesis_hash, hashes
+
+
+def _boot_run(monkeypatch, client, bootstrap=True):
+    key = Ed25519PrivateKey.generate()
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", _real_signer(key))
+    return checkpoint_audit.run(
+        client,
+        "binary",
+        "key",
+        now=_BOOT_NOW,
+        keyring=_keyring(key.public_key().public_bytes_raw()),
+        bootstrap_chains=frozenset({("sovereign", "")}) if bootstrap else frozenset(),
+    ), key
+
+
+def test_bootstrap_signs_row_count_zero_then_a_normal_checkpoint_in_the_same_run(monkeypatch):
+    client, genesis_hash, hashes = _truncated_client(3)
+
+    result, _ = _boot_run(monkeypatch, client)
+
+    assert result.skipped == []
+    boot, normal = result.inserted
+    assert (boot["row_count"], boot["head_row_hash"]) == (0, genesis_hash)
+    assert (normal["row_count"], normal["head_row_hash"]) == (3, hashes[-1])
+    assert normal["checkpoint_ts"] > boot["checkpoint_ts"]
+    assert len(client.inserted) == 2
+
+
+def test_parse_chain_spec():
+    assert checkpoint_audit.parse_chain_spec("sovereign") == ("sovereign", "")
+    assert checkpoint_audit.parse_chain_spec("evidence:junos-1") == ("evidence", "junos-1")
+    with pytest.raises(ValueError):
+        checkpoint_audit.parse_chain_spec(":x")
+
+
+def _assert_refused(monkeypatch, client, capsys, reason):
+    result, _ = _boot_run(monkeypatch, client)
+    assert result.inserted == []
+    assert client.inserted == []
+    assert result.skipped == [("sovereign", "")]
+    assert reason in capsys.readouterr().err
+
+
+def test_bootstrap_refuses_a_chain_that_already_has_a_checkpoint(monkeypatch, capsys):
+    client, genesis_hash, _ = _truncated_client(
+        3, checkpoint_rows=[("sovereign", "", 2, "ab" * 32, "2026-01-01T00:00:00.000Z", "s", "k")]
+    )
+    _assert_refused(monkeypatch, client, capsys, "already has 1 checkpoint")
+
+
+def test_bootstrap_refuses_two_dangling_hashes(monkeypatch, capsys):
+    client, _, hashes = _truncated_client(2)
+    stray, _ = _audit_row(9, "sovereign", "cd" * 32)  # second, unrelated gap
+    client._audit_rows.append(stray)
+    _assert_refused(monkeypatch, client, capsys, "exactly 1 dangling prev_hash, found 2")
+
+
+def test_bootstrap_refuses_a_content_edit(monkeypatch, capsys):
+    client, _, _ = _truncated_client(3)
+    row = dict(zip(checkpoint_audit._ROW_COLUMNS, client._audit_rows[1]))
+    row["tool"] = "TAMPERED"
+    client._audit_rows[1] = tuple(row[c] for c in checkpoint_audit._ROW_COLUMNS)
+    _assert_refused(monkeypatch, client, capsys, "content_edit")
+
+
+def test_bootstrap_refuses_when_the_genesis_is_present(monkeypatch, capsys):
+    genesis, genesis_hash = _audit_row(0, "sovereign", "")
+    child, _ = _audit_row(1, "sovereign", genesis_hash)
+    client = _FakeClient(audit_rows=[genesis, child])
+    _assert_refused(monkeypatch, client, capsys, "genesis row is present")
+
+
+def test_bootstrap_refuses_a_fork_at_the_anchor(monkeypatch, capsys):
+    client, genesis_hash, _ = _truncated_client(2)
+    sibling, _ = _audit_row(7, "sovereign", genesis_hash)
+    client._audit_rows.append(sibling)
+    _assert_refused(monkeypatch, client, capsys, "fork")
+
+
+def test_without_bootstrap_flag_an_unverifiable_truncated_chain_is_skipped_not_anchored(
+    monkeypatch,
+):
+    client, _, _ = _truncated_client(3)
+    result, _ = _boot_run(monkeypatch, client, bootstrap=False)
+    assert result.inserted == [] and result.skipped == [("sovereign", "")]
+
+
+def test_job_never_emits_row_count_zero_without_bootstrap(monkeypatch):
+    # Normal runs sign counts >= 1 ...
+    _, genesis_hash = _audit_row(0, "sovereign", "")
+    child, _ = _audit_row(1, "sovereign", genesis_hash)
+    genesis, _ = _audit_row(0, "sovereign", "")
+    client = _FakeClient(audit_rows=[genesis, child])
+    result, key = _boot_run(monkeypatch, client, bootstrap=False)
+    assert [c["row_count"] for c in result.inserted] == [2]
+
+    # ... and the signer wrapper refuses a zero even if the orchestrator were to produce one.
+    with pytest.raises(RuntimeError, match="without --bootstrap"):
+        _REAL_SIGN_CHECKPOINT(
+            "binary",
+            "key",
+            {
+                "tier": "sovereign",
+                "server_id": "",
+                "row_count": 0,
+                "head_row_hash": "x",
+                "checkpoint_ts": "2026-09-20T00:00:00.000Z",
+            },
+        )
+    from ssdf_mcp_query import checkpoint_orchestrator as orch
+
+    monkeypatch.setattr(
+        checkpoint_audit,
+        "compute_next_checkpoint",
+        lambda rows, previous: orch.PendingCheckpoint("sovereign", "", 0, "h"),
+    )
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", _REAL_SIGN_CHECKPOINT)
+    client2 = _FakeClient(audit_rows=[genesis, child])
+    with pytest.raises(RuntimeError, match="without --bootstrap"):
+        checkpoint_audit.run(
+            client2,
+            "binary",
+            "key",
+            now=_BOOT_NOW,
+            keyring=_keyring(key.public_key().public_bytes_raw()),
+        )
+    assert client2.inserted == []
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+def _signed_boot_row(key, head, ts="2026-09-19T00:00:00.000Z", tier="sovereign", server_id=""):
+    payload = {
+        "tier": tier,
+        "server_id": server_id,
+        "row_count": 0,
+        "head_row_hash": head,
+        "checkpoint_ts": ts,
+    }
+    signed = _real_signer(key)("b", "k", payload, allow_bootstrap=True)
+    return tuple(signed[c] for c in checkpoint_audit._CHECKPOINT_COLUMNS)
+
+
+def test_next_plain_run_recovers_when_the_bootstrap_follow_up_failed(monkeypatch):
+    """Bootstrap inserted, ordinary checkpoint never was: the next normal run
+    (no --bootstrap) must verify through the honoured bootstrap and sign it."""
+    key = Ed25519PrivateKey.generate()
+    client, genesis_hash, hashes = _truncated_client(3)
+    client._checkpoint_rows = [_signed_boot_row(key, genesis_hash)]
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", _real_signer(key))
+
+    result = checkpoint_audit.run(
+        client,
+        "binary",
+        "key",
+        now=_BOOT_NOW,
+        keyring=_keyring(key.public_key().public_bytes_raw()),
+    )
+
+    assert result.skipped == []
+    assert [(c["row_count"], c["head_row_hash"]) for c in result.inserted] == [(3, hashes[-1])]
+
+
+def test_bootstrap_refuses_evidence_tier_chains(monkeypatch, capsys):
+    args = json.dumps({"server_id": "srv"})
+    _, prev = _audit_row(0, "evidence", "", args=args)
+    tuples = []
+    for i in (1, 2):
+        values, prev = _audit_row(i, "evidence", prev, args=args)
+        tuples.append(values)
+    client = _FakeClient(audit_rows=tuples)
+    key = Ed25519PrivateKey.generate()
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", _real_signer(key))
+
+    result = checkpoint_audit.run(
+        client,
+        "b",
+        "k",
+        now=_BOOT_NOW,
+        keyring=_keyring(key.public_key().public_bytes_raw()),
+        bootstrap_chains=frozenset({("evidence", "srv")}),
+    )
+
+    assert client.inserted == [] and result.skipped == [("evidence", "srv")]
+    assert "evidence-tier chains cannot be bootstrapped" in capsys.readouterr().err
+
+
+def test_fetch_evidence_window_reaches_back_to_a_bootstrap():
+    seen = {}
+
+    class _Recording(_FakeClient):
+        def query(self, sql, parameters=None):
+            seen.update(parameters or {})
+            return super().query(sql, parameters)
+
+    now = dt.datetime(2026, 12, 20, tzinfo=dt.timezone.utc)
+    key = Ed25519PrivateKey.generate()
+    ring = _keyring(key.public_key().public_bytes_raw())
+    boot = Checkpoint(*_signed_boot_row(key, "ab" * 32))
+    forged = Checkpoint("sovereign", "", 0, "h", "0001-01-01T00:00:00.000Z", "s", "k")
+
+    checkpoint_audit.fetch_evidence_rows_by_chain(_Recording(), now, [boot], ring)
+    assert seen["since"] == dt.datetime(2026, 6, 19, tzinfo=dt.timezone.utc)
+    default = now - dt.timedelta(days=120)
+    # Unverified (no keyring) or forged rows never widen the window or raise.
+    checkpoint_audit.fetch_evidence_rows_by_chain(_Recording(), now, [boot])
+    assert seen["since"] == default
+    checkpoint_audit.fetch_evidence_rows_by_chain(_Recording(), now, [forged], ring)
+    assert seen["since"] == default
+
+
+def test_dry_run_probes_the_signer_once_and_never_inserts(monkeypatch):
+    client, genesis_hash, hashes = _truncated_client(3)
+    key = Ed25519PrivateKey.generate()
+    probes = []
+    real = _real_signer(key)
+
+    def counting_signer(binary, key_path, payload, **kwargs):
+        probes.append(payload)
+        return real(binary, key_path, payload, **kwargs)
+
+    def no_insert(*a, **k):
+        raise AssertionError("dry run must not insert")
+
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", counting_signer)
+    monkeypatch.setattr(checkpoint_audit, "insert_checkpoint", no_insert)
+
+    result = checkpoint_audit.run(
+        client,
+        "b",
+        "k",
+        now=_BOOT_NOW,
+        keyring=_keyring(key.public_key().public_bytes_raw()),
+        bootstrap_chains=frozenset({("sovereign", "")}),
+        dry_run=True,
+    )
+
+    assert [p["tier"] for p in probes] == ["dry-run"]
+    assert result.skipped == [] and result.inserted == [] and client.inserted == []
+    assert result.planned == [
+        (("sovereign", ""), 0, genesis_hash, True),
+        (("sovereign", ""), 3, hashes[-1], False),
+    ]
+
+
+def test_dry_run_fails_when_the_signer_check_fails(monkeypatch):
+    client, _, _ = _truncated_client(3)
+    key = Ed25519PrivateKey.generate()
+
+    def broken(*a, **k):
+        raise RuntimeError("could not run 'b': no such file")
+
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", broken)
+    with pytest.raises(RuntimeError, match="dry-run signer check failed: could not run"):
+        checkpoint_audit.run(
+            client,
+            "b",
+            "k",
+            now=_BOOT_NOW,
+            keyring=_keyring(key.public_key().public_bytes_raw()),
+            dry_run=True,
+        )
+    assert client.inserted == []
+
+
+def test_dry_run_fails_when_the_signing_key_is_not_in_the_keyring(monkeypatch):
+    client, _, _ = _truncated_client(3)
+    signing_key = Ed25519PrivateKey.generate()
+    other_ring = _keyring(Ed25519PrivateKey.generate().public_key().public_bytes_raw())
+    # The real sign_checkpoint, with a stub subprocess standing in for the binary.
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", _REAL_SIGN_CHECKPOINT)
+
+    class _Proc:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, payload):
+            signed = _real_signer(signing_key)("b", "k", payload)
+            self.stdout = json.dumps(signed)
+
+    monkeypatch.setattr(
+        checkpoint_audit.subprocess,
+        "run",
+        lambda cmd, input, **k: _Proc(json.loads(input)),
+    )
+    with pytest.raises(RuntimeError, match="dry-run signer check failed"):
+        checkpoint_audit.run(client, "b", "k", now=_BOOT_NOW, keyring=other_ring, dry_run=True)
+
+
+def test_dry_run_reports_a_refusal_as_skipped(monkeypatch):
+    client, _, _ = _truncated_client(2)
+    client._audit_rows.append(_audit_row(9, "sovereign", "cd" * 32)[0])  # 2nd gap
+    key = Ed25519PrivateKey.generate()
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", _real_signer(key))
+    result = checkpoint_audit.run(
+        client,
+        "b",
+        "k",
+        now=_BOOT_NOW,
+        keyring=_keyring(key.public_key().public_bytes_raw()),
+        bootstrap_chains=frozenset({("sovereign", "")}),
+        dry_run=True,
+    )
+    assert result.skipped == [("sovereign", "")] and result.planned == []
+
+
+def test_report_counts_distinct_chains_not_inserted_rows():
+    row = {"tier": "sovereign", "server_id": "", "row_count": 0, "head_row_hash": "ab" * 32}
+    result = checkpoint_audit.RunResult(inserted=[row, {**row, "row_count": 3}])
+    assert checkpoint_audit.format_report(result, False)[-1].startswith("1 chain(s) checkpointed")

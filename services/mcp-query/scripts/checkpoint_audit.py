@@ -39,11 +39,31 @@ genesis has expired, rather than fail closed up front.
 docs/checkpoint-key-rotation.md for the rotation procedure and the overlap
 window it requires.
 
+One-time bootstrap (``--bootstrap CHAIN``, CHAIN = ``TIER`` or
+``TIER:SERVER_ID``): a chain whose genesis expired BEFORE checkpointing was
+enabled can never self-verify, so this job would never sign it. For the named
+chain only (never an evidence-tier chain: writer-hashed rows are not bridge
+material, so the anchor would not survive the next TTL turnover), and only if
+it has no checkpoints, no genesis, exactly one
+dangling prev_hash D, no integrity finding beyond that gap, and every row
+reachable forward from D, the job signs a checkpoint with ``row_count == 0``
+(the signed bootstrap marker; normal checkpoints are >= 1) and
+``head_row_hash == D``, then continues in the same run with an ordinary
+checkpoint. Any failed precondition prints its reason, signs nothing for that
+chain and makes the run exit non-zero. The anchor is attested by the
+operator, not proven -- see docs/checkpoint-bootstrap.md. Without
+``--bootstrap`` the job never signs ``row_count == 0``. ``--dry-run`` validates the
+chains, the bootstrap preconditions and the signer, key and keyring (one
+throwaway probe signature, never inserted), printing what it would sign; it
+exits non-zero if anything would be refused or the signer check fails. It does
+not test the database INSERT grant.
+
 Usage (from services/mcp-query, where the package is installed):
     export CH_HOST=... CH_CHECKPOINT_PASSWORD=...
     export CHECKPOINT_SIGNING_KEY_PATH=/etc/ssdf/checkpoint-signing.key
     export CH_CHECKPOINT_VERIFY_KEY_PATHS=/etc/ssdf/checkpoint-verify.key
-    uv run python scripts/checkpoint_audit.py [--binary mecmcp-audit-checkpoint]
+    uv run python scripts/checkpoint_audit.py [--binary mecmcp-audit-checkpoint] \\
+        [--bootstrap TIER[:SERVER_ID]]...
 """
 
 from __future__ import annotations
@@ -55,22 +75,25 @@ import os
 import subprocess
 import sys
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from ssdf_common.config import ConfigError, require_tls_or_loopback
 from ssdf_mcp_query.checkpoint_orchestrator import (
     ForkDetectedError,
+    PendingCheckpoint,
     compute_next_checkpoint,
     rows_unreachable_from_previous,
 )
 from ssdf_mcp_query.checkpoint_verify import (
+    BOOTSTRAP_ROW_COUNT,
     Checkpoint,
     CheckpointVerificationError,
     checkpoint_verify_key_paths_from_env,
     load_verifying_keyring,
     verify_checkpoint_signature_from_keyring,
 )
-from ssdf_mcp_query.verify_audit import group_key, verify_tier
+from ssdf_mcp_query.verify_audit import bridge_window_start, group_key, verify_tier
 
 # Same shape verify_audit.py reads (_VERIFY_COLUMNS): compute_next_checkpoint
 # only needs tier/args/prev_hash/row_hash, but verify_tier's content-integrity
@@ -114,6 +137,8 @@ class RunResult:
     """What one `run()` invocation did, per chain."""
 
     inserted: list[dict] = field(default_factory=list)
+    # --dry-run: what would have been signed, as (chain, row_count, head, is_bootstrap).
+    planned: list[tuple[tuple[str, str], int, str, bool]] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
@@ -141,14 +166,19 @@ def fetch_rows_by_chain(client) -> dict[tuple[str, str], list[dict]]:
 _EVIDENCE_BRIDGE_LOOKBACK_DAYS = 120
 
 
-def fetch_evidence_rows_by_chain(client, now: dt.datetime) -> dict[tuple[str, str], list[dict]]:
+def fetch_evidence_rows_by_chain(
+    client,
+    now: dt.datetime,
+    checkpoints: Iterable[Checkpoint] = (),
+    keyring: dict[str, bytes] | None = None,
+) -> dict[tuple[str, str], list[dict]]:
     """Each chain's evidence-tier rows available as bridge material for
     self-verification, grouped the same way as `fetch_rows_by_chain`.
     Requires `ssdf_checkpoint` to hold SELECT on `ssdf.audit_evidence`
     (022_audit_checkpoints.sql / 023_audit_evidence.sql)."""
     if now.tzinfo is None:
         now = now.replace(tzinfo=dt.timezone.utc)
-    since = now - dt.timedelta(days=_EVIDENCE_BRIDGE_LOOKBACK_DAYS)
+    since = bridge_window_start(now, checkpoints, keyring)
     res = client.query(
         f"SELECT {', '.join(_ROW_COLUMNS)} FROM ssdf.audit_evidence "
         "WHERE ts >= {since:DateTime64(3)} ORDER BY ts ASC",
@@ -246,6 +276,7 @@ def sign_checkpoint(
     key_path: str,
     payload: dict,
     keyring: dict[str, bytes] | None = None,
+    allow_bootstrap: bool = False,
 ) -> dict:
     """Shell out to the Rust signer. Deterministic, no model in the loop.
 
@@ -260,7 +291,14 @@ def sign_checkpoint(
     signature must itself verify -- a buggy or compromised signer producing
     output that merely *parses* like a checkpoint must not reach the insert
     path either.
+
+    A ``row_count == BOOTSTRAP_ROW_COUNT`` payload is refused unless the caller
+    passes ``allow_bootstrap`` (only the ``--bootstrap`` path does).
     """
+    if payload.get("row_count") == BOOTSTRAP_ROW_COUNT and not allow_bootstrap:
+        raise RuntimeError(
+            "refusing to sign a row_count=0 (bootstrap) checkpoint without --bootstrap"
+        )
     try:
         proc = subprocess.run(
             [binary, key_path],
@@ -314,12 +352,98 @@ def insert_checkpoint(client, signed: dict) -> None:
     )
 
 
+def parse_chain_spec(spec: str) -> tuple[str, str]:
+    """``TIER`` -> (TIER, '') or ``TIER:SERVER_ID`` -> (TIER, SERVER_ID)."""
+    tier, _, server_id = spec.partition(":")
+    if not tier:
+        raise ValueError(f"invalid chain {spec!r}: expected TIER or TIER:SERVER_ID")
+    return tier, server_id
+
+
+def bootstrap_anchor(
+    chain_tier: str,
+    rows: list[dict],
+    checkpoints: list[Checkpoint],
+    bridge_rows: list[dict],
+    keyring: dict[str, bytes] | None,
+    now: dt.datetime,
+) -> tuple[str | None, str]:
+    """Check the bootstrap preconditions for one chain. Returns
+    ``(dangling_hash, "")`` when all hold, else ``(None, reason)``."""
+    if chain_tier == "evidence":
+        return None, (
+            "evidence-tier chains cannot be bootstrapped: writer-hashed rows are never "
+            "bridge material, so the anchor would fail at the next TTL turnover"
+        )
+    if checkpoints:
+        return None, f"chain already has {len(checkpoints)} checkpoint(s); bootstrap is one-time"
+    if not rows:
+        return None, "chain has no rows"
+    if any(r["prev_hash"] == "" for r in rows):
+        return None, "chain's genesis row is present; no bootstrap needed"
+    row_hashes = {r["row_hash"] for r in rows}
+    dangling = {r["prev_hash"] for r in rows if r["prev_hash"] not in row_hashes}
+    if len(dangling) != 1:
+        return None, f"expected exactly 1 dangling prev_hash, found {len(dangling)}"
+    (anchor,) = dangling
+    issues = verify_tier(
+        rows,
+        checkpoints=[],
+        bridge_rows=bridge_rows,
+        keyring=keyring,
+        now=now,
+        check_freshness=False,
+    )
+    other = sorted({i["type"] for i in issues} - {"missing_predecessor", "unreachable"})
+    if other:
+        return None, f"chain has integrity finding(s) beyond the gap: {', '.join(other)}"
+    gap_rows = {r["row_hash"] for r in rows if r["prev_hash"] == anchor}
+    if {i["row_hash"] for i in issues if i["type"] == "missing_predecessor"} != gap_rows:
+        return None, "missing_predecessor is not solely the row(s) naming the dangling hash"
+    children: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        children[r["prev_hash"]].append(r)
+    reached: set[str] = set()
+    stack = list(children[anchor])
+    while stack:
+        r = stack.pop()
+        if r["row_hash"] in reached:
+            continue
+        reached.add(r["row_hash"])
+        stack.extend(children[r["row_hash"]])
+    if reached != row_hashes:
+        return None, f"{len(row_hashes - reached)} row(s) not reachable forward from the anchor"
+    return anchor, ""
+
+
+def probe_signer(
+    binary: str, key_path: str, now: dt.datetime, keyring: dict[str, bytes] | None
+) -> None:
+    """Dry-run only: sign a throwaway payload with the real signer and key and
+    verify it against the keyring (``sign_checkpoint`` does both). Nothing is
+    inserted. Raises RuntimeError with the reason on any failure. Does NOT test
+    the database INSERT grant."""
+    payload = {
+        "tier": "dry-run",
+        "server_id": "",
+        "row_count": 1,
+        "head_row_hash": "0" * 64,
+        "checkpoint_ts": format_checkpoint_ts(now),
+    }
+    try:
+        sign_checkpoint(binary, key_path, payload, keyring=keyring)
+    except RuntimeError as exc:
+        raise RuntimeError(f"dry-run signer check failed: {exc}") from exc
+
+
 def run(
     client,
     binary: str,
     key_path: str,
     now: dt.datetime | None = None,
     keyring: dict[str, bytes] | None = None,
+    bootstrap_chains: frozenset[tuple[str, str]] = frozenset(),
+    dry_run: bool = False,
 ) -> RunResult:
     """Checkpoint every chain that has rows newer than its last checkpoint.
 
@@ -330,26 +454,80 @@ def run(
     the only remedy for a stale one, so this job cannot be the thing that
     checkpoint freshness is enforced against, or a chain that falls behind
     schedule could never be caught back up.
+
+    A chain in ``bootstrap_chains`` first gets its one-time bootstrap
+    checkpoint (see :func:`bootstrap_anchor`); the normal pass then runs on it
+    in the same call, one millisecond later so the ordinary checkpoint is
+    strictly after the bootstrap.
+
+    ``dry_run`` does every fetch, check and computation, signs one throwaway
+    probe payload to validate the signer, key and keyring, and inserts nothing;
+    ``RunResult.planned`` lists what would be signed.
     """
     now = now or dt.datetime.now(dt.timezone.utc)
+    if dry_run:
+        probe_signer(binary, key_path, now, keyring)
     rows_by_chain = fetch_rows_by_chain(client)
     previous_by_chain = fetch_previous_checkpoints(client)
     checkpoints_by_chain = fetch_checkpoints_by_chain(client)
-    evidence_by_chain = fetch_evidence_rows_by_chain(client, now)
+    evidence_by_chain = fetch_evidence_rows_by_chain(
+        client, now, [c for cps in checkpoints_by_chain.values() for c in cps], keyring
+    )
     result = RunResult()
     # Walk every chain that has EITHER surviving rows OR a checkpoint, not
     # just `rows_by_chain`'s keys -- a chain whose rows were all removed
     # from ssdf.audit has no entry there, and skipping it would also skip
     # the head_unreachable backstop below for it.
-    all_chains = set(rows_by_chain) | set(checkpoints_by_chain)
+    all_chains = set(rows_by_chain) | set(checkpoints_by_chain) | set(bootstrap_chains)
     for chain in sorted(all_chains):
         rows = rows_by_chain.get(chain, [])
+        chain_now = now
+        if chain in bootstrap_chains:
+            anchor, reason = bootstrap_anchor(
+                chain[0],
+                rows,
+                checkpoints_by_chain.get(chain, []),
+                evidence_by_chain.get(chain, []),
+                keyring,
+                now,
+            )
+            if anchor is None:
+                print(
+                    f"refusing to bootstrap chain tier={chain[0]} server={chain[1]!r}: {reason}",
+                    file=sys.stderr,
+                )
+                result.skipped.append(chain)
+                continue
+            pending = PendingCheckpoint(chain[0], chain[1], BOOTSTRAP_ROW_COUNT, anchor)
+            if dry_run:
+                result.planned.append((chain, BOOTSTRAP_ROW_COUNT, anchor, True))
+                follow_up = compute_next_checkpoint(
+                    rows, {"row_count": BOOTSTRAP_ROW_COUNT, "head_row_hash": anchor}
+                )
+                if follow_up is not None:
+                    result.planned.append(
+                        (chain, follow_up.row_count, follow_up.head_row_hash, False)
+                    )
+                continue
+            boot = sign_checkpoint(
+                binary, key_path, build_payload(pending, now), keyring=keyring, allow_bootstrap=True
+            )
+            insert_checkpoint(client, boot)
+            result.inserted.append(boot)
+            checkpoints_by_chain[chain] = [Checkpoint(**{c: boot[c] for c in _CHECKPOINT_COLUMNS})]
+            previous_by_chain[chain] = boot
+            chain_now = now + dt.timedelta(milliseconds=1)
+            print(
+                f"bootstrapped chain tier={chain[0]} server={chain[1]!r}: anchor "
+                f"{anchor[:16]}… is ATTESTED by the operator, not proven",
+                file=sys.stderr,
+            )
         issues = verify_tier(
             rows,
             checkpoints=checkpoints_by_chain.get(chain, []),
             bridge_rows=evidence_by_chain.get(chain, []),
             keyring=keyring,
-            now=now,
+            now=chain_now,
             check_freshness=False,
         )
         # premature_truncation (the bridge-row-ts trigger) is informational:
@@ -421,10 +599,44 @@ def run(
                 )
                 result.skipped.append(chain)
             continue
-        signed = sign_checkpoint(binary, key_path, build_payload(pending, now), keyring=keyring)
+        if dry_run:
+            result.planned.append((chain, pending.row_count, pending.head_row_hash, False))
+            continue
+        signed = sign_checkpoint(
+            binary, key_path, build_payload(pending, chain_now), keyring=keyring
+        )
         insert_checkpoint(client, signed)
         result.inserted.append(signed)
     return result
+
+
+def format_report(result: RunResult, dry_run: bool) -> list[str]:
+    """Human-readable result lines. The count is of distinct chains: a bootstrap
+    run inserts two rows (bootstrap + ordinary) for one chain."""
+    lines = []
+    for chain, row_count, head, is_boot in result.planned:
+        writer = f" server={chain[1]}" if chain[1] else ""
+        kind = "BOOTSTRAP" if is_boot else "checkpoint"
+        lines.append(
+            f"would sign {kind} tier={chain[0]}{writer} row_count={row_count} head={head[:16]}…"
+        )
+    for cp in result.inserted:
+        writer = f" server={cp['server_id']}" if cp["server_id"] else ""
+        lines.append(
+            f"checkpointed tier={cp['tier']}{writer} "
+            f"row_count={cp['row_count']} head={cp['head_row_hash'][:16]}…"
+        )
+    if dry_run:
+        chains = {c for c, *_ in result.planned}
+        verb = (
+            "would be checkpointed (dry run: nothing inserted; the signer was "
+            "probed once with a throwaway payload)"
+        )
+    else:
+        chains = {(cp["tier"], cp["server_id"]) for cp in result.inserted}
+        verb = "checkpointed"
+    lines.append(f"{len(chains)} chain(s) {verb}, {len(result.skipped)} skipped")
+    return lines
 
 
 def main() -> int:
@@ -434,7 +646,28 @@ def main() -> int:
         default=os.environ.get("CHECKPOINT_SIGNER_BIN", "mecmcp-audit-checkpoint"),
         help="path to the mecmcp-audit-checkpoint binary",
     )
+    parser.add_argument(
+        "--bootstrap",
+        action="append",
+        default=[],
+        metavar="CHAIN",
+        help="one-time operator-attested bootstrap for TIER or TIER:SERVER_ID "
+        "(chain whose genesis expired before checkpointing; see module docstring)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate chains, bootstrap preconditions and the signer/key/keyring (one "
+        "throwaway probe signature) and print what would be signed; inserts nothing and "
+        "does not test the database INSERT grant. Non-zero if anything would be refused "
+        "or the signer check fails",
+    )
     args = parser.parse_args()
+    try:
+        bootstrap_chains = frozenset(parse_chain_spec(spec) for spec in args.bootstrap)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     key_path = os.environ.get("CHECKPOINT_SIGNING_KEY_PATH")
     password = os.environ.get("CH_CHECKPOINT_PASSWORD")
@@ -483,18 +716,20 @@ def main() -> int:
     )
 
     try:
-        result = run(client, args.binary, key_path, keyring=keyring)
+        result = run(
+            client,
+            args.binary,
+            key_path,
+            keyring=keyring,
+            bootstrap_chains=bootstrap_chains,
+            dry_run=args.dry_run,
+        )
     except RuntimeError as exc:
         print(f"checkpointing failed: {exc}", file=sys.stderr)
         return 1
 
-    for cp in result.inserted:
-        writer = f" server={cp['server_id']}" if cp["server_id"] else ""
-        print(
-            f"checkpointed tier={cp['tier']}{writer} "
-            f"row_count={cp['row_count']} head={cp['head_row_hash'][:16]}…"
-        )
-    print(f"{len(result.inserted)} chain(s) checkpointed, {len(result.skipped)} skipped")
+    for line in format_report(result, args.dry_run):
+        print(line)
     return 1 if result.skipped else 0
 
 

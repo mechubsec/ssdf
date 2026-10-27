@@ -155,3 +155,16 @@ def test_evidence_chain_carries_its_writer_id():
     assert cp.tier == "evidence"
     assert cp.server_id == "rustsdcmcp-606"
     assert cp.row_count == 1
+
+
+def test_next_checkpoint_walks_from_an_absent_bootstrap_head():
+    """A bootstrap checkpoint's head (the expired predecessor) is not in
+    ``rows`` and its signed row_count is 0; the walk must start there anyway."""
+    expired = _chain(1)
+    rows = _chain(3, first_prev=expired[-1]["row_hash"])
+    previous = {"row_count": 0, "head_row_hash": expired[-1]["row_hash"]}
+
+    pending = compute_next_checkpoint(rows, previous)
+
+    assert pending is not None
+    assert (pending.row_count, pending.head_row_hash) == (3, rows[-1]["row_hash"])
