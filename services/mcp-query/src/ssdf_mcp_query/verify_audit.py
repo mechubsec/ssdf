@@ -69,6 +69,7 @@ import json
 import re
 import sys
 from collections import defaultdict
+from collections.abc import Iterable
 
 from .audit_chain import compute_row_hash
 from .checkpoint_verify import (
@@ -457,17 +458,24 @@ def _bootstrap_checkpoints(
     verified_checkpoints: list[Checkpoint],
 ) -> tuple[frozenset[Checkpoint], list[dict]]:
     """Split verified bootstrap checkpoints into the one that may be honoured
-    (it is the chain's EARLIEST verified checkpoint) and ``invalid_bootstrap``
+    (it is the chain's EARLIEST verified checkpoint and not evidence-tier) and ``invalid_bootstrap``
     issues for every other. A bootstrap vouches for rows expired before
     checkpointing began, so it can only ever be the first checkpoint."""
     if not verified_checkpoints:
         return frozenset(), []
     earliest = min(verified_checkpoints, key=_checkpoint_order)
-    honoured = frozenset([earliest]) if is_bootstrap(earliest) else frozenset()
+    # Evidence rows carry writer hashes and are never bridge material
+    # (_content_recomputable), so an evidence bootstrap could not outlive its
+    # first TTL turnover: never honour one.
+    honoured = (
+        frozenset([earliest])
+        if is_bootstrap(earliest) and earliest.tier != "evidence"
+        else frozenset()
+    )
     issues = [
         {"type": "invalid_bootstrap", "row_hash": c.head_row_hash}
         for c in verified_checkpoints
-        if is_bootstrap(c) and c is not earliest
+        if is_bootstrap(c) and c not in honoured
     ]
     return honoured, issues
 
@@ -640,6 +648,14 @@ def verify_tier_detailed(
     verified_checkpoints = _verified_checkpoints(list(checkpoints), keyring)
     honoured_bootstraps, bootstrap_issues = _bootstrap_checkpoints(verified_checkpoints)
     issues.extend(bootstrap_issues)
+    # A bootstrap's head is exempt from presence checks, so with no ordinary
+    # checkpoint behind it and no rows at all, deleting everything would read
+    # as clean. (With rows present, partial deletion is missing_predecessor.)
+    if not rows and verified_checkpoints and all(is_bootstrap(c) for c in verified_checkpoints):
+        issues.extend(
+            {"type": "checkpoint_head_missing", "row_hash": c.head_row_hash}
+            for c in honoured_bootstraps
+        )
     issues.extend(
         _checkpoint_head_issues(
             list(checkpoints), by_hash, bridge_by_hash, keyring, now, honoured_bootstraps
@@ -754,12 +770,33 @@ def _fetch_rows(config) -> list[dict]:
 _EVIDENCE_BRIDGE_LOOKBACK_DAYS = 120
 
 
-def _fetch_evidence_rows(config, now: dt.datetime) -> dict[tuple[str, str], list[dict]]:
+def bridge_window_start(now: dt.datetime, checkpoints: Iterable[Checkpoint]) -> dt.datetime:
+    """Earliest ``ts`` to load from ``ssdf.audit_evidence`` as bridge material.
+
+    Normally ``now`` minus ``_EVIDENCE_BRIDGE_LOOKBACK_DAYS``. A bootstrapped
+    chain must still bridge back to the bootstrap head D; the archived rows
+    between were already in ssdf.audit at bootstrap time, so are at most
+    ``_AUDIT_TTL_DAYS + _CHECKPOINT_INTERVAL_SLACK_DAYS`` older than the
+    bootstrap's ``checkpoint_ts``. Widen the window to cover the earliest one
+    (an unparsable ``checkpoint_ts`` is skipped; it cannot anchor anything).
+    """
+    start = now - dt.timedelta(days=_EVIDENCE_BRIDGE_LOOKBACK_DAYS)
+    reach = dt.timedelta(days=_AUDIT_TTL_DAYS + _CHECKPOINT_INTERVAL_SLACK_DAYS)
+    for checkpoint in checkpoints:
+        if not is_bootstrap(checkpoint):
+            continue
+        try:
+            start = min(start, _parse_checkpoint_ts(checkpoint.checkpoint_ts) - reach)
+        except ValueError:
+            continue
+    return start
+
+
+def _fetch_evidence_rows(config, since: dt.datetime) -> dict[tuple[str, str], list[dict]]:
     """This chain's evidence-tier rows available as bridge material, grouped
     the same way as ``_fetch_rows``. Requires ``ssdf_audit_verify`` to hold
     SELECT on ``ssdf.audit_evidence`` (022_audit_checkpoints.sql /
     023_audit_evidence.sql)."""
-    since = now - dt.timedelta(days=_EVIDENCE_BRIDGE_LOOKBACK_DAYS)
     client = _make_client(config)
     res = client.query(
         f"SELECT {', '.join(_VERIFY_COLUMNS)} FROM ssdf.audit_evidence "
@@ -819,7 +856,10 @@ def main() -> int:
     checkpoints_by_chain = _fetch_checkpoints(config)
     keyring = _load_verifying_keyring(config)
     now = dt.datetime.now(dt.timezone.utc)
-    evidence_by_chain = _fetch_evidence_rows(config, now)
+    evidence_by_chain = _fetch_evidence_rows(
+        config,
+        bridge_window_start(now, [c for cps in checkpoints_by_chain.values() for c in cps]),
+    )
     by_chain: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for r in rows:
         by_chain[group_key(r)].append(r)

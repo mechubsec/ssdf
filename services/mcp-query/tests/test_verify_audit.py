@@ -1367,3 +1367,86 @@ def test_main_notes_attested_anchor_without_reporting_an_issue(monkeypatch, caps
     assert verify_audit.main() == 0
     out = capsys.readouterr().out
     assert f"anchor=attested({_BOOTSTRAP_TS}) OK" in out
+
+
+def test_lone_bootstrap_with_every_row_deleted_is_not_clean():
+    key, ring = _bootstrap_keys()
+    expired, _ = _truncated_chain()
+    head = expired[-1]["row_hash"]
+    bootstrap = _signed_checkpoint(key, head, _BOOTSTRAP_TS, row_count=0)
+    issues = verify_tier([], checkpoints=[bootstrap], keyring=ring, now=_BOOTSTRAP_NOW)
+    assert {"type": "checkpoint_head_missing", "row_hash": head} in issues
+
+    # Once an ordinary verified checkpoint follows, the rule no longer applies.
+    later = _signed_checkpoint(key, "cd" * 32, "2026-09-19T01:00:00.000Z", row_count=2)
+    issues = verify_tier([], checkpoints=[bootstrap, later], keyring=ring, now=_BOOTSTRAP_NOW)
+    assert {"type": "checkpoint_head_missing", "row_hash": head} not in issues
+
+
+def _signed_checkpoint_for(signing_key, tier, server_id, head, ts, row_count):
+    from ssdf_mcp_query.checkpoint_verify import canonical_digest
+
+    unsigned = Checkpoint(
+        tier=tier,
+        server_id=server_id,
+        row_count=row_count,
+        head_row_hash=head,
+        checkpoint_ts=ts,
+        signature="",
+        key_id=key_fingerprint(signing_key.public_key().public_bytes_raw()),
+    )
+    signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
+    return Checkpoint(**{**unsigned.__dict__, "signature": signature})
+
+
+def test_evidence_tier_bootstrap_is_never_honoured():
+    key, ring = _bootstrap_keys()
+    expired = _evidence_chain(2, "srv")
+    surviving = _evidence_chain(2, "srv", first_prev=expired[-1]["row_hash"])
+    bootstrap = _signed_checkpoint_for(
+        key, "evidence", "srv", expired[-1]["row_hash"], _BOOTSTRAP_TS, 0
+    )
+    types = {
+        i["type"]
+        for i in verify_tier(surviving, checkpoints=[bootstrap], keyring=ring, now=_BOOTSTRAP_NOW)
+    }
+    assert {"invalid_bootstrap", "missing_predecessor"} <= types
+
+    # The same shape on the sovereign tier IS honoured.
+    sov = _signed_checkpoint_for(key, "sovereign", "", expired[-1]["row_hash"], _BOOTSTRAP_TS, 0)
+    sov_rows = _evidence_chain(2, "srv", first_prev=expired[-1]["row_hash"])
+    assert verify_tier(sov_rows, checkpoints=[sov], keyring=ring, now=_BOOTSTRAP_NOW) == []
+
+
+def test_bridge_window_start_widens_to_reach_a_bootstrap_head():
+    from ssdf_mcp_query.verify_audit import bridge_window_start
+
+    now = dt.datetime(2026, 12, 20, tzinfo=dt.timezone.utc)
+    default = now - dt.timedelta(days=120)
+    key, _ = _bootstrap_keys()
+    boot = _signed_checkpoint(key, "ab" * 32, "2026-09-19T00:00:00.000Z", row_count=0)
+    normal = _signed_checkpoint(key, "ab" * 32, "2026-01-01T00:00:00.000Z", row_count=5)
+    young = _signed_checkpoint(key, "ab" * 32, "2026-12-01T00:00:00.000Z", row_count=0)
+    junk = Checkpoint(**{**boot.__dict__, "checkpoint_ts": "garbage"})
+
+    assert bridge_window_start(now, []) == default
+    assert bridge_window_start(now, [normal, young, junk]) == default  # nothing older reaches back
+    # 2026-09-19 minus (90 + 2) days
+    assert bridge_window_start(now, [boot, normal]) == dt.datetime(
+        2026, 6, 19, tzinfo=dt.timezone.utc
+    )
+    assert bridge_window_start(now, [boot]) < default
+
+
+def test_bootstrap_bridge_walk_works_at_the_oldest_age_the_window_must_cover():
+    """Archived rows are up to 92 days older than the bootstrap's checkpoint_ts;
+    the walk must work for rows that old, long after they left a 120-day window."""
+    key, ring = _bootstrap_keys()
+    full = _chain(6)  # ts 2026-06-10
+    boot_ts = "2026-09-09T00:00:00.000Z"  # 91 days after the rows
+    bootstrap = _signed_checkpoint(key, full[0]["row_hash"], boot_ts, row_count=0)
+    now = dt.datetime(2026, 12, 20, tzinfo=dt.timezone.utc)  # rows ~193 days old
+    assert (
+        verify_tier(full[3:], checkpoints=[bootstrap], bridge_rows=full[1:3], keyring=ring, now=now)
+        == []
+    )
