@@ -42,7 +42,9 @@ window it requires.
 One-time bootstrap (``--bootstrap CHAIN``, CHAIN = ``TIER`` or
 ``TIER:SERVER_ID``): a chain whose genesis expired BEFORE checkpointing was
 enabled can never self-verify, so this job would never sign it. For the named
-chain only, and only if it has no checkpoints, no genesis, exactly one
+chain only (never an evidence-tier chain: writer-hashed rows are not bridge
+material, so the anchor would not survive the next TTL turnover), and only if
+it has no checkpoints, no genesis, exactly one
 dangling prev_hash D, no integrity finding beyond that gap, and every row
 reachable forward from D, the job signs a checkpoint with ``row_count == 0``
 (the signed bootstrap marker; normal checkpoints are >= 1) and
@@ -50,7 +52,9 @@ reachable forward from D, the job signs a checkpoint with ``row_count == 0``
 checkpoint. Any failed precondition prints its reason, signs nothing for that
 chain and makes the run exit non-zero. The anchor is attested by the
 operator, not proven -- see docs/checkpoint-bootstrap.md. Without
-``--bootstrap`` the job never signs ``row_count == 0``.
+``--bootstrap`` the job never signs ``row_count == 0``. ``--dry-run`` does every
+step but signs and inserts nothing, printing what it would sign; it exits 0 only
+if a real run would succeed.
 
 Usage (from services/mcp-query, where the package is installed):
     export CH_HOST=... CH_CHECKPOINT_PASSWORD=...
