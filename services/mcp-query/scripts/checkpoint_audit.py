@@ -628,7 +628,10 @@ def format_report(result: RunResult, dry_run: bool) -> list[str]:
         )
     if dry_run:
         chains = {c for c, *_ in result.planned}
-        verb = "would be checkpointed (dry run, nothing signed)"
+        verb = (
+            "would be checkpointed (dry run: nothing inserted; the signer was "
+            "probed once with a throwaway payload)"
+        )
     else:
         chains = {(cp["tier"], cp["server_id"]) for cp in result.inserted}
         verb = "checkpointed"
