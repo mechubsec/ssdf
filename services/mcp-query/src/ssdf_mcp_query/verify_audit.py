@@ -770,25 +770,35 @@ def _fetch_rows(config) -> list[dict]:
 _EVIDENCE_BRIDGE_LOOKBACK_DAYS = 120
 
 
-def bridge_window_start(now: dt.datetime, checkpoints: Iterable[Checkpoint]) -> dt.datetime:
+def bridge_window_start(
+    now: dt.datetime, checkpoints: Iterable[Checkpoint], keyring: dict[str, bytes] | None
+) -> dt.datetime:
     """Earliest ``ts`` to load from ``ssdf.audit_evidence`` as bridge material.
 
     Normally ``now`` minus ``_EVIDENCE_BRIDGE_LOOKBACK_DAYS``. A bootstrapped
     chain must still bridge back to the bootstrap head D; the archived rows
     between were already in ssdf.audit at bootstrap time, so are at most
     ``_AUDIT_TTL_DAYS + _CHECKPOINT_INTERVAL_SLACK_DAYS`` older than the
-    bootstrap's ``checkpoint_ts``. Widen the window to cover the earliest one
-    (an unparsable ``checkpoint_ts`` is skipped; it cannot anchor anything).
+    bootstrap's ``checkpoint_ts``. Widen the window to cover the earliest one.
+
+    Runs before any verification, on rows an attacker with INSERT may have
+    forged, so only a bootstrap that is signature-verified against ``keyring``
+    AND honoured (``_bootstrap_checkpoints``, per chain) widens it; with no
+    keyring nothing does. An unparsable or out-of-range ``checkpoint_ts`` is
+    skipped, never raised.
     """
     start = now - dt.timedelta(days=_EVIDENCE_BRIDGE_LOOKBACK_DAYS)
     reach = dt.timedelta(days=_AUDIT_TTL_DAYS + _CHECKPOINT_INTERVAL_SLACK_DAYS)
+    by_chain: dict[tuple[str, str], list[Checkpoint]] = defaultdict(list)
     for checkpoint in checkpoints:
-        if not is_bootstrap(checkpoint):
-            continue
-        try:
-            start = min(start, _parse_checkpoint_ts(checkpoint.checkpoint_ts) - reach)
-        except ValueError:
-            continue
+        by_chain[(checkpoint.tier, checkpoint.server_id)].append(checkpoint)
+    for chain_checkpoints in by_chain.values():
+        honoured, _ = _bootstrap_checkpoints(_verified_checkpoints(chain_checkpoints, keyring))
+        for checkpoint in honoured:
+            try:
+                start = min(start, _parse_checkpoint_ts(checkpoint.checkpoint_ts) - reach)
+            except (ValueError, OverflowError):
+                continue
     return start
 
 
@@ -858,7 +868,9 @@ def main() -> int:
     now = dt.datetime.now(dt.timezone.utc)
     evidence_by_chain = _fetch_evidence_rows(
         config,
-        bridge_window_start(now, [c for cps in checkpoints_by_chain.values() for c in cps]),
+        bridge_window_start(
+            now, [c for cps in checkpoints_by_chain.values() for c in cps], keyring
+        ),
     )
     by_chain: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for r in rows:

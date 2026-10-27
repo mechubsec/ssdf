@@ -165,7 +165,10 @@ _EVIDENCE_BRIDGE_LOOKBACK_DAYS = 120
 
 
 def fetch_evidence_rows_by_chain(
-    client, now: dt.datetime, checkpoints: Iterable[Checkpoint] = ()
+    client,
+    now: dt.datetime,
+    checkpoints: Iterable[Checkpoint] = (),
+    keyring: dict[str, bytes] | None = None,
 ) -> dict[tuple[str, str], list[dict]]:
     """Each chain's evidence-tier rows available as bridge material for
     self-verification, grouped the same way as `fetch_rows_by_chain`.
@@ -173,7 +176,7 @@ def fetch_evidence_rows_by_chain(
     (022_audit_checkpoints.sql / 023_audit_evidence.sql)."""
     if now.tzinfo is None:
         now = now.replace(tzinfo=dt.timezone.utc)
-    since = bridge_window_start(now, checkpoints)
+    since = bridge_window_start(now, checkpoints, keyring)
     res = client.query(
         f"SELECT {', '.join(_ROW_COLUMNS)} FROM ssdf.audit_evidence "
         "WHERE ts >= {since:DateTime64(3)} ORDER BY ts ASC",

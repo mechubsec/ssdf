@@ -1423,19 +1423,32 @@ def test_bridge_window_start_widens_to_reach_a_bootstrap_head():
 
     now = dt.datetime(2026, 12, 20, tzinfo=dt.timezone.utc)
     default = now - dt.timedelta(days=120)
-    key, _ = _bootstrap_keys()
+    key, ring = _bootstrap_keys()
     boot = _signed_checkpoint(key, "ab" * 32, "2026-09-19T00:00:00.000Z", row_count=0)
-    normal = _signed_checkpoint(key, "ab" * 32, "2026-01-01T00:00:00.000Z", row_count=5)
-    young = _signed_checkpoint(key, "ab" * 32, "2026-12-01T00:00:00.000Z", row_count=0)
+    normal = _signed_checkpoint(key, "ab" * 32, "2026-09-20T00:00:00.000Z", row_count=5)
+    young = _signed_checkpoint(key, "ab" * 32, "2026-12-01T00:00:00.000Z", row_count=7)
     junk = Checkpoint(**{**boot.__dict__, "checkpoint_ts": "garbage"})
+    forged = Checkpoint(**{**boot.__dict__, "checkpoint_ts": "0001-01-01T00:00:00.000Z"})
 
-    assert bridge_window_start(now, []) == default
-    assert bridge_window_start(now, [normal, young, junk]) == default  # nothing older reaches back
+    assert bridge_window_start(now, [], ring) == default
+    assert bridge_window_start(now, [normal, young, junk], ring) == default
     # 2026-09-19 minus (90 + 2) days
-    assert bridge_window_start(now, [boot, normal]) == dt.datetime(
-        2026, 6, 19, tzinfo=dt.timezone.utc
-    )
-    assert bridge_window_start(now, [boot]) < default
+    expected = dt.datetime(2026, 6, 19, tzinfo=dt.timezone.utc)
+    assert bridge_window_start(now, [boot, normal], ring) == expected
+    # No keyring: nothing is verified, nothing widens.
+    assert bridge_window_start(now, [boot], None) == default
+    # Forged (bad signature) ancient bootstrap: no OverflowError, no widening.
+    assert bridge_window_start(now, [forged], ring) == default
+    assert bridge_window_start(now, [boot, forged], ring) == expected  # forged is dropped
+    # A verified bootstrap that is out of range for the date arithmetic is skipped, not raised.
+    ancient = _signed_checkpoint(key, "ab" * 32, "0001-01-01T00:00:00.000Z", row_count=0)
+    assert bridge_window_start(now, [ancient], ring) == default
+    # A non-earliest verified bootstrap is not honoured, so it does not widen either.
+    late_boot = _signed_checkpoint(key, "ab" * 32, "2026-12-10T00:00:00.000Z", row_count=0)
+    assert bridge_window_start(now, [normal, late_boot], ring) == default
+    # An evidence-tier bootstrap is never honoured.
+    ev = _signed_checkpoint_for(key, "evidence", "s", "ab" * 32, "2026-09-19T00:00:00.000Z", 0)
+    assert bridge_window_start(now, [ev], ring) == default
 
 
 def test_bootstrap_bridge_walk_works_at_the_oldest_age_the_window_must_cover():
