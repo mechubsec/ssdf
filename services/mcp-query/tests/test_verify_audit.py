@@ -1193,3 +1193,177 @@ def test_relabelled_and_rehashed_chain_is_caught_by_its_checkpoint():
         [], checkpoints=[checkpoint], keyring=_keyring(verifying_key), now=now
     )
     assert any(i["type"] == "checkpoint_head_missing" for i in sovereign_issues)  # ...this is not
+
+
+# --- operator-attested bootstrap checkpoints (row_count == 0) -----------------
+
+_BOOTSTRAP_NOW = dt.datetime(2026, 9, 20, tzinfo=dt.timezone.utc)
+_BOOTSTRAP_TS = "2026-09-19T00:00:00.000Z"  # fresh: far younger than the 88-day rule
+
+
+def _bootstrap_keys():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing_key = Ed25519PrivateKey.generate()
+    return signing_key, _keyring(signing_key.public_key().public_bytes_raw())
+
+
+def _truncated_chain(surviving_count=2, expired_count=2):
+    """(expired rows, surviving rows) with the expired genesis gone."""
+    expired = _chain(expired_count)
+    return expired, _chain(surviving_count, first_prev=expired[-1]["row_hash"])
+
+
+def test_fresh_bootstrap_anchors_an_expired_genesis_chain_clean():
+    from ssdf_mcp_query.verify_audit import verify_tier_detailed
+
+    key, ring = _bootstrap_keys()
+    expired, surviving = _truncated_chain()
+    bootstrap = _signed_checkpoint(key, expired[-1]["row_hash"], _BOOTSTRAP_TS, row_count=0)
+    kwargs = dict(checkpoints=[bootstrap], keyring=ring, now=_BOOTSTRAP_NOW)
+
+    assert verify_tier(surviving, **kwargs) == []  # no premature_truncation, no head_missing
+    assert verify_tier_detailed(surviving, **kwargs)[1] == _BOOTSTRAP_TS
+
+
+def test_same_checkpoint_with_nonzero_count_is_still_too_young_to_anchor():
+    key, ring = _bootstrap_keys()
+    expired, surviving = _truncated_chain()
+    normal = _signed_checkpoint(key, expired[-1]["row_hash"], _BOOTSTRAP_TS, row_count=2)
+    issues = verify_tier(surviving, checkpoints=[normal], keyring=ring, now=_BOOTSTRAP_NOW)
+    assert {"premature_truncation", "checkpoint_head_missing"} <= {i["type"] for i in issues}
+
+
+def test_unsigned_bootstrap_is_not_honoured():
+    key, ring = _bootstrap_keys()
+    expired, surviving = _truncated_chain()
+    bootstrap = _signed_checkpoint(key, expired[-1]["row_hash"], _BOOTSTRAP_TS, row_count=0)
+    unsigned = Checkpoint(
+        **{**bootstrap.__dict__, "signature": base64.b64encode(b"x" * 64).decode()}
+    )
+    types = {
+        i["type"]
+        for i in verify_tier(surviving, checkpoints=[unsigned], keyring=ring, now=_BOOTSTRAP_NOW)
+    }
+    assert {"unverifiable_checkpoint", "missing_predecessor"} <= types
+
+
+def test_wrong_key_bootstrap_is_not_honoured():
+    key, _ = _bootstrap_keys()
+    _, other_ring = _bootstrap_keys()
+    expired, surviving = _truncated_chain()
+    bootstrap = _signed_checkpoint(key, expired[-1]["row_hash"], _BOOTSTRAP_TS, row_count=0)
+    types = {
+        i["type"]
+        for i in verify_tier(
+            surviving, checkpoints=[bootstrap], keyring=other_ring, now=_BOOTSTRAP_NOW
+        )
+    }
+    assert {"unverifiable_checkpoint", "missing_predecessor"} <= types
+
+
+def test_bootstrap_whose_head_is_not_the_dangling_hash_leaves_the_gap():
+    key, ring = _bootstrap_keys()
+    _, surviving = _truncated_chain()
+    bootstrap = _signed_checkpoint(key, "ab" * 32, _BOOTSTRAP_TS, row_count=0)
+    issues = verify_tier(surviving, checkpoints=[bootstrap], keyring=ring, now=_BOOTSTRAP_NOW)
+    assert any(i["type"] == "missing_predecessor" for i in issues)
+
+
+def test_a_non_earliest_bootstrap_is_invalid_and_not_honoured():
+    key, ring = _bootstrap_keys()
+    expired, surviving = _truncated_chain()
+    head = expired[-1]["row_hash"]
+    first = _signed_checkpoint(key, head, "2026-09-10T00:00:00.000Z", row_count=0)
+    second = _signed_checkpoint(key, head, "2026-09-12T00:00:00.000Z", row_count=0)
+    issues = verify_tier(surviving, checkpoints=[first, second], keyring=ring, now=_BOOTSTRAP_NOW)
+    assert [i["type"] for i in issues].count("invalid_bootstrap") == 1
+
+    # Even a lone bootstrap later than an ordinary checkpoint is not honoured, and
+    # it anchors nothing: the gap stays reported.
+    normal = _signed_checkpoint(key, "cd" * 32, "2026-09-01T00:00:00.000Z", row_count=3)
+    late = _signed_checkpoint(key, head, "2026-09-12T00:00:00.000Z", row_count=0)
+    issues = verify_tier(surviving, checkpoints=[normal, late], keyring=ring, now=_BOOTSTRAP_NOW)
+    types = {i["type"] for i in issues}
+    assert {"invalid_bootstrap", "missing_predecessor"} <= types
+
+
+def test_bootstrap_anchors_only_its_own_head():
+    key, ring = _bootstrap_keys()
+    expired, surviving = _truncated_chain(surviving_count=3)
+    bootstrap = _signed_checkpoint(key, expired[-1]["row_hash"], _BOOTSTRAP_TS, row_count=0)
+    del surviving[0]  # new dangling hash is surviving[0]'s hash, not D
+    issues = verify_tier(surviving, checkpoints=[bootstrap], keyring=ring, now=_BOOTSTRAP_NOW)
+    assert any(i["type"] == "missing_predecessor" for i in issues)
+
+
+def test_content_edit_is_still_flagged_with_a_bootstrap_present():
+    key, ring = _bootstrap_keys()
+    expired, surviving = _truncated_chain()
+    bootstrap = _signed_checkpoint(key, expired[-1]["row_hash"], _BOOTSTRAP_TS, row_count=0)
+    surviving[1]["tool"] = "TAMPERED"
+    issues = verify_tier(surviving, checkpoints=[bootstrap], keyring=ring, now=_BOOTSTRAP_NOW)
+    assert any(i["type"] == "content_edit" for i in issues)
+
+
+def test_bridge_through_archived_rows_reaches_a_bootstrap_head():
+    key, ring = _bootstrap_keys()
+    full = _chain(6)
+    bootstrap = _signed_checkpoint(key, full[0]["row_hash"], _BOOTSTRAP_TS, row_count=0)
+    # full[1:3] expired out of ssdf.audit too, but the archiver kept them.
+    issues = verify_tier(
+        full[3:],
+        checkpoints=[bootstrap],
+        bridge_rows=full[1:3],
+        keyring=ring,
+        now=_BOOTSTRAP_NOW,
+    )
+    assert issues == []
+    # Without the archive the walk cannot reach D.
+    assert any(
+        i["type"] == "missing_predecessor"
+        for i in verify_tier(full[3:], checkpoints=[bootstrap], keyring=ring, now=_BOOTSTRAP_NOW)
+    )
+
+
+def test_bootstrap_takes_part_in_count_continuity():
+    key, ring = _bootstrap_keys()
+    expired, surviving = _truncated_chain()
+    head = expired[-1]["row_hash"]
+    bootstrap = _signed_checkpoint(key, head, "2026-09-10T00:00:00.000Z", row_count=0)
+    later = _signed_checkpoint(key, surviving[-1]["row_hash"], "2026-09-11T00:00:00.000Z", 2)
+    kwargs = dict(keyring=ring, now=_BOOTSTRAP_NOW)
+    assert verify_tier(surviving, checkpoints=[bootstrap, later], **kwargs) == []
+    # Same ts: the bootstrap still sorts first, whatever order the DB returns.
+    tied = _signed_checkpoint(key, surviving[-1]["row_hash"], "2026-09-10T00:00:00.000Z", 2)
+    assert verify_tier(surviving, checkpoints=[tied, bootstrap], **kwargs) == []
+
+
+def test_main_notes_attested_anchor_without_reporting_an_issue(monkeypatch, capsys):
+    from ssdf_mcp_query import verify_audit
+
+    key, ring = _bootstrap_keys()
+    expired, surviving = _truncated_chain()
+    bootstrap = _signed_checkpoint(key, expired[-1]["row_hash"], _BOOTSTRAP_TS, row_count=0)
+
+    class _Config:
+        ch_audit_verify_password = "pw"
+        ch_checkpoint_verify_key_paths = ("unused",)
+
+    class _FrozenDatetime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _BOOTSTRAP_NOW
+
+    monkeypatch.setattr(verify_audit.dt, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(verify_audit, "load_config", lambda: _Config())
+    monkeypatch.setattr(verify_audit, "_fetch_rows", lambda config: surviving)
+    monkeypatch.setattr(
+        verify_audit, "_fetch_checkpoints", lambda config: {("sovereign", ""): [bootstrap]}
+    )
+    monkeypatch.setattr(verify_audit, "_fetch_evidence_rows", lambda config, now: {})
+    monkeypatch.setattr(verify_audit, "_load_verifying_keyring", lambda config: ring)
+
+    assert verify_audit.main() == 0
+    out = capsys.readouterr().out
+    assert f"anchor=attested({_BOOTSTRAP_TS}) OK" in out

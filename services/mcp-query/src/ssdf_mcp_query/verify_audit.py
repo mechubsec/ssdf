@@ -38,6 +38,12 @@ Finding types (the ``type`` field of each reported issue):
   checkpoint, and that checkpoint is itself overdue on the nominal schedule.
 - ``checkpoint_count_regression`` — a chain's verified checkpoints do not
   have strictly increasing ``row_count`` in checkpoint_ts order.
+- ``invalid_bootstrap`` — a signature-verified ``row_count == 0`` (bootstrap)
+  checkpoint that is not the chain's earliest verified checkpoint. BLOCKING;
+  it is not honoured as an anchor. A bootstrap that IS the earliest is an
+  operator-attested trust-on-first-use anchor (scripts/checkpoint_audit.py
+  ``--bootstrap``): exempt from the age and head-presence rules, and noted
+  as ``anchor=attested(<checkpoint_ts>)`` by the CLI, not reported as an issue.
 - ``unidentified_writer`` — an evidence-tier row's ``args`` carry no usable
   ``server_id`` to group it by writer.
 - ``premature_truncation`` — informational: something in the anchor path
@@ -68,6 +74,7 @@ from .audit_chain import compute_row_hash
 from .checkpoint_verify import (
     Checkpoint,
     CheckpointVerificationError,
+    is_bootstrap,
     verify_checkpoint_signature_from_keyring,
 )
 from .config import ch_tls_kwargs, load_config
@@ -203,12 +210,20 @@ def _is_old_enough_to_anchor(checkpoint_ts: str, now: dt.datetime) -> bool:
 
 
 def _verify_checkpoint_anchor(
-    checkpoint: Checkpoint, keyring: dict[str, bytes] | None, now: dt.datetime
+    checkpoint: Checkpoint,
+    keyring: dict[str, bytes] | None,
+    now: dt.datetime,
+    honoured_bootstraps: frozenset[Checkpoint] = frozenset(),
 ) -> dict | None:
     """Whether ``checkpoint`` may be trusted as an anchor: its signature must
     verify against ``keyring``, and it must be old enough that the rows
     it stands in for could actually have expired. Returns the issue to report
     when it fails either check, or ``None`` when it passes.
+
+    A signature-verified bootstrap in ``honoured_bootstraps`` (the chain's
+    earliest verified checkpoint, ``row_count == 0``) skips the age rule: it
+    attests that the rows before its head are already gone. Any other
+    bootstrap anchors nothing.
     """
     if keyring is None:
         return {"type": "unverifiable_checkpoint", "row_hash": checkpoint.head_row_hash}
@@ -216,6 +231,10 @@ def _verify_checkpoint_anchor(
         verify_checkpoint_signature_from_keyring(checkpoint, keyring)
     except CheckpointVerificationError:
         return {"type": "unverifiable_checkpoint", "row_hash": checkpoint.head_row_hash}
+    if is_bootstrap(checkpoint):
+        if checkpoint in honoured_bootstraps:
+            return None
+        return {"type": "invalid_bootstrap", "row_hash": checkpoint.head_row_hash}
     if not _is_old_enough_to_anchor(checkpoint.checkpoint_ts, now):
         return {"type": "premature_truncation", "row_hash": checkpoint.head_row_hash}
     return None
@@ -227,6 +246,8 @@ def _anchor_dangling_hash(
     bridge_by_hash: dict[str, dict],
     keyring: dict[str, bytes] | None,
     now: dt.datetime,
+    honoured_bootstraps: frozenset[Checkpoint] = frozenset(),
+    anchors_used: list[Checkpoint] | None = None,
 ) -> tuple[bool, list[dict], list[dict]]:
     """Try to anchor one dangling ``prev_hash``: either directly against a
     checkpoint whose ``head_row_hash`` matches it, or by walking backward
@@ -266,8 +287,10 @@ def _anchor_dangling_hash(
         candidates = checkpoints_by_head.get(current)
         if candidates:
             for checkpoint in candidates:
-                issue = _verify_checkpoint_anchor(checkpoint, keyring, now)
+                issue = _verify_checkpoint_anchor(checkpoint, keyring, now, honoured_bootstraps)
                 if issue is None:
+                    if anchors_used is not None:
+                        anchors_used.append(checkpoint)
                     return True, issues, _premature_bridge_departure_issue(first_bridge_row, now)
                 issues.append(issue)
             return False, issues, []
@@ -321,9 +344,11 @@ def _checkpoint_head_issues(
     bridge_by_hash: dict[str, dict],
     keyring: dict[str, bytes] | None,
     now: dt.datetime,
+    honoured_bootstraps: frozenset[Checkpoint] = frozenset(),
 ) -> list[dict]:
     """Every checkpoint's signature is verified regardless of age; age only
-    gates the head-presence check."""
+    gates the head-presence check. An honoured bootstrap is exempt from it:
+    its head is by definition already gone."""
     if keyring is None:
         return []
     issues: list[dict] = []
@@ -332,6 +357,8 @@ def _checkpoint_head_issues(
             verify_checkpoint_signature_from_keyring(checkpoint, keyring)
         except CheckpointVerificationError:
             issues.append({"type": "unverifiable_checkpoint", "row_hash": checkpoint.head_row_hash})
+            continue
+        if checkpoint in honoured_bootstraps:
             continue
         if _is_old_enough_to_anchor(checkpoint.checkpoint_ts, now):
             continue
@@ -420,6 +447,31 @@ def _stale_checkpoint_issue(
     return {"type": "stale_checkpoint", "row_hash": latest.head_row_hash}
 
 
+def _checkpoint_order(checkpoint: Checkpoint) -> tuple[str, int]:
+    """Chronological order; row_count breaks a checkpoint_ts tie so a bootstrap
+    (0) deterministically precedes the ordinary checkpoint signed in its run."""
+    return (checkpoint.checkpoint_ts, checkpoint.row_count)
+
+
+def _bootstrap_checkpoints(
+    verified_checkpoints: list[Checkpoint],
+) -> tuple[frozenset[Checkpoint], list[dict]]:
+    """Split verified bootstrap checkpoints into the one that may be honoured
+    (it is the chain's EARLIEST verified checkpoint) and ``invalid_bootstrap``
+    issues for every other. A bootstrap vouches for rows expired before
+    checkpointing began, so it can only ever be the first checkpoint."""
+    if not verified_checkpoints:
+        return frozenset(), []
+    earliest = min(verified_checkpoints, key=_checkpoint_order)
+    honoured = frozenset([earliest]) if is_bootstrap(earliest) else frozenset()
+    issues = [
+        {"type": "invalid_bootstrap", "row_hash": c.head_row_hash}
+        for c in verified_checkpoints
+        if is_bootstrap(c) and c is not earliest
+    ]
+    return honoured, issues
+
+
 def _checkpoint_count_regression_issues(verified_checkpoints: list[Checkpoint]) -> list[dict]:
     """A legitimate checkpoint job's signed ``row_count`` is cumulative and
     must only grow between consecutive checkpoints for the same chain.
@@ -428,7 +480,7 @@ def _checkpoint_count_regression_issues(verified_checkpoints: list[Checkpoint]) 
     ever touching ``ssdf.audit`` -- a tamper none of the other checks here
     can see, since they only look at ``ssdf.audit`` itself.
     """
-    ordered = sorted(verified_checkpoints, key=lambda c: c.checkpoint_ts)
+    ordered = sorted(verified_checkpoints, key=_checkpoint_order)
     issues: list[dict] = []
     for prev, cur in zip(ordered, ordered[1:]):
         if cur.row_count <= prev.row_count:
@@ -442,6 +494,8 @@ def _select_checkpoint_anchors(
     dangling_prev_hashes: set[str],
     bridge_rows: list[dict],
     now: dt.datetime,
+    honoured_bootstraps: frozenset[Checkpoint] = frozenset(),
+    anchors_used: list[Checkpoint] | None = None,
 ) -> tuple[set[str], list[dict]]:
     """Pick which dangling predecessors can be anchored, either directly
     against a checkpoint or by bridging through evidence-tier rows
@@ -468,7 +522,13 @@ def _select_checkpoint_anchors(
     issues: list[dict] = []
     for prev_hash in dangling_prev_hashes:
         anchored, hash_issues, info_issues = _anchor_dangling_hash(
-            prev_hash, checkpoints_by_head, bridge_by_hash, keyring, now
+            prev_hash,
+            checkpoints_by_head,
+            bridge_by_hash,
+            keyring,
+            now,
+            honoured_bootstraps,
+            anchors_used,
         )
         issues.extend(info_issues)
         if anchored:
@@ -486,7 +546,23 @@ def verify_tier(
     now: dt.datetime | None = None,
     check_freshness: bool = True,
 ) -> list[dict]:
-    """Verify one tier's rows. Returns a list of issue dicts (empty == clean).
+    """Verify one tier's rows; see :func:`verify_tier_detailed`."""
+    return verify_tier_detailed(rows, checkpoints, bridge_rows, keyring, now, check_freshness)[0]
+
+
+def verify_tier_detailed(
+    rows: list[dict],
+    checkpoints: list[Checkpoint] = (),
+    bridge_rows: list[dict] = (),
+    keyring: dict[str, bytes] | None = None,
+    now: dt.datetime | None = None,
+    check_freshness: bool = True,
+) -> tuple[list[dict], str | None]:
+    """Verify one tier's rows. Returns ``(issues, attested_ts)``: ``attested_ts``
+    is the ``checkpoint_ts`` of the bootstrap checkpoint the chain's anchoring
+    relied on, else ``None`` (a note, not an issue).
+
+    The issue list is empty when clean. Returns a list of issue dicts (empty == clean).
 
     Rows written before migration 009 carry prev_hash='' / row_hash='' (column
     DEFAULT) and are excluded: the first hashed row per tier is that tier's
@@ -561,12 +637,18 @@ def verify_tier(
     # 1.5 Checkpoint head presence: every checkpoint still within its recent
     # window must have its head findable, independent of whether this
     # chain's genesis survives -- see _checkpoint_head_issues.
-    issues.extend(_checkpoint_head_issues(list(checkpoints), by_hash, bridge_by_hash, keyring, now))
+    verified_checkpoints = _verified_checkpoints(list(checkpoints), keyring)
+    honoured_bootstraps, bootstrap_issues = _bootstrap_checkpoints(verified_checkpoints)
+    issues.extend(bootstrap_issues)
+    issues.extend(
+        _checkpoint_head_issues(
+            list(checkpoints), by_hash, bridge_by_hash, keyring, now, honoured_bootstraps
+        )
+    )
 
     # 1.6 Checkpoint freshness and count continuity, both independent of
     # whether any particular row or head is currently reachable -- see
     # _stale_checkpoint_issue and _checkpoint_count_regression_issues.
-    verified_checkpoints = _verified_checkpoints(list(checkpoints), keyring)
     if check_freshness:
         stale_issue = _stale_checkpoint_issue(rows, verified_checkpoints, now)
         if stale_issue is not None:
@@ -583,14 +665,22 @@ def verify_tier(
     # nothing to do with.
     has_genesis = any(r["prev_hash"] == "" for r in rows)
     anchor_hashes: set[str] = set()
+    anchors_used: list[Checkpoint] = []
     if not has_genesis and rows:
         dangling = {
             r["prev_hash"] for r in rows if r["prev_hash"] != "" and r["prev_hash"] not in by_hash
         }
         anchor_hashes, anchor_issues = _select_checkpoint_anchors(
-            list(checkpoints), keyring, dangling, list(bridge_rows), now
+            list(checkpoints),
+            keyring,
+            dangling,
+            list(bridge_rows),
+            now,
+            honoured_bootstraps,
+            anchors_used,
         )
-        issues.extend(anchor_issues)
+        # Already reported once above, from the verified list.
+        issues.extend(i for i in anchor_issues if i["type"] != "invalid_bootstrap")
 
     # 2. Linkage: a non-genesis prev_hash must name a present row, UNLESS it
     #    is itself a trusted anchor -- a hash that stands in for a row that
@@ -622,7 +712,8 @@ def verify_tier(
         if r["row_hash"] not in reachable:
             issues.append({"type": "unreachable", "row_hash": r["row_hash"]})
 
-    return issues
+    attested = [c.checkpoint_ts for c in anchors_used if c in honoured_bootstraps]
+    return issues, (min(attested) if attested else None)
 
 
 _CHECKPOINT_COLUMNS = [
@@ -740,7 +831,7 @@ def main() -> int:
     all_chains = set(by_chain) | set(checkpoints_by_chain)
     for tier, server_id in sorted(all_chains):
         chain_rows = by_chain.get((tier, server_id), [])
-        issues = verify_tier(
+        issues, attested_ts = verify_tier_detailed(
             chain_rows,
             checkpoints=checkpoints_by_chain.get((tier, server_id), []),
             bridge_rows=evidence_by_chain.get((tier, server_id), []),
@@ -756,8 +847,10 @@ def main() -> int:
         writer = f" server={server_id}" if server_id else ""
         # Say so rather than let OK imply the rows' content was checked.
         content = " content=writer-hashed(not-recomputed)" if tier == "evidence" else ""
+        attested = f" anchor=attested({attested_ts})" if attested_ts else ""
         print(
-            f"tier={tier}{writer} rows={len(chain_rows)} legacy_unhashed={legacy}{content} {status}"
+            f"tier={tier}{writer} rows={len(chain_rows)} legacy_unhashed={legacy}{content}"
+            f"{attested} {status}"
         )
         for issue in issues:
             print(f"  {issue['type']}: row_hash={issue['row_hash'][:16]}…")
