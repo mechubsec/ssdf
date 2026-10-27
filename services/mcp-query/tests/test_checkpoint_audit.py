@@ -661,3 +661,165 @@ def test_main_accepts_a_keyring_of_multiple_paths(monkeypatch, tmp_path):
 
     keyring = checkpoint_audit.load_checkpoint_verifying_keyring()
     assert keyring == {**_keyring(key_a), **_keyring(key_b)}
+
+
+# --- one-time bootstrap (--bootstrap) -----------------------------------------
+
+_BOOT_NOW = dt.datetime(2026, 9, 20, tzinfo=dt.timezone.utc)
+_REAL_SIGN_CHECKPOINT = checkpoint_audit.sign_checkpoint
+
+
+def _real_signer(signing_key):
+    """Stands in for the Rust binary: really signs the payload it is handed."""
+    from ssdf_mcp_query.checkpoint_verify import Checkpoint
+
+    key_id = key_fingerprint(signing_key.public_key().public_bytes_raw())
+
+    def sign(binary, key_path, payload, keyring=None, allow_bootstrap=False):
+        if payload["row_count"] == 0 and not allow_bootstrap:
+            raise RuntimeError("bootstrap refused")
+        unsigned = Checkpoint(**payload, signature="", key_id=key_id)
+        signature = base64.b64encode(signing_key.sign(canonical_digest(unsigned))).decode()
+        return {**payload, "signature": signature, "key_id": key_id}
+
+    return sign
+
+
+def _truncated_client(surviving_count=3, checkpoint_rows=()):
+    """(client, expired_genesis_hash, surviving_hashes) for a chain whose
+    genesis expired before checkpointing was ever enabled."""
+    _, genesis_hash = _audit_row(0, "sovereign", "")
+    tuples, prev, hashes = [], genesis_hash, []
+    for i in range(1, surviving_count + 1):
+        values, prev = _audit_row(i, "sovereign", prev)
+        tuples.append(values)
+        hashes.append(prev)
+    client = _FakeClient(audit_rows=tuples, checkpoint_rows=checkpoint_rows)
+    return client, genesis_hash, hashes
+
+
+def _boot_run(monkeypatch, client, bootstrap=True):
+    key = Ed25519PrivateKey.generate()
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", _real_signer(key))
+    return checkpoint_audit.run(
+        client,
+        "binary",
+        "key",
+        now=_BOOT_NOW,
+        keyring=_keyring(key.public_key().public_bytes_raw()),
+        bootstrap_chains=frozenset({("sovereign", "")}) if bootstrap else frozenset(),
+    ), key
+
+
+def test_bootstrap_signs_row_count_zero_then_a_normal_checkpoint_in_the_same_run(monkeypatch):
+    client, genesis_hash, hashes = _truncated_client(3)
+
+    result, _ = _boot_run(monkeypatch, client)
+
+    assert result.skipped == []
+    boot, normal = result.inserted
+    assert (boot["row_count"], boot["head_row_hash"]) == (0, genesis_hash)
+    assert (normal["row_count"], normal["head_row_hash"]) == (3, hashes[-1])
+    assert normal["checkpoint_ts"] > boot["checkpoint_ts"]
+    assert len(client.inserted) == 2
+
+
+def test_parse_chain_spec():
+    assert checkpoint_audit.parse_chain_spec("sovereign") == ("sovereign", "")
+    assert checkpoint_audit.parse_chain_spec("evidence:junos-1") == ("evidence", "junos-1")
+    with pytest.raises(ValueError):
+        checkpoint_audit.parse_chain_spec(":x")
+
+
+def _assert_refused(monkeypatch, client, capsys, reason):
+    result, _ = _boot_run(monkeypatch, client)
+    assert result.inserted == []
+    assert client.inserted == []
+    assert result.skipped == [("sovereign", "")]
+    assert reason in capsys.readouterr().err
+
+
+def test_bootstrap_refuses_a_chain_that_already_has_a_checkpoint(monkeypatch, capsys):
+    client, genesis_hash, _ = _truncated_client(
+        3, checkpoint_rows=[("sovereign", "", 2, "ab" * 32, "2026-01-01T00:00:00.000Z", "s", "k")]
+    )
+    _assert_refused(monkeypatch, client, capsys, "already has 1 checkpoint")
+
+
+def test_bootstrap_refuses_two_dangling_hashes(monkeypatch, capsys):
+    client, _, hashes = _truncated_client(2)
+    stray, _ = _audit_row(9, "sovereign", "cd" * 32)  # second, unrelated gap
+    client._audit_rows.append(stray)
+    _assert_refused(monkeypatch, client, capsys, "exactly 1 dangling prev_hash, found 2")
+
+
+def test_bootstrap_refuses_a_content_edit(monkeypatch, capsys):
+    client, _, _ = _truncated_client(3)
+    row = dict(zip(checkpoint_audit._ROW_COLUMNS, client._audit_rows[1]))
+    row["tool"] = "TAMPERED"
+    client._audit_rows[1] = tuple(row[c] for c in checkpoint_audit._ROW_COLUMNS)
+    _assert_refused(monkeypatch, client, capsys, "content_edit")
+
+
+def test_bootstrap_refuses_when_the_genesis_is_present(monkeypatch, capsys):
+    genesis, genesis_hash = _audit_row(0, "sovereign", "")
+    child, _ = _audit_row(1, "sovereign", genesis_hash)
+    client = _FakeClient(audit_rows=[genesis, child])
+    _assert_refused(monkeypatch, client, capsys, "genesis row is present")
+
+
+def test_bootstrap_refuses_a_fork_at_the_anchor(monkeypatch, capsys):
+    client, genesis_hash, _ = _truncated_client(2)
+    sibling, _ = _audit_row(7, "sovereign", genesis_hash)
+    client._audit_rows.append(sibling)
+    _assert_refused(monkeypatch, client, capsys, "fork")
+
+
+def test_without_bootstrap_flag_an_unverifiable_truncated_chain_is_skipped_not_anchored(
+    monkeypatch,
+):
+    client, _, _ = _truncated_client(3)
+    result, _ = _boot_run(monkeypatch, client, bootstrap=False)
+    assert result.inserted == [] and result.skipped == [("sovereign", "")]
+
+
+def test_job_never_emits_row_count_zero_without_bootstrap(monkeypatch):
+    # Normal runs sign counts >= 1 ...
+    _, genesis_hash = _audit_row(0, "sovereign", "")
+    child, _ = _audit_row(1, "sovereign", genesis_hash)
+    genesis, _ = _audit_row(0, "sovereign", "")
+    client = _FakeClient(audit_rows=[genesis, child])
+    result, key = _boot_run(monkeypatch, client, bootstrap=False)
+    assert [c["row_count"] for c in result.inserted] == [2]
+
+    # ... and the signer wrapper refuses a zero even if the orchestrator were to produce one.
+    with pytest.raises(RuntimeError, match="without --bootstrap"):
+        _REAL_SIGN_CHECKPOINT(
+            "binary",
+            "key",
+            {
+                "tier": "sovereign",
+                "server_id": "",
+                "row_count": 0,
+                "head_row_hash": "x",
+                "checkpoint_ts": "2026-09-20T00:00:00.000Z",
+            },
+        )
+    from ssdf_mcp_query import checkpoint_orchestrator as orch
+
+    monkeypatch.setattr(
+        checkpoint_audit,
+        "compute_next_checkpoint",
+        lambda rows, previous: orch.PendingCheckpoint("sovereign", "", 0, "h"),
+    )
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", _REAL_SIGN_CHECKPOINT)
+    client2 = _FakeClient(audit_rows=[genesis, child])
+    with pytest.raises(RuntimeError, match="without --bootstrap"):
+        checkpoint_audit.run(
+            client2,
+            "binary",
+            "key",
+            now=_BOOT_NOW,
+            keyring=_keyring(key.public_key().public_bytes_raw()),
+        )
+    assert client2.inserted == []
