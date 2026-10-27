@@ -69,6 +69,7 @@ import os
 import subprocess
 import sys
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from ssdf_common.config import ConfigError, require_tls_or_loopback
@@ -86,7 +87,7 @@ from ssdf_mcp_query.checkpoint_verify import (
     load_verifying_keyring,
     verify_checkpoint_signature_from_keyring,
 )
-from ssdf_mcp_query.verify_audit import group_key, verify_tier
+from ssdf_mcp_query.verify_audit import bridge_window_start, group_key, verify_tier
 
 # Same shape verify_audit.py reads (_VERIFY_COLUMNS): compute_next_checkpoint
 # only needs tier/args/prev_hash/row_hash, but verify_tier's content-integrity
@@ -130,6 +131,8 @@ class RunResult:
     """What one `run()` invocation did, per chain."""
 
     inserted: list[dict] = field(default_factory=list)
+    # --dry-run: what would have been signed, as (chain, row_count, head, is_bootstrap).
+    planned: list[tuple[tuple[str, str], int, str, bool]] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
@@ -157,14 +160,16 @@ def fetch_rows_by_chain(client) -> dict[tuple[str, str], list[dict]]:
 _EVIDENCE_BRIDGE_LOOKBACK_DAYS = 120
 
 
-def fetch_evidence_rows_by_chain(client, now: dt.datetime) -> dict[tuple[str, str], list[dict]]:
+def fetch_evidence_rows_by_chain(
+    client, now: dt.datetime, checkpoints: Iterable[Checkpoint] = ()
+) -> dict[tuple[str, str], list[dict]]:
     """Each chain's evidence-tier rows available as bridge material for
     self-verification, grouped the same way as `fetch_rows_by_chain`.
     Requires `ssdf_checkpoint` to hold SELECT on `ssdf.audit_evidence`
     (022_audit_checkpoints.sql / 023_audit_evidence.sql)."""
     if now.tzinfo is None:
         now = now.replace(tzinfo=dt.timezone.utc)
-    since = now - dt.timedelta(days=_EVIDENCE_BRIDGE_LOOKBACK_DAYS)
+    since = bridge_window_start(now, checkpoints)
     res = client.query(
         f"SELECT {', '.join(_ROW_COLUMNS)} FROM ssdf.audit_evidence "
         "WHERE ts >= {since:DateTime64(3)} ORDER BY ts ASC",
@@ -347,6 +352,7 @@ def parse_chain_spec(spec: str) -> tuple[str, str]:
 
 
 def bootstrap_anchor(
+    chain_tier: str,
     rows: list[dict],
     checkpoints: list[Checkpoint],
     bridge_rows: list[dict],
@@ -355,6 +361,11 @@ def bootstrap_anchor(
 ) -> tuple[str | None, str]:
     """Check the bootstrap preconditions for one chain. Returns
     ``(dangling_hash, "")`` when all hold, else ``(None, reason)``."""
+    if chain_tier == "evidence":
+        return None, (
+            "evidence-tier chains cannot be bootstrapped: writer-hashed rows are never "
+            "bridge material, so the anchor would fail at the next TTL turnover"
+        )
     if checkpoints:
         return None, f"chain already has {len(checkpoints)} checkpoint(s); bootstrap is one-time"
     if not rows:
@@ -403,6 +414,7 @@ def run(
     now: dt.datetime | None = None,
     keyring: dict[str, bytes] | None = None,
     bootstrap_chains: frozenset[tuple[str, str]] = frozenset(),
+    dry_run: bool = False,
 ) -> RunResult:
     """Checkpoint every chain that has rows newer than its last checkpoint.
 
@@ -418,12 +430,17 @@ def run(
     checkpoint (see :func:`bootstrap_anchor`); the normal pass then runs on it
     in the same call, one millisecond later so the ordinary checkpoint is
     strictly after the bootstrap.
+
+    ``dry_run`` does every fetch, check and computation but never calls the
+    signer or inserts; ``RunResult.planned`` lists what would be signed.
     """
     now = now or dt.datetime.now(dt.timezone.utc)
     rows_by_chain = fetch_rows_by_chain(client)
     previous_by_chain = fetch_previous_checkpoints(client)
     checkpoints_by_chain = fetch_checkpoints_by_chain(client)
-    evidence_by_chain = fetch_evidence_rows_by_chain(client, now)
+    evidence_by_chain = fetch_evidence_rows_by_chain(
+        client, now, [c for cps in checkpoints_by_chain.values() for c in cps]
+    )
     result = RunResult()
     # Walk every chain that has EITHER surviving rows OR a checkpoint, not
     # just `rows_by_chain`'s keys -- a chain whose rows were all removed
@@ -435,6 +452,7 @@ def run(
         chain_now = now
         if chain in bootstrap_chains:
             anchor, reason = bootstrap_anchor(
+                chain[0],
                 rows,
                 checkpoints_by_chain.get(chain, []),
                 evidence_by_chain.get(chain, []),
@@ -449,6 +467,16 @@ def run(
                 result.skipped.append(chain)
                 continue
             pending = PendingCheckpoint(chain[0], chain[1], BOOTSTRAP_ROW_COUNT, anchor)
+            if dry_run:
+                result.planned.append((chain, BOOTSTRAP_ROW_COUNT, anchor, True))
+                follow_up = compute_next_checkpoint(
+                    rows, {"row_count": BOOTSTRAP_ROW_COUNT, "head_row_hash": anchor}
+                )
+                if follow_up is not None:
+                    result.planned.append(
+                        (chain, follow_up.row_count, follow_up.head_row_hash, False)
+                    )
+                continue
             boot = sign_checkpoint(
                 binary, key_path, build_payload(pending, now), keyring=keyring, allow_bootstrap=True
             )
@@ -539,12 +567,41 @@ def run(
                 )
                 result.skipped.append(chain)
             continue
+        if dry_run:
+            result.planned.append((chain, pending.row_count, pending.head_row_hash, False))
+            continue
         signed = sign_checkpoint(
             binary, key_path, build_payload(pending, chain_now), keyring=keyring
         )
         insert_checkpoint(client, signed)
         result.inserted.append(signed)
     return result
+
+
+def format_report(result: RunResult, dry_run: bool) -> list[str]:
+    """Human-readable result lines. The count is of distinct chains: a bootstrap
+    run inserts two rows (bootstrap + ordinary) for one chain."""
+    lines = []
+    for chain, row_count, head, is_boot in result.planned:
+        writer = f" server={chain[1]}" if chain[1] else ""
+        kind = "BOOTSTRAP" if is_boot else "checkpoint"
+        lines.append(
+            f"would sign {kind} tier={chain[0]}{writer} row_count={row_count} head={head[:16]}…"
+        )
+    for cp in result.inserted:
+        writer = f" server={cp['server_id']}" if cp["server_id"] else ""
+        lines.append(
+            f"checkpointed tier={cp['tier']}{writer} "
+            f"row_count={cp['row_count']} head={cp['head_row_hash'][:16]}…"
+        )
+    if dry_run:
+        chains = {c for c, *_ in result.planned}
+        verb = "would be checkpointed (dry run, nothing signed)"
+    else:
+        chains = {(cp["tier"], cp["server_id"]) for cp in result.inserted}
+        verb = "checkpointed"
+    lines.append(f"{len(chains)} chain(s) {verb}, {len(result.skipped)} skipped")
+    return lines
 
 
 def main() -> int:
@@ -561,6 +618,12 @@ def main() -> int:
         metavar="CHAIN",
         help="one-time operator-attested bootstrap for TIER or TIER:SERVER_ID "
         "(chain whose genesis expired before checkpointing; see module docstring)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="do every check and print what would be signed; sign and insert nothing "
+        "(exit 0 only if a real run would succeed)",
     )
     args = parser.parse_args()
     try:
@@ -617,19 +680,19 @@ def main() -> int:
 
     try:
         result = run(
-            client, args.binary, key_path, keyring=keyring, bootstrap_chains=bootstrap_chains
+            client,
+            args.binary,
+            key_path,
+            keyring=keyring,
+            bootstrap_chains=bootstrap_chains,
+            dry_run=args.dry_run,
         )
     except RuntimeError as exc:
         print(f"checkpointing failed: {exc}", file=sys.stderr)
         return 1
 
-    for cp in result.inserted:
-        writer = f" server={cp['server_id']}" if cp["server_id"] else ""
-        print(
-            f"checkpointed tier={cp['tier']}{writer} "
-            f"row_count={cp['row_count']} head={cp['head_row_hash'][:16]}…"
-        )
-    print(f"{len(result.inserted)} chain(s) checkpointed, {len(result.skipped)} skipped")
+    for line in format_report(result, args.dry_run):
+        print(line)
     return 1 if result.skipped else 0
 
 
