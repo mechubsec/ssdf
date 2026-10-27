@@ -45,9 +45,11 @@ The job refuses any `tier == 'evidence'` chain (including the writerless
 ## How to run
 
 Needs the signing key and verifying keyring, as for a normal run. Start with a
-read-only preflight; it does every fetch and check and prints each checkpoint
-it WOULD sign, signing and inserting nothing. It exits 0 only if the real run
-would succeed:
+preflight; it fetches and checks the chains and bootstrap preconditions, signs
+one throwaway probe payload to validate the signer binary, key and keyring, and
+prints each checkpoint it WOULD sign. It inserts nothing and does not test the
+database INSERT grant. It exits non-zero if any chain would be refused or the
+signer check fails:
 
     uv run python scripts/checkpoint_audit.py --dry-run --bootstrap sovereign
 
@@ -91,6 +93,8 @@ Bridge window: the verifier and the job normally read the last 120 days of
 already in `ssdf.audit` at bootstrap time, so they can be up to 92 days
 (`_AUDIT_TTL_DAYS + _CHECKPOINT_INTERVAL_SLACK_DAYS`) older than the
 bootstrap's `checkpoint_ts`. The window therefore starts at
-`min(now - 120 days, earliest row_count=0 checkpoint_ts - 92 days)`
-(`verify_audit.bridge_window_start`). The archive table's own TTL is 410 days
+`min(now - 120 days, bootstrap checkpoint_ts - 92 days)`
+(`verify_audit.bridge_window_start`), widened only by a bootstrap that is
+signature-verified against the keyring and honoured (so a forged row cannot
+widen it or crash the fetch; with no keyring nothing widens). The archive table's own TTL is 410 days
 from each row's `ts` (`023_audit_evidence.sql`), comfortably longer.

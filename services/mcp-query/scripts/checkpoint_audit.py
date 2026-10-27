@@ -52,9 +52,11 @@ reachable forward from D, the job signs a checkpoint with ``row_count == 0``
 checkpoint. Any failed precondition prints its reason, signs nothing for that
 chain and makes the run exit non-zero. The anchor is attested by the
 operator, not proven -- see docs/checkpoint-bootstrap.md. Without
-``--bootstrap`` the job never signs ``row_count == 0``. ``--dry-run`` does every
-step but signs and inserts nothing, printing what it would sign; it exits 0 only
-if a real run would succeed.
+``--bootstrap`` the job never signs ``row_count == 0``. ``--dry-run`` validates the
+chains, the bootstrap preconditions and the signer, key and keyring (one
+throwaway probe signature, never inserted), printing what it would sign; it
+exits non-zero if anything would be refused or the signer check fails. It does
+not test the database INSERT grant.
 
 Usage (from services/mcp-query, where the package is installed):
     export CH_HOST=... CH_CHECKPOINT_PASSWORD=...
@@ -414,6 +416,26 @@ def bootstrap_anchor(
     return anchor, ""
 
 
+def probe_signer(
+    binary: str, key_path: str, now: dt.datetime, keyring: dict[str, bytes] | None
+) -> None:
+    """Dry-run only: sign a throwaway payload with the real signer and key and
+    verify it against the keyring (``sign_checkpoint`` does both). Nothing is
+    inserted. Raises RuntimeError with the reason on any failure. Does NOT test
+    the database INSERT grant."""
+    payload = {
+        "tier": "dry-run",
+        "server_id": "",
+        "row_count": 1,
+        "head_row_hash": "0" * 64,
+        "checkpoint_ts": format_checkpoint_ts(now),
+    }
+    try:
+        sign_checkpoint(binary, key_path, payload, keyring=keyring)
+    except RuntimeError as exc:
+        raise RuntimeError(f"dry-run signer check failed: {exc}") from exc
+
+
 def run(
     client,
     binary: str,
@@ -438,15 +460,18 @@ def run(
     in the same call, one millisecond later so the ordinary checkpoint is
     strictly after the bootstrap.
 
-    ``dry_run`` does every fetch, check and computation but never calls the
-    signer or inserts; ``RunResult.planned`` lists what would be signed.
+    ``dry_run`` does every fetch, check and computation, signs one throwaway
+    probe payload to validate the signer, key and keyring, and inserts nothing;
+    ``RunResult.planned`` lists what would be signed.
     """
     now = now or dt.datetime.now(dt.timezone.utc)
+    if dry_run:
+        probe_signer(binary, key_path, now, keyring)
     rows_by_chain = fetch_rows_by_chain(client)
     previous_by_chain = fetch_previous_checkpoints(client)
     checkpoints_by_chain = fetch_checkpoints_by_chain(client)
     evidence_by_chain = fetch_evidence_rows_by_chain(
-        client, now, [c for cps in checkpoints_by_chain.values() for c in cps]
+        client, now, [c for cps in checkpoints_by_chain.values() for c in cps], keyring
     )
     result = RunResult()
     # Walk every chain that has EITHER surviving rows OR a checkpoint, not
@@ -629,8 +654,10 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="do every check and print what would be signed; sign and insert nothing "
-        "(exit 0 only if a real run would succeed)",
+        help="validate chains, bootstrap preconditions and the signer/key/keyring (one "
+        "throwaway probe signature) and print what would be signed; inserts nothing and "
+        "does not test the database INSERT grant. Non-zero if anything would be refused "
+        "or the signer check fails",
     )
     args = parser.parse_args()
     try:

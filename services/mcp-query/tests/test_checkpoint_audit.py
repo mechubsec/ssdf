@@ -12,7 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import checkpoint_audit  # noqa: E402
 from ssdf_mcp_query.audit_chain import compute_row_hash  # noqa: E402
-from ssdf_mcp_query.checkpoint_verify import canonical_digest, key_fingerprint  # noqa: E402
+from ssdf_mcp_query.checkpoint_verify import (  # noqa: E402
+    Checkpoint,
+    canonical_digest,
+    key_fingerprint,
+)
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: E402
     Ed25519PrivateKey,
@@ -885,8 +889,6 @@ def test_bootstrap_refuses_evidence_tier_chains(monkeypatch, capsys):
 
 
 def test_fetch_evidence_window_reaches_back_to_a_bootstrap():
-    from ssdf_mcp_query.checkpoint_verify import Checkpoint
-
     seen = {}
 
     class _Recording(_FakeClient):
@@ -895,23 +897,36 @@ def test_fetch_evidence_window_reaches_back_to_a_bootstrap():
             return super().query(sql, parameters)
 
     now = dt.datetime(2026, 12, 20, tzinfo=dt.timezone.utc)
-    boot = Checkpoint("sovereign", "", 0, "h", "2026-09-19T00:00:00.000Z", "s", "k")
+    key = Ed25519PrivateKey.generate()
+    ring = _keyring(key.public_key().public_bytes_raw())
+    boot = Checkpoint(*_signed_boot_row(key, "ab" * 32))
+    forged = Checkpoint("sovereign", "", 0, "h", "0001-01-01T00:00:00.000Z", "s", "k")
 
-    checkpoint_audit.fetch_evidence_rows_by_chain(_Recording(), now, [boot])
+    checkpoint_audit.fetch_evidence_rows_by_chain(_Recording(), now, [boot], ring)
     assert seen["since"] == dt.datetime(2026, 6, 19, tzinfo=dt.timezone.utc)
-    checkpoint_audit.fetch_evidence_rows_by_chain(_Recording(), now)
-    assert seen["since"] == now - dt.timedelta(days=120)
+    default = now - dt.timedelta(days=120)
+    # Unverified (no keyring) or forged rows never widen the window or raise.
+    checkpoint_audit.fetch_evidence_rows_by_chain(_Recording(), now, [boot])
+    assert seen["since"] == default
+    checkpoint_audit.fetch_evidence_rows_by_chain(_Recording(), now, [forged], ring)
+    assert seen["since"] == default
 
 
-def test_dry_run_never_signs_or_inserts_and_lists_the_plan(monkeypatch):
+def test_dry_run_probes_the_signer_once_and_never_inserts(monkeypatch):
     client, genesis_hash, hashes = _truncated_client(3)
     key = Ed25519PrivateKey.generate()
+    probes = []
+    real = _real_signer(key)
 
-    def boom(*a, **k):
-        raise AssertionError("dry run must not sign")
+    def counting_signer(binary, key_path, payload, **kwargs):
+        probes.append(payload)
+        return real(binary, key_path, payload, **kwargs)
 
-    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", boom)
-    monkeypatch.setattr(checkpoint_audit, "insert_checkpoint", boom)
+    def no_insert(*a, **k):
+        raise AssertionError("dry run must not insert")
+
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", counting_signer)
+    monkeypatch.setattr(checkpoint_audit, "insert_checkpoint", no_insert)
 
     result = checkpoint_audit.run(
         client,
@@ -923,6 +938,7 @@ def test_dry_run_never_signs_or_inserts_and_lists_the_plan(monkeypatch):
         dry_run=True,
     )
 
+    assert [p["tier"] for p in probes] == ["dry-run"]
     assert result.skipped == [] and result.inserted == [] and client.inserted == []
     assert result.planned == [
         (("sovereign", ""), 0, genesis_hash, True),
@@ -930,10 +946,55 @@ def test_dry_run_never_signs_or_inserts_and_lists_the_plan(monkeypatch):
     ]
 
 
+def test_dry_run_fails_when_the_signer_check_fails(monkeypatch):
+    client, _, _ = _truncated_client(3)
+    key = Ed25519PrivateKey.generate()
+
+    def broken(*a, **k):
+        raise RuntimeError("could not run 'b': no such file")
+
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", broken)
+    with pytest.raises(RuntimeError, match="dry-run signer check failed: could not run"):
+        checkpoint_audit.run(
+            client,
+            "b",
+            "k",
+            now=_BOOT_NOW,
+            keyring=_keyring(key.public_key().public_bytes_raw()),
+            dry_run=True,
+        )
+    assert client.inserted == []
+
+
+def test_dry_run_fails_when_the_signing_key_is_not_in_the_keyring(monkeypatch):
+    client, _, _ = _truncated_client(3)
+    signing_key = Ed25519PrivateKey.generate()
+    other_ring = _keyring(Ed25519PrivateKey.generate().public_key().public_bytes_raw())
+    # The real sign_checkpoint, with a stub subprocess standing in for the binary.
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", _REAL_SIGN_CHECKPOINT)
+
+    class _Proc:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, payload):
+            signed = _real_signer(signing_key)("b", "k", payload)
+            self.stdout = json.dumps(signed)
+
+    monkeypatch.setattr(
+        checkpoint_audit.subprocess,
+        "run",
+        lambda cmd, input, **k: _Proc(json.loads(input)),
+    )
+    with pytest.raises(RuntimeError, match="dry-run signer check failed"):
+        checkpoint_audit.run(client, "b", "k", now=_BOOT_NOW, keyring=other_ring, dry_run=True)
+
+
 def test_dry_run_reports_a_refusal_as_skipped(monkeypatch):
     client, _, _ = _truncated_client(2)
     client._audit_rows.append(_audit_row(9, "sovereign", "cd" * 32)[0])  # 2nd gap
     key = Ed25519PrivateKey.generate()
+    monkeypatch.setattr(checkpoint_audit, "sign_checkpoint", _real_signer(key))
     result = checkpoint_audit.run(
         client,
         "b",
