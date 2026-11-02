@@ -21,6 +21,18 @@ It is not recoverable afterwards. That is the point of the change.
 
 Omit `--allowed-tools` to grant every tool. `--days 0` means no expiry.
 
+## `created_at` and `whoami`
+
+`mint_token` writes `created_at` (ISO-8601 UTC) on every new entry. It is
+optional and informational: older entries without it load fine. A malformed
+value is a startup `ConfigError`, like `not_after`.
+
+Any valid token may call the `whoami` tool, whatever its `allowed_tools`, on both
+tiers. It returns only the caller's own `{principal, created_at, expires_at,
+local_only}` (null when unset), never digests, other principals or the tool
+list. An expired token is still denied, and the call is rate-limited and audited
+like any other. Use it to warn before `expires_at`.
+
 ## Sovereign tier requires `local_only` (M16e)
 
 A `tier="sovereign"` build refuses to authenticate any token whose entry does

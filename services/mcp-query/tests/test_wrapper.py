@@ -301,3 +301,32 @@ def test_wrapped_preserves_signature_and_doc():
     wrapped = audited_tool("query_flows", query_flows, _Recorder(), caller=lambda: ("p", None))
     assert wrapped.__doc__ == "Real docstring."
     assert list(inspect.signature(wrapped).parameters) == ["dst_port"]
+
+
+def test_whoami_bypasses_allowed_tools():
+    rec = _Recorder()
+    wrapped = audited_tool(
+        "whoami", lambda: {"principal": "p"}, rec, caller=lambda: ("p", frozenset({"query_flows"}))
+    )
+    assert wrapped() == {"principal": "p"}
+    assert rec.calls[0]["decision"] == "allow"
+
+
+def test_whoami_denied_for_expired_token_and_audited():
+    import datetime as dt
+
+    rec = _Recorder()
+    past = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+
+    def fn():
+        raise AssertionError("must not run")
+
+    wrapped = audited_tool("whoami", fn, rec, caller=lambda: ("p", None, past))
+    assert wrapped()["error"] == "forbidden"
+    assert rec.calls[0]["decision"] == "deny"
+
+
+def test_allowlist_exemption_is_whoami_only():
+    rec = _Recorder()
+    wrapped = audited_tool("run_sql", lambda: {}, rec, caller=lambda: ("p", frozenset({"whoami"})))
+    assert wrapped()["error"] == "forbidden"

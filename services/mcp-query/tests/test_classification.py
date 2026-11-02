@@ -11,6 +11,7 @@ from ssdf_mcp_query.classification import (
 from ssdf_mcp_query.config import ConfigError
 
 EXPECTED = {
+    "whoami": set(),
     "query_flows": {"security_log"},
     "describe_schema": {"security_log"},
     "top_talkers": {"security_log"},

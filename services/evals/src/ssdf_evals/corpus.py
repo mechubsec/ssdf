@@ -26,7 +26,7 @@ import yaml
 # were unreachable by the corpus until they were added here. A comment asking a
 # human to "keep in sync" is what allowed that, so the sync is now enforced by
 # test_registry_drift.py instead of by this sentence.
-PUBLIC_TOOLS = frozenset({"metric_timeseries", "top_series", "entity_metric_timeseries"})
+PUBLIC_TOOLS = frozenset({"metric_timeseries", "top_series", "entity_metric_timeseries", "whoami"})
 SOVEREIGN_TOOLS = PUBLIC_TOOLS | frozenset(
     {
         "get_entity",
