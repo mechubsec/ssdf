@@ -34,6 +34,7 @@ SOVEREIGN_TOOLS = {
     "unused_rules",
     "explain_rule",
     "change_impact",
+    "whoami",
 }
 
 
@@ -73,6 +74,7 @@ def test_public_build_both_classes_exposes_five_tools(monkeypatch, tmp_path):
         "neighbors",
         "find_path",
         "topology_snapshot",
+        "whoami",
     }
 
 
@@ -84,7 +86,7 @@ def test_public_build_topology_only(monkeypatch, tmp_path):
         "MCP_CLASSIFICATION_FILE", _classification_file(tmp_path, topology="shareable")
     )
     app = server.build_app(tier="public")
-    assert _names(app) == {"locate", "neighbors", "find_path", "topology_snapshot"}
+    assert _names(app) == {"locate", "neighbors", "find_path", "topology_snapshot", "whoami"}
     assert "get_entity" not in _names(app)
 
 
@@ -95,8 +97,8 @@ def test_public_build_zero_tools_warns(monkeypatch, tmp_path, capsys):
     # no MCP_CLASSIFICATION_FILE -> everything sovereign -> zero public tools
     monkeypatch.delenv("MCP_CLASSIFICATION_FILE", raising=False)
     app = server.build_app(tier="public")
-    assert _names(app) == set()
-    assert "no shareable classes" in capsys.readouterr().err
+    assert _names(app) == {"whoami"}  # whoami is served on every build
+    assert "no shareable classes configured; only whoami exposed" in capsys.readouterr().err
 
 
 def test_public_build_never_exposes_run_sql_or_security_tools(monkeypatch, tmp_path):
@@ -160,6 +162,7 @@ def test_public_build_does_not_construct_entity_store(monkeypatch, tmp_path):
         "neighbors",
         "find_path",
         "topology_snapshot",
+        "whoami",
     }
 
 
@@ -212,6 +215,7 @@ def test_public_build_metrics_config_exposes_only_metrics(monkeypatch, tmp_path)
         "metric_timeseries",
         "top_series",
         "entity_metric_timeseries",
+        "whoami",
     }
     assert "reidentify" not in _names(app)  # sovereign-only, never a public candidate
 
@@ -228,6 +232,7 @@ def test_public_metrics_example_config_is_metrics_only(monkeypatch):
         "metric_timeseries",
         "top_series",
         "entity_metric_timeseries",
+        "whoami",
     }
 
 
@@ -263,3 +268,12 @@ def test_host_log_patterns_not_public_but_on_sovereign(monkeypatch, tmp_path):
     )
     assert "host_log_patterns" not in _names(server.build_app(tier="public"))
     assert "host_log_patterns" in _names(server.build_app(tier="sovereign"))
+
+
+def test_whoami_registered_on_both_tiers(monkeypatch):
+    import ssdf_mcp_query.server as server
+
+    _patch_ch(monkeypatch, server)
+    monkeypatch.delenv("MCP_CLASSIFICATION_FILE", raising=False)
+    assert "whoami" in _names(server.build_app(tier="sovereign"))
+    assert "whoami" in _names(server.build_app(tier="public"))

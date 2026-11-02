@@ -62,7 +62,7 @@ def test_all_tools_registered_single_token(monkeypatch):
 
     _patch_ch(monkeypatch, server)
     app = server.build_app()
-    assert _names(app) == EXPECTED_TOOLS
+    assert _names(app) == EXPECTED_TOOLS | {"whoami"}
 
 
 def _write_tokens(tmp_path, payload):
@@ -86,7 +86,7 @@ def test_multi_principal_tokens_register(monkeypatch, tmp_path):
     monkeypatch.setenv("MCP_TOKENS_FILE", str(f))
     _patch_ch(monkeypatch, server)
     app = server.build_app()
-    assert _names(app) == EXPECTED_TOOLS
+    assert _names(app) == EXPECTED_TOOLS | {"whoami"}
 
 
 def test_build_app_fails_closed_when_audit_required_without_password(monkeypatch):
@@ -173,3 +173,33 @@ def test_mask_error_details_hides_exception_detail(monkeypatch):
     assert str(excinfo.value) == "Error calling tool 'query_flows'"
     assert "hunter2" not in str(excinfo.value)
     assert "RuntimeError" not in str(excinfo.value)
+
+
+def test_verifier_claims_carry_local_only_and_created_at(monkeypatch, tmp_path):
+    import ssdf_mcp_query.server as server
+
+    f = _write_tokens(
+        tmp_path,
+        {
+            digest_for("tok-a"): {
+                "principal": "a",
+                "local_only": True,
+                "created_at": "2026-08-01T00:00:00+00:00",
+            },
+            digest_for("tok-b"): {"principal": "b", "local_only": True},
+        },
+    )
+    monkeypatch.setenv("MCP_TOKENS_FILE", str(f))
+    _patch_ch(monkeypatch, server)
+    captured = {}
+    real_verifier = server.DigestTokenVerifier
+
+    def _spy(tokens):
+        captured.update(tokens)
+        return real_verifier(tokens)
+
+    monkeypatch.setattr(server, "DigestTokenVerifier", _spy)
+    server.build_app()
+    assert captured[digest_for("tok-a")]["created_at"] == "2026-08-01T00:00:00+00:00"
+    assert captured[digest_for("tok-a")]["local_only"] is True
+    assert "created_at" not in captured[digest_for("tok-b")]

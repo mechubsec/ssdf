@@ -33,16 +33,15 @@ def build_entry(
 ) -> tuple[str, dict]:
     """Return ``(token, {digest: entry})`` for a freshly minted token."""
     token = mint_token()
-    entry: dict = {"principal": principal}
+    now = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0)
+    entry: dict = {"principal": principal, "created_at": now.isoformat()}
     if allowed_tools:
         entry["allowed_tools"] = allowed_tools
     if local_only:
         entry["local_only"] = True
     if days is not None:
-        expiry = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=days)
-        # Whole seconds: not_after is parsed with fromisoformat and compared,
-        # so sub-second precision is noise in a file a human edits.
-        entry["not_after"] = expiry.replace(microsecond=0).isoformat()
+        # Whole seconds (via `now`): sub-second precision is noise in a file a human edits.
+        entry["not_after"] = (now + _dt.timedelta(days=days)).isoformat()
     return token, {digest_for(token): entry}
 
 

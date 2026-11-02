@@ -19,6 +19,10 @@ from .auth import current_caller_claims
 from .classification import classes_for_tool
 from .ratelimit import ConcurrencyExceeded, PrincipalLimiter, RateLimitExceeded
 
+# Tools any valid token may call whatever its allowed_tools: a caller must be
+# able to learn when its own token expires. Expiry, limits and audit still apply.
+ALLOWLIST_EXEMPT_TOOLS: frozenset[str] = frozenset({"whoami"})
+
 # Args that must never reach ssdf.audit verbatim, by tool name:
 # `change_impact.junos_current_text` is the caller's pasted device output,
 # which may carry device secrets alongside the policy config. Hash + length
@@ -116,7 +120,7 @@ def audited_tool(
         not_after = info[2] if len(info) > 2 else None
         if not_after is not None and _dt.datetime.now(_dt.timezone.utc) >= not_after:
             return _deny(principal, kwargs, f"token for principal '{principal}' has expired")
-        if allowed is not None and tool_name not in allowed:
+        if allowed is not None and tool_name not in allowed | ALLOWLIST_EXEMPT_TOOLS:
             return _deny(
                 principal, kwargs, f"tool '{tool_name}' not permitted for principal '{principal}'"
             )

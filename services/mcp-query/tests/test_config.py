@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import pathlib
 import pytest
@@ -263,3 +264,23 @@ def test_checkpoint_verify_key_paths_empty_when_unconfigured(monkeypatch):
     monkeypatch.delenv("CH_CHECKPOINT_VERIFY_KEY_PATH", raising=False)
     cfg = load_config()
     assert cfg.ch_checkpoint_verify_key_paths == ()
+
+
+def test_token_map_created_at_parsed_utc(monkeypatch, tmp_path):
+    f = tmp_path / "tokens.json"
+    f.write_text(
+        json.dumps({digest_for("t"): {"principal": "p", "created_at": "2026-08-01T00:00:00"}})
+    )
+    f.chmod(0o600)
+    monkeypatch.setenv("MCP_TOKENS_FILE", str(f))
+    (policy,) = load_token_map().values()
+    assert policy.created_at == dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc)
+
+
+def test_token_map_bad_created_at_raises(monkeypatch, tmp_path):
+    f = tmp_path / "tokens.json"
+    f.write_text(json.dumps({digest_for("t"): {"principal": "p", "created_at": "yesterday"}}))
+    f.chmod(0o600)
+    monkeypatch.setenv("MCP_TOKENS_FILE", str(f))
+    with pytest.raises(ConfigError, match="created_at"):
+        load_token_map()

@@ -38,6 +38,7 @@ class TokenPrincipal:
     allowed_tools: frozenset[str] | None
     not_after: _dt.datetime | None = None
     local_only: bool = False
+    created_at: _dt.datetime | None = None  # informational; surfaced by whoami
 
 
 @dataclass(frozen=True)
@@ -97,19 +98,19 @@ def ch_tls_kwargs(config: "Config") -> dict:
     return kwargs
 
 
-def parse_not_after(value: object) -> _dt.datetime | None:
-    """Parse a tokens-file ``not_after`` ISO-8601 string (naive ⇒ UTC).
+def parse_not_after(value: object, field: str = "not_after") -> _dt.datetime | None:
+    """Parse a tokens-file ISO-8601 timestamp (``not_after``/``created_at``; naive ⇒ UTC).
 
     Raises ``ConfigError`` on any non-string or unparseable value (fail closed).
     """
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ConfigError(f"not_after must be an ISO-8601 string, got {type(value).__name__}")
+        raise ConfigError(f"{field} must be an ISO-8601 string, got {type(value).__name__}")
     try:
         parsed = _dt.datetime.fromisoformat(value)
     except ValueError as exc:
-        raise ConfigError(f"invalid not_after {value!r}: {exc}") from exc
+        raise ConfigError(f"invalid {field} {value!r}: {exc}") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=_dt.timezone.utc)
     return parsed
@@ -195,6 +196,7 @@ def load_token_map() -> dict[str, TokenPrincipal]:
             allowed_tools=allowed_set,
             not_after=parse_not_after(meta.get("not_after")),
             local_only=parse_local_only(meta.get("local_only")),
+            created_at=parse_not_after(meta.get("created_at"), "created_at"),
         )
     return tokens
 

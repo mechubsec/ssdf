@@ -22,6 +22,7 @@ from .classification import load_classification, public_tool_names
 # drop it and break every test in test_server_audit.py / test_server_public.py.
 from .audit import Auditor, make_ch_auditor  # noqa: F401  (test patch seam)
 from .wrapper import audited_tool
+from .auth import current_caller_identity
 from .ratelimit import PrincipalLimiter
 from .clickhouse import ClickHouseClient
 from .tools import Tools
@@ -86,7 +87,10 @@ def build_app(tier: str = "sovereign") -> FastMCP:
             "client_id": "ssdf",
             "tier": tier,
             "principal": tp.principal,
+            "local_only": tp.local_only,
         }
+        if tp.created_at is not None:
+            payload["created_at"] = tp.created_at.isoformat()
         if tp.allowed_tools is not None:
             payload["allowed_tools"] = sorted(tp.allowed_tools)
         if tp.not_after is not None:
@@ -395,6 +399,13 @@ def build_app(tier: str = "sovereign") -> FastMCP:
             until=until,
         )
 
+    def whoami() -> dict:
+        """Your own token's identity: {principal, created_at, expires_at, local_only}.
+        Works for any valid token regardless of its allowed_tools. created_at and
+        expires_at are ISO-8601 UTC or null (unknown / never expires). Use it to
+        learn when your token expires."""
+        return current_caller_identity()
+
     raw_tools = {
         "query_flows": query_flows,
         "describe_schema": describe_schema,
@@ -430,7 +441,7 @@ def build_app(tier: str = "sovereign") -> FastMCP:
     if tier == "public":
         selected = public_tool_names(classification, list(raw_tools))
         if not selected:
-            print("[public] no shareable classes configured; 0 tools exposed", file=sys.stderr)
+            print("[public] no shareable classes configured; only whoami exposed", file=sys.stderr)
     else:
         selected = list(raw_tools)
 
@@ -449,6 +460,11 @@ def build_app(tier: str = "sovereign") -> FastMCP:
             f"{config.max_concurrent_calls} concurrent",
             file=sys.stderr,
         )
+
+    # whoami has no data class, so public_tool_names would drop it; it returns only
+    # the caller's own token metadata, so both tiers serve it unconditionally.
+    raw_tools["whoami"] = whoami
+    selected.append("whoami")
 
     for name in selected:
         mcp.tool(name=name)(

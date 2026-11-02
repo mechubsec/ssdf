@@ -158,7 +158,7 @@ def test_mint_entry_is_keyed_by_digest_and_carries_expiry():
 def test_mint_entry_without_expiry_or_tool_list():
     _, entry = build_entry("admin", None, days=None)
     (key,) = entry
-    assert entry[key] == {"principal": "admin"}
+    assert entry[key].keys() == {"principal", "created_at"}
 
 
 def test_minted_entry_loads_and_authenticates_end_to_end(tmp_path, monkeypatch):

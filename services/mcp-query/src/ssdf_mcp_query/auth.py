@@ -44,6 +44,23 @@ def current_caller_claims() -> tuple[str, frozenset[str] | None, _dt.datetime | 
     return principal, allowed_set, _parse_claim_not_after(claims.get("not_after"))
 
 
+def current_caller_identity() -> dict:
+    """Return the in-flight caller's own token metadata (the ``whoami`` payload).
+
+    Built from an explicit field list, never from the raw claims, so nothing
+    else a claim might carry (allowed_tools, digests) can leak into the output.
+    """
+    token = get_access_token()
+    claims = token.claims if token is not None and token.claims else {}
+    expires = _parse_claim_not_after(claims.get("not_after"))
+    return {
+        "principal": claims.get("principal") or claims.get("sub") or "unknown",
+        "created_at": claims.get("created_at"),
+        "expires_at": expires.isoformat() if expires is not None else None,
+        "local_only": bool(claims.get("local_only", False)),
+    }
+
+
 def current_caller() -> tuple[str, frozenset[str] | None]:
     """Return ``(principal, allowed_tools)`` for the in-flight request.
 

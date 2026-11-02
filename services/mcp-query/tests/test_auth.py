@@ -81,3 +81,36 @@ def test_claims_malformed_not_after_fails_closed(monkeypatch):
     _, _, not_after = auth.current_caller_claims()
     assert not_after is not None
     assert not_after <= dt.datetime.now(dt.timezone.utc)
+
+
+def test_identity_returns_own_fields_only(monkeypatch):
+    monkeypatch.setattr(
+        auth,
+        "get_access_token",
+        lambda: _fake_token(
+            {
+                "principal": "bot",
+                "allowed_tools": ["query_flows"],
+                "created_at": "2026-08-01T00:00:00+00:00",
+                "not_after": "2026-11-01T00:00:00",
+                "local_only": True,
+                "digest": "sha256:abc",
+            }
+        ),
+    )
+    assert auth.current_caller_identity() == {
+        "principal": "bot",
+        "created_at": "2026-08-01T00:00:00+00:00",
+        "expires_at": "2026-11-01T00:00:00+00:00",
+        "local_only": True,
+    }
+
+
+def test_identity_nulls_when_absent(monkeypatch):
+    monkeypatch.setattr(auth, "get_access_token", lambda: _fake_token({"principal": "p"}))
+    assert auth.current_caller_identity() == {
+        "principal": "p",
+        "created_at": None,
+        "expires_at": None,
+        "local_only": False,
+    }
