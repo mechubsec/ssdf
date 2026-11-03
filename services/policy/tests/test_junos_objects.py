@@ -1,5 +1,7 @@
 """MEC-992: Junos address-book + application object-book collection."""
 
+from fastmcp.exceptions import ToolError
+
 from ssdf_policy.collectors.junos import (
     parse_address_book,
     parse_applications,
@@ -197,3 +199,66 @@ def test_collect_objects_skips_unreachable_device():
         _BoomClient(), "2026-09-30T00:00:00Z"
     )
     assert books == []
+
+
+def test_collect_objects_does_not_retry_device_collect_found_unreachable():
+    """Each dead device stalls on the vendor MCP's SSH timeout; paying it twice
+    per run pushed ssdf-policy past its 600s TimeoutStartSec on a fleet with
+    many powered-off vSRXs."""
+    from ssdf_policy.collectors.junos import JunosPolicyCollector
+
+    client = _ObjectBookClient(
+        policies_error=ToolError(
+            "netconf error: transport error: connection failed: "
+            "SSH connect to 192.0.2.1:22 failed: No route to host (os error 113)"
+        )
+    )
+    collector = JunosPolicyCollector(["vsrx-dead", "vsrx-live"])
+    collector.collect(client, "2026-09-30T00:00:00Z")
+    client.devices_called.clear()
+
+    books = collector.collect_objects(client, "2026-09-30T00:00:00Z")
+
+    assert "vsrx-dead" not in client.devices_called
+    assert [book["device_name"] for book in books] == ["vsrx-live"]
+
+
+def test_collect_objects_still_reads_device_that_only_rejected_policy_command():
+    """A reachable device whose policy read fails for another reason (command
+    refused, bad scope) must not lose its object book too."""
+    from ssdf_policy.collectors.junos import JunosPolicyCollector
+
+    client = _ObjectBookClient(policies_error=ToolError("error: syntax error, expecting <command>"))
+    collector = JunosPolicyCollector(["vsrx-dead", "vsrx-live"])
+    collector.collect(client, "2026-09-30T00:00:00Z")
+
+    books = collector.collect_objects(client, "2026-09-30T00:00:00Z")
+
+    assert [book["device_name"] for book in books] == ["vsrx-dead", "vsrx-live"]
+
+
+class _ObjectBookClient:
+    """Serves object-book text; "vsrx-dead" raises policies_error on the policy read
+    and, unless that error is a command rejection, on every other command too."""
+
+    def __init__(self, policies_error):
+        self.policies_error = policies_error
+        self.devices_called = []
+
+    def call_tool(self, name, args=None):
+        device = (args or {})["router_name"]
+        self.devices_called.append(device)
+        command = args["command"]
+        if device == "vsrx-dead" and (
+            "security policies" in command or "transport error" in str(self.policies_error)
+        ):
+            raise self.policies_error
+        if "address-book" in command:
+            return ADDRESS_BOOK_TEXT
+        if "security zones" in command:
+            return ZONE_ADDRESS_BOOK_TEXT
+        if "groups junos-defaults" in command:
+            return PREDEFINED_TEXT
+        if "applications" in command:
+            return APPLICATIONS_TEXT
+        return ""

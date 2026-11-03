@@ -11,6 +11,8 @@ import logging
 
 import re
 
+from fastmcp.exceptions import ToolError
+
 from .base import register
 from .matchunknown import derive_match_unknown
 
@@ -370,6 +372,20 @@ def parse_predefined_applications(text: str) -> dict[str, dict]:
     return {"applications": apps, "application_sets": app_sets}
 
 
+def _is_unreachable(exc: Exception) -> bool:
+    """True when exc means the device could not be reached, not that it rejected a command.
+
+    A powered-off vSRX surfaces as a ToolError from the vendor MCP, e.g.
+    "netconf error: transport error: connection failed: SSH connect ... No route to host",
+    so the class alone cannot tell it from a command the device refused. Anything that
+    is not a ToolError (timeout, HTTP failure to the vendor MCP) never reached the device.
+    shortcut: matches rust-junosmcp's message text; if it changes, devices are just re-dialed.
+    """
+    if isinstance(exc, ToolError):
+        return "transport error" in str(exc)
+    return True
+
+
 @register("junos")
 class JunosPolicyCollector:
     """Collects configured security policies from one or more vSRX devices."""
@@ -378,6 +394,10 @@ class JunosPolicyCollector:
 
     def __init__(self, devices: list[str] | None = None):
         self.devices = devices or []
+        # Devices collect() could not reach this run. collect_objects() skips them:
+        # each dead device costs the vendor MCP's SSH timeout, and paying it twice
+        # per run pushed ssdf-policy past its TimeoutStartSec on a mostly-off fleet.
+        self._unreachable: set[str] = set()
 
     def collect(self, client, now: str) -> list[dict]:
         """Read each device's configured policy, skipping ones that fail.
@@ -386,6 +406,7 @@ class JunosPolicyCollector:
         an uncaught error here would discard every other device's rules too.
         """
         rules: list[dict] = []
+        self._unreachable = set()
         for dev in self.devices:
             try:
                 text = client.call_tool(
@@ -395,8 +416,10 @@ class JunosPolicyCollector:
                         "command": "show configuration security policies | display set",
                     },
                 )
-            except Exception:
+            except Exception as exc:
                 logger.warning("junos device %r unreachable; skipping", dev, exc_info=True)
+                if _is_unreachable(exc):
+                    self._unreachable.add(dev)
                 continue
             try:
                 dev_rules = parse_security_policies(text, dev, now)
@@ -435,6 +458,11 @@ class JunosPolicyCollector:
         """
         books: list[dict] = []
         for dev in self.devices:
+            if dev in self._unreachable:
+                logger.warning(
+                    "junos device %r unreachable in collect(); skipping object book", dev
+                )
+                continue
             try:
                 addr_text = client.call_tool(
                     "execute_junos_command",
