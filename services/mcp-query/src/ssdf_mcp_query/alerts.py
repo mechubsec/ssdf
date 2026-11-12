@@ -3,6 +3,10 @@
 Severity normalization lives HERE (SSDF owns the schema knowledge): ssdf.events
 has no severity column; each provider hides severity in ext differently.
 Scale: critical=4, high=3, medium=2, low=1.
+
+alert_counts: grouped counts over the SAME alert gate, severity expression and
+signature expression as recent_alerts, so a noisy source cannot hide how many
+alerts of each kind there were behind recent_alerts' row limit.
 """
 
 from __future__ import annotations
@@ -24,6 +28,11 @@ ALERT_KINDS = ("alert",)
 # if sev != "" { ext = set!(ext, ["panw.panos.severity"], sev) }
 PAN_SEVERITY_KEY = "panw.panos.severity"
 
+# UniFi controller events (WAN down, device offline, IP conflict...) carry the CEF
+# header severity 0-10. Bands follow the common CEF convention: 0-3 low, 4-6 medium,
+# 7-8 high, 9-10 critical. UniFi does not document which severity an outage gets.
+_UNIFI_EVENT_SEV_SQL = "toInt32OrZero(ext['unifi.event.severity'])"
+
 # normalize_severity as a ClickHouse expression, so the floor applies BEFORE the
 # LIMIT. Filtering only in Python let the newest rows below the floor (PAN-OS
 # informational system logs, thousands a day) use up the whole LIMIT and the tool
@@ -37,6 +46,9 @@ SEVERITY_NUM_SQL = (
     "lower(ext['panw.panos.severity']) = 'high', 3, "
     "lower(ext['panw.panos.severity']) = 'medium', 2, "
     "lower(ext['panw.panos.severity']) IN ('low', 'informational'), 1, 2), "
+    "ext['unifi.event.severity'] != '', "
+    f"multiIf({_UNIFI_EVENT_SEV_SQL} <= 3, 1, {_UNIFI_EVENT_SEV_SQL} <= 6, 2, "
+    f"{_UNIFI_EVENT_SEV_SQL} <= 8, 3, 4), "
     "ext['syslog.severity'] != '', "
     "multiIf(toInt32OrZero(ext['syslog.severity']) <= 2, 4, "
     "toInt32OrZero(ext['syslog.severity']) = 3, 3, "
@@ -46,6 +58,33 @@ SEVERITY_NUM_SQL = (
 
 # Junos screen (RT_SCREEN) rows carry this literal instead of a rule name.
 NO_RULE_NAMES = ("", "N/A")
+
+# How an alert is named: UniFi IPS signature, else rule name (unless empty/N/A),
+# else event action, else event kind. ONE definition, used by recent_alerts and
+# alert_counts, in SQL so grouped counts are exact.
+SIGNATURE_SQL = (
+    "multiIf(ext['unifi.ips.signature'] != '', ext['unifi.ips.signature'], "
+    f"rule_name NOT IN {NO_RULE_NAMES!r}, rule_name, "
+    "event_action != '', event_action, event_kind)"
+)
+
+# Alert-class gate: explicit event_kind IN (alert) OR has UniFi IPS signature
+# OR has PAN severity ext key (PAN THREAT logs keep event_kind='event')
+ALERT_GATE_SQL = (
+    "(event_kind IN %(kinds)s OR ext['unifi.ips.signature'] != '' "
+    "OR ext['panw.panos.severity'] != '')"
+)
+
+# Max (provider, observer, signature, severity) groups alert_counts returns.
+MAX_COUNT_GROUPS = 500
+
+
+def _int_or_zero(value: str) -> int:
+    """Mirror ClickHouse toInt32OrZero for the severity strings."""
+    try:
+        return int(value)
+    except ValueError:
+        return 0
 
 
 def normalize_severity(provider: str, event_kind: str, ext: dict) -> tuple[str, int] | None:
@@ -59,28 +98,42 @@ def normalize_severity(provider: str, event_kind: str, ext: dict) -> tuple[str, 
     Returns:
         (severity_label, severity_num) tuple or None if not alert-class
     """
+    # Empty values count as absent, like the SQL `!= ''` guards in SEVERITY_NUM_SQL.
     # UniFi IPS (Suricata): 1 is WORST, inverted scale
-    # Vector.toml line 519: if sev != "" { ext = set!(ext, ["unifi.ips.severity"], sev) }
-    if "unifi.ips.severity" in ext:
-        sev = ext["unifi.ips.severity"]
-        if sev == "1":
+    ips_sev = ext.get("unifi.ips.severity")
+    if ips_sev:
+        if ips_sev == "1":
             return ("critical", 4)
-        elif sev == "2":
+        if ips_sev == "2":
             return ("high", 3)
-        # 3 and anything else → medium
+        # 3 and anything else -> medium
         return ("medium", 2)
 
     # PAN-OS threat: string severity values
-    if PAN_SEVERITY_KEY in ext:
-        s = ext[PAN_SEVERITY_KEY].lower()
+    pan_sev = ext.get(PAN_SEVERITY_KEY)
+    if pan_sev:
+        s = pan_sev.lower()
         if s in SEVERITY_NUM:
             return (s, SEVERITY_NUM[s])
-        # informational → low, anything unknown → medium
+        # informational -> low, anything unknown -> medium
         return ("low", 1) if s == "informational" else ("medium", 2)
 
+    # UniFi controller event: CEF severity 0-10 (bands documented at _UNIFI_EVENT_SEV_SQL)
+    event_sev = ext.get("unifi.event.severity")
+    if event_sev:
+        n = _int_or_zero(event_sev)
+        if n <= 3:
+            return ("low", 1)
+        if n <= 6:
+            return ("medium", 2)
+        if n <= 8:
+            return ("high", 3)
+        return ("critical", 4)
+
     # Syslog numeric severity: 0-7, lower is worse (RFC 5424)
-    if "syslog.severity" in ext:
-        n = int(ext["syslog.severity"])
+    syslog_sev = ext.get("syslog.severity")
+    if syslog_sev:
+        n = _int_or_zero(syslog_sev)
         if n <= 2:
             return ("critical", 4)
         if n == 3:
@@ -97,6 +150,33 @@ def normalize_severity(provider: str, event_kind: str, ext: dict) -> tuple[str, 
     return None
 
 
+def _alert_where(since: str, min_severity: str, providers: str) -> tuple[list[str], dict]:
+    """WHERE clauses + params shared by recent_alerts and alert_counts.
+
+    `timestamp` is QUALIFIED: recent_alerts' SELECT aliases `toString(timestamp) AS
+    timestamp`, and an unqualified reference binds to that String alias rather
+    than the real DateTime column, making the window a lexical string compare.
+    It happens to agree today only because the bound is a datetime rendered in
+    the same layout toString() emits; qualifying removes the dependency on that
+    coincidence (see build_subgraph_sql, where the layouts differed and a
+    same-day window silently returned nothing).
+    """
+    params = {
+        "since": parse_time(since),
+        "floor": SEVERITY_NUM.get(min_severity, 3),  # default to high if unknown
+        "kinds": tuple(ALERT_KINDS),
+    }
+    where = [
+        "events.timestamp >= %(since)s",
+        ALERT_GATE_SQL,
+        SEVERITY_NUM_SQL + " >= %(floor)s",
+    ]
+    if providers:
+        params["providers"] = tuple(p.strip() for p in providers.split(",") if p.strip())
+        where.append("event_provider IN %(providers)s")
+    return where, params
+
+
 def build_recent_alerts_sql(
     since: str, min_severity: str, providers: str, limit: int
 ) -> tuple[str, dict]:
@@ -111,40 +191,38 @@ def build_recent_alerts_sql(
     Returns:
         (sql, params) tuple ready for ClickHouseClient.run()
     """
-    params = {
-        "since": parse_time(since),
-        "limit": max(1, min(int(limit), 2000)),
-        "floor": SEVERITY_NUM.get(min_severity, 3),  # default to high if unknown
-    }
-
-    # Alert-class gate: explicit event_kind IN (alert) OR has UniFi IPS signature
-    # OR has PAN severity ext key (PAN THREAT logs keep event_kind='event')
-    # `timestamp` is QUALIFIED: the SELECT below aliases `toString(timestamp) AS
-    # timestamp`, and an unqualified reference binds to that String alias rather
-    # than the real DateTime column, making the window a lexical string compare.
-    # It happens to agree today only because the bound is a datetime rendered in
-    # the same layout toString() emits; qualifying removes the dependency on that
-    # coincidence (see build_subgraph_sql, where the layouts differed and a
-    # same-day window silently returned nothing).
-    where = [
-        "events.timestamp >= %(since)s",
-        "(event_kind IN %(kinds)s OR ext['unifi.ips.signature'] != '' OR ext['panw.panos.severity'] != '')",
-        SEVERITY_NUM_SQL + " >= %(floor)s",
-    ]
-    params["kinds"] = tuple(ALERT_KINDS)
-
-    if providers:
-        params["providers"] = tuple(p.strip() for p in providers.split(",") if p.strip())
-        where.append("event_provider IN %(providers)s")
-
+    where, params = _alert_where(since, min_severity, providers)
+    params["limit"] = max(1, min(int(limit), 2000))
     sql = (
         "SELECT event_id, toString(timestamp) AS timestamp, event_provider, "
-        "event_kind, event_action, rule_name, source_ip, source_port, destination_ip, "
+        "event_kind, event_action, rule_name, "
+        f"{SIGNATURE_SQL} AS signature, source_ip, source_port, destination_ip, "
         "destination_port, observer_hostname, observer_ingress_zone, "
         "observer_egress_zone, ext "
         "FROM ssdf.events WHERE "
         + " AND ".join(where)
         + " ORDER BY events.timestamp DESC LIMIT %(limit)s"
+    )
+    return sql, params
+
+
+def build_alert_counts_sql(since: str, min_severity: str, providers: str) -> tuple[str, dict]:
+    """Build SQL counting alert-class events per (provider, observer, signature, severity).
+
+    Same gate, severity expression and signature expression as recent_alerts. Asks
+    for MAX_COUNT_GROUPS + 1 groups so the caller can tell the list was cut.
+    """
+    where, params = _alert_where(since, min_severity, providers)
+    params["max_groups"] = MAX_COUNT_GROUPS + 1
+    sql = (
+        "SELECT event_provider AS provider, observer_hostname AS observer, "
+        f"{SIGNATURE_SQL} AS signature, {SEVERITY_NUM_SQL} AS severity_num, "
+        "count() AS n, toString(min(events.timestamp)) AS first_seen, "
+        "toString(max(events.timestamp)) AS last_seen "
+        "FROM ssdf.events WHERE "
+        + " AND ".join(where)
+        + " GROUP BY provider, observer, signature, severity_num"
+        " ORDER BY severity_num DESC, n DESC LIMIT %(max_groups)s"
     )
     return sql, params
 
@@ -186,13 +264,7 @@ class AlertTools:
                 continue
 
             # log-derived; wrapped as UntrustedText
-            rule_name = r.get("rule_name") or ""
-            sig = (
-                ext.get("unifi.ips.signature")
-                or (rule_name if rule_name not in NO_RULE_NAMES else "")
-                or r.get("event_action")
-                or r.get("event_kind")
-            )
+            sig = r.get("signature") or r.get("event_kind")
 
             rows.append(
                 {
@@ -213,7 +285,7 @@ class AlertTools:
                     "ext_subset": {
                         k: UntrustedText.from_raw(v).to_response()
                         for k, v in ext.items()
-                        if k.startswith(("unifi.ips.", "panw.", "syslog."))
+                        if k.startswith(("unifi.ips.", "unifi.event.", "panw.", "syslog."))
                     },
                 }
             )
@@ -222,4 +294,43 @@ class AlertTools:
             "rows": rows,
             "row_count": len(rows),
             "truncated": len(result.get("rows", [])) >= params["limit"],
+        }
+
+    def alert_counts(
+        self, since: str = "now-24h", min_severity: str = "low", providers: str = ""
+    ) -> dict:
+        """Count alert-class events per (provider, observer, signature, severity).
+
+        Args:
+            since: time window start (ISO-8601 or relative "now-24h" style)
+            min_severity: minimum severity to include (critical|high|medium|low)
+            providers: comma-separated provider filter, or empty for all
+
+        Returns:
+            {rows: [{provider, observer, signature, severity, severity_num, count,
+            first_seen, last_seen}], row_count, truncated}, worst severity first
+            then highest count; at most MAX_COUNT_GROUPS groups.
+        """
+        sql, params = build_alert_counts_sql(since, min_severity, providers)
+        result = self._ch.run(sql, params)
+        labels = {num: label for label, num in SEVERITY_NUM.items()}
+
+        raw_rows = result.get("rows", [])
+        rows = [
+            {
+                "provider": r["provider"],
+                "observer": UntrustedText.from_raw(r.get("observer") or "").to_response(),
+                "signature": UntrustedText.from_raw(r.get("signature") or "").to_response(),
+                "severity": labels.get(r["severity_num"], "medium"),
+                "severity_num": r["severity_num"],
+                "count": r["n"],
+                "first_seen": r["first_seen"],
+                "last_seen": r["last_seen"],
+            }
+            for r in raw_rows[:MAX_COUNT_GROUPS]
+        ]
+        return {
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": len(raw_rows) > MAX_COUNT_GROUPS,
         }

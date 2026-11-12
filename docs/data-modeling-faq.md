@@ -336,10 +336,11 @@ specification we have of the questions agents are expected to answer.
 - "What is the network path from the lab traffic generator to its gateway?"
 
 **4. Detections and alerts:** `recent_alerts` (severity floor, bounded rows),
+`alert_counts` (exact counts per provider/observer/signature/severity),
 `explain_access.detections`
 
-- "Which providers raised alerts in the last 24 hours?" (This tool cannot answer "how
-  many alerts", because its output is capped.)
+- "Which providers raised alerts in the last 24 hours?" (`recent_alerts` cannot answer "how
+  many alerts", because its output is capped; use `alert_counts`.)
 
 **5. Fabric health and freshness** (max timestamp per source, compared with a budget):
 `ingest_status`, `fabric_status`

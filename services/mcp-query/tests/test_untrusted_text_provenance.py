@@ -21,6 +21,7 @@ _UNTRUSTED_BEARING_TOOLS = {
     "run_sql",
     "explain_access",
     "recent_alerts",
+    "alert_counts",
 }
 
 
