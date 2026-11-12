@@ -113,8 +113,9 @@ a name that contains an IPv4, MAC or `@` is stored as `redacted`) and a `raw` re
 from the CEF **header** (`CEF:0|Ubiquiti|UniFi Network|<ver>|<id>|<name>|<sev>`). It
 deliberately leaves out the CEF extension: no admin username or email, no `msg` body,
 no client MAC/alias, no addresses (`source_ip`/`destination_ip` stay null), no device
-name or observer (`observer_hostname` empty), and `user_name` is empty. Find
-unmatched names with `alert_counts` or
+name or observer (`observer_hostname` empty), and `user_name` is empty. The rows are
+not alert-class, so `recent_alerts`/`alert_counts` do not list them. Find unmatched
+names with
 `SELECT ext['unifi.event.name'], count() FROM ssdf.events WHERE event_action='unifi_other' GROUP BY 1`,
 then add a pattern for any that are really outages.
 
