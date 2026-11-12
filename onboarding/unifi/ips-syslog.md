@@ -71,3 +71,37 @@ ALERT (SID 2013479, ET SCAN Behavioral ... Terminal Server ... Outbound, CEF sev
 NOTE: there is no separate "FLOW" wire format on this controller — the SIEM export
 emits only CEF "Threat Detected" security events (the v2 traffic-flow API is 404 on
 this controller, per the header). M9 ingests IPS detections only.
+
+## 5. Other event classes kept (firewall blocks, outages, IP conflicts)
+The `unifi_events` transform (vector.toml) keeps four more classes from the same
+controller CEF stream. It classifies by CEF **event name**, case-insensitive, because
+event ids and `UNIFIcategory` values differ between Network versions and sources.
+Anything not listed is dropped, in particular client connect/disconnect/roam events
+(ids 400-404) and the gateway's plain RFC3164 noise.
+
+| Class | Name match (case-insensitive) | `event_kind` / `event_action` | Status |
+|---|---|---|---|
+| Intrusion | `Threat Detected` or `Threat Detected and Blocked` (`unifi_cef_threat` -> `unifi_ips`, unchanged mapping) | alert / `alert_<policy>` | id 200 seen live on 10.68.57; 11.0.99 not yet observed |
+| Firewall block | `Blocked by Firewall` | event / `flow_deny` | seen live on 11.0.99 (id 203) |
+| WAN down | `Internet\|WAN` + `Down\|Offline\|Disconnected` | alert / `wan_down` | documentation only (id 100) |
+| WAN flap | `Multiple\|Temporary` + `Internet\|WAN Disconnection` | alert / `wan_flap` | documentation only (ids 101, 104) |
+| WAN failover | contains `failover` | alert / `wan_failover` | documentation only |
+| Device offline | `Device(s) Offline\|Disconnected\|Unreachable`, `lost contact` | alert / `device_offline` | documentation only (ids 512, 515) |
+| IP conflict | `ip` and `conflict` in either order, `duplicate ip` | alert / `ip_conflict` | name is a guess; no source documents it |
+
+Mapping: `flow_deny` rows carry `source_ip` (`src`, else `UNIFIsrcClientIp`),
+`destination_ip` (`dst`, else `UNIFIdstClientIp`, else `UNIFIdstDeviceIp`), ports,
+transport, `rule_name` (`UNIFIfirewallPolicy`, else `UNIFIpolicyName`), zones, and
+`event_outcome=failure`, like PAN-OS deny rows. Alert rows put the affected device
+address in `source_ip` when it is IPv4; IPv6 and MACs only ever go to `ext`. Every row
+has `ext['unifi.event.id'|'name'|'severity'|'category']`; alert rows also carry
+`ext['syslog.severity']='3'` so `recent_alerts` (default floor `high`) shows them.
+
+Controller settings: Settings -> System -> Logging (SIEM / remote syslog, UDP 516) must
+export the **Security** (Firewall, Intrusion Prevention), **Internet** (Outage &
+Failover) and **System/UniFi Devices** (Devices) log categories; the **Client Devices**
+categories can stay on or off, they are dropped. A firewall policy only emits "Blocked
+by Firewall" when its Logging option is enabled.
+
+Not kept on purpose: `Internet Restored` / `Device Reconnected` (recovery notices),
+latency and packet-loss alerts, admin and audit events.
