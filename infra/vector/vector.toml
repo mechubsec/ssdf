@@ -713,9 +713,10 @@ if cerr != null {
 # differ between Network versions and documentation sources (only "Blocked by
 # Firewall" is verified live on 11.0.99), so a name match fails safer. Client
 # connect/disconnect/roam events (ids 400-404) are dropped explicitly, and any
-# unrecognised name is dropped (abort), so new controller events never reach
-# ssdf.events unreviewed. Threat events stay on
-# unifi_cef_threat -> unifi_ips. See onboarding/unifi/ips-syslog.md.
+# unrecognised non-client name becomes a low-priority "unifi_other" row that keeps
+# ONLY event id/name/severity/category (see below), so an outage whose real name
+# matches no pattern shows up as a name and a count instead of vanishing. Threat
+# events stay on unifi_cef_threat -> unifi_ips. See onboarding/unifi/ips-syslog.md.
 [transforms.unifi_events]
 type = "remap"
 inputs = ["unifi_syslog"]
@@ -730,6 +731,8 @@ if derr != null { abort }
 name = string(doc.name) ?? ""
 lname = downcase(name)
 if match(lname, r'^(wifi |wired )?client') { abort }
+# IPS detections are unifi_ips' (the unifi_cef_threat filter matches the same names).
+if match(lname, r'^threat detected( and blocked)?$') { abort }
 
 action = ""
 if match(lname, r'blocked by firewall') {
@@ -738,6 +741,10 @@ if match(lname, r'blocked by firewall') {
     action = "wan_failover"
 } else if match(lname, r'(internet|wan) (down|offline|disconnected)') {
     action = "wan_down"
+} else if match(lname, r'(internet|wan) (up|restored|back online|online|recovered|reconnected|connected)') {
+    action = "wan_up"
+} else if match(lname, r'devices? (is )?(back online|online|reconnected|restored)|^back online') {
+    action = "device_online"
 } else if match(lname, r'(multiple|temporary) (internet|wan) disconnection') {
     action = "wan_flap"
 } else if match(lname, r'devices? (offline|disconnected|unreachable)|lost contact') {
@@ -745,7 +752,7 @@ if match(lname, r'blocked by firewall') {
 } else if match(lname, r'ip.*conflict|conflict.*ip|duplicate ip') {
     action = "ip_conflict"
 } else {
-    abort
+    action = "unifi_other"
 }
 
 event_ts = now()
@@ -768,63 +775,91 @@ ev.observer_hostname = ""
 ev.user_name = ""
 ev.raw = raw
 ext = {}
-if action == "flow_deny" {
+if action == "unifi_other" {
+    # Catch-all: id/name/severity/category only. No raw line (its extension can carry
+    # admin usernames, emails and message bodies), no msg, no client or device fields,
+    # no addresses. raw is rebuilt from the CEF header; a name that looks like it
+    # embeds an address or email is replaced.
+    safe_name = slice!(name, 0, 128)
+    if match(safe_name, r'@|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|(?i)([0-9a-f]{2}[:-]){5}[0-9a-f]{2}') { safe_name = "redacted" }
+    event_id_text = slice!(string(doc.deviceEventClassId) ?? "", 0, 16)
+    severity_text = slice!(string(doc.severity) ?? "", 0, 8)
+    ev.event_kind = "event"
+    ev.event_outcome = "unknown"
+    ev.observer_ingress_zone = ""
+    ev.observer_egress_zone = ""
+    ev.raw = slice!("CEF:0|Ubiquiti|UniFi Network|" + (string(doc.deviceVersion) ?? "") + "|" + event_id_text + "|" + safe_name + "|" + severity_text, 0, 512)
+    ext = set!(ext, ["unifi.event.id"], event_id_text)
+    ext = set!(ext, ["unifi.event.name"], safe_name)
+    ext = set!(ext, ["unifi.event.severity"], severity_text)
+    category_text = slice!(string(doc.UNIFIcategory) ?? "", 0, 64)
+    if category_text != "" { ext = set!(ext, ["unifi.event.category"], category_text) }
+    ev.ext = ext
+    . = ev
+} else if action == "flow_deny" {
     ev.event_kind = "event"
     ev.rule_name = string(doc.UNIFIfirewallPolicy) ?? string(doc.UNIFIpolicyName) ?? ""
     ev.observer_hostname = string(doc.UNIFIdeviceName) ?? string(doc.UNIFIdstDeviceName) ?? ""
 } else {
+    # Outages and conflicts are alerts (severity from unifi.event.severity, which
+    # mcp-query maps); recoveries are plain events that mark the end of an outage.
     ev.event_kind = "alert"
-    # recent_alerts hides rows without a severity ext key (default floor "high");
-    # reuse its syslog scale (3 = high) so outages surface by default.
-    ext = set!(ext, ["syslog.severity"], "3")
-    if action != "device_offline" && action != "ip_conflict" { ev.observer_hostname = string(doc.UNIFIdeviceName) ?? "" }
+    if action == "wan_up" || action == "device_online" {
+        ev.event_kind = "event"
+        ev.event_outcome = "success"
+    }
+    if action != "device_offline" && action != "device_online" && action != "ip_conflict" { ev.observer_hostname = string(doc.UNIFIdeviceName) ?? "" }
 }
-proto = downcase(string(doc.proto) ?? "")
-if match(proto, r'^[a-z0-9_-]{1,64}$') { ev.network_transport = proto }
-sp = to_int(doc.spt) ?? null
-if sp != null { ev.source_port = sp }
-dp = to_int(doc.dpt) ?? null
-if dp != null { ev.destination_port = dp }
+# Everything below copies addresses and client/device fields; the unifi_other row above
+# already assigned its minimal event and must not reach it.
+if action != "unifi_other" {
+    proto = downcase(string(doc.proto) ?? "")
+    if match(proto, r'^[a-z0-9_-]{1,64}$') { ev.network_transport = proto }
+    sp = to_int(doc.spt) ?? null
+    if sp != null { ev.source_port = sp }
+    dp = to_int(doc.dpt) ?? null
+    if dp != null { ev.destination_port = dp }
 
-# source_ip/destination_ip are Nullable(IPv4): first IPv4 candidate wins, anything
-# else (IPv6, MAC, hostname) stays out of the typed column.
-for_each(["src", "UNIFIsrcClientIp", "UNIFIdeviceIp", "UNIFIclientIp"]) -> |_i, key| {
-    candidate = string(get!(doc, [key])) ?? ""
-    _n, nerr = ip_aton(candidate)
-    if nerr == null && !exists(ev.source_ip) { ev.source_ip = candidate }
-}
-for_each(["dst", "UNIFIdstClientIp", "UNIFIdstDeviceIp"]) -> |_i, key| {
-    candidate = string(get!(doc, [key])) ?? ""
-    _n, nerr = ip_aton(candidate)
-    if nerr == null && !exists(ev.destination_ip) { ev.destination_ip = candidate }
-}
+    # source_ip/destination_ip are Nullable(IPv4): first IPv4 candidate wins, anything
+    # else (IPv6, MAC, hostname) stays out of the typed column.
+    for_each(["src", "UNIFIsrcClientIp", "UNIFIdeviceIp", "UNIFIclientIp"]) -> |_i, key| {
+        candidate = string(get!(doc, [key])) ?? ""
+        _n, nerr = ip_aton(candidate)
+        if nerr == null && !exists(ev.source_ip) { ev.source_ip = candidate }
+    }
+    for_each(["dst", "UNIFIdstClientIp", "UNIFIdstDeviceIp"]) -> |_i, key| {
+        candidate = string(get!(doc, [key])) ?? ""
+        _n, nerr = ip_aton(candidate)
+        if nerr == null && !exists(ev.destination_ip) { ev.destination_ip = candidate }
+    }
 
-ext = set!(ext, ["unifi.event.id"], string(doc.deviceEventClassId) ?? "")
-ext = set!(ext, ["unifi.event.name"], name)
-ext = set!(ext, ["unifi.event.severity"], string(doc.severity) ?? "")
-for_each({
-    "UNIFIcategory": "unifi.event.category",
-    "UNIFIdeviceName": "unifi.device_name",
-    "UNIFIdeviceIp": "unifi.device_ip",
-    "UNIFIdeviceMac": "unifi.device_mac",
-    "UNIFIwanName": "unifi.wan_name",
-    "UNIFIwanId": "unifi.wan_id",
-    "UNIFIwanIsp": "unifi.wan_isp",
-    "UNIFIwanSubnet": "unifi.wan_subnet",
-    "UNIFIsrcClientMac": "unifi.src_mac",
-    "UNIFIsrcClientAlias": "unifi.src_alias",
-    "UNIFIdstClientMac": "unifi.dst_mac",
-    "UNIFIdstClientAlias": "unifi.dst_alias",
-    "UNIFIdirection": "unifi.direction",
-    "UNIFIpolicyType": "unifi.policy_type",
-    "UNIFIdeviceList": "unifi.device_list",
-    "msg": "unifi.msg",
-}) -> |cef_key, ext_key| {
-    value = string(get!(doc, [cef_key])) ?? ""
-    if value != "" { ext = set!(ext, [ext_key], slice!(value, 0, 512)) }
+    ext = set!(ext, ["unifi.event.id"], string(doc.deviceEventClassId) ?? "")
+    ext = set!(ext, ["unifi.event.name"], name)
+    ext = set!(ext, ["unifi.event.severity"], string(doc.severity) ?? "")
+    for_each({
+        "UNIFIcategory": "unifi.event.category",
+        "UNIFIdeviceName": "unifi.device_name",
+        "UNIFIdeviceIp": "unifi.device_ip",
+        "UNIFIdeviceMac": "unifi.device_mac",
+        "UNIFIwanName": "unifi.wan_name",
+        "UNIFIwanId": "unifi.wan_id",
+        "UNIFIwanIsp": "unifi.wan_isp",
+        "UNIFIwanSubnet": "unifi.wan_subnet",
+        "UNIFIsrcClientMac": "unifi.src_mac",
+        "UNIFIsrcClientAlias": "unifi.src_alias",
+        "UNIFIdstClientMac": "unifi.dst_mac",
+        "UNIFIdstClientAlias": "unifi.dst_alias",
+        "UNIFIdirection": "unifi.direction",
+        "UNIFIpolicyType": "unifi.policy_type",
+        "UNIFIdeviceList": "unifi.device_list",
+        "msg": "unifi.msg",
+    }) -> |cef_key, ext_key| {
+        value = string(get!(doc, [cef_key])) ?? ""
+        if value != "" { ext = set!(ext, [ext_key], slice!(value, 0, 512)) }
+    }
+    ev.ext = ext
+    . = ev
 }
-ev.ext = ext
-. = ev
 '''
 
 # Keep only the known Proxmox security lines (pvedaemon/pveproxy auth+task, sshd
@@ -2239,7 +2274,8 @@ assert_eq!(.event_action, "wan_down")
 assert_eq!(.event_outcome, "failure")
 assert_eq!(.source_ip, "192.0.2.1")
 assert_eq!(.observer_hostname, "Example Gateway")
-assert_eq!(.ext."syslog.severity", "3")
+assert_eq!(.ext."unifi.event.severity", "10")
+assert!(!exists(.ext."syslog.severity"))
 assert_eq!(.ext."unifi.event.id", "100")
 assert_eq!(.ext."unifi.event.severity", "10")
 assert_eq!(.ext."unifi.wan_id", "WAN1")
@@ -2382,12 +2418,129 @@ type = "raw"
 value = 'Nov 12 10:00:00 ctrl-example CEF:0|Ubiquiti|UniFi Network|11.0.99|402|WiFi Client Roamed|1|UNIFIcategory=Client Devices msg=roamed'
 
 [[tests]]
-name = "unifi_events_drops_unlisted_event"
+name = "unifi_events_unlisted_event_becomes_unifi_other_without_personal_fields"
+[[tests.inputs]]
+insert_at = "unifi_events"
+type = "raw"
+value = 'Nov 12 10:00:00 ctrl-example CEF:0|Ubiquiti|UniFi Network|11.0.99|546|Config Modified|5|UNIFIcategory=Audit UNIFIsite=Default suser=example-admin UNIFIadminEmail=admin@example.invalid UNIFIdeviceName=Example Gateway UNIFIdeviceIp=192.0.2.1 UNIFIsrcClientMac=02:00:5e:00:00:60 UNIFIsrcClientAlias=example-laptop UNIFIutcTime=2026-11-12T10:07:00.000Z msg=example-admin changed the firewall at 192.0.2.77'
+[[tests.outputs]]
+extract_from = "unifi_events"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_kind, "event")
+assert_eq!(.event_action, "unifi_other")
+assert_eq!(.event_provider, "unifi")
+assert_eq!(.event_outcome, "unknown")
+assert_eq!(.timestamp, t'2026-11-12T10:07:00Z')
+assert_eq!(.ext."unifi.event.id", "546")
+assert_eq!(.ext."unifi.event.name", "Config Modified")
+assert_eq!(.ext."unifi.event.severity", "5")
+assert_eq!(.ext."unifi.event.category", "Audit")
+assert_eq!(.user_name, "")
+assert!(!exists(.source_ip))
+assert!(!exists(.destination_ip))
+assert_eq!(.observer_hostname, "")
+assert_eq!(length!(.ext), 4)
+raw = string!(.raw)
+assert_eq!(raw, "CEF:0|Ubiquiti|UniFi Network|11.0.99|546|Config Modified|5")
+assert!(!contains(raw, "example-admin"))
+assert!(!contains(raw, "192.0.2."))
+assert!(!contains(raw, "example.invalid"))
+'''
+
+[[tests]]
+name = "unifi_events_unifi_other_redacts_a_name_that_embeds_an_address"
+[[tests.inputs]]
+insert_at = "unifi_events"
+type = "raw"
+value = 'Nov 12 10:00:00 ctrl-example CEF:0|Ubiquiti|UniFi Network|11.0.99|777|Login from 192.0.2.88 by someone@example.invalid|3|UNIFIcategory=System msg=x'
+[[tests.outputs]]
+extract_from = "unifi_events"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "unifi_other")
+assert_eq!(.ext."unifi.event.name", "redacted")
+assert_eq!(.ext."unifi.event.id", "777")
+assert!(!contains(string!(.raw), "192.0.2.88"))
+assert!(!contains(string!(.raw), "example.invalid"))
+'''
+
+[[tests]]
+name = "unifi_events_internet_restored_maps_to_wan_up_event"
+[[tests.inputs]]
+insert_at = "unifi_events"
+type = "raw"
+value = 'Nov 12 10:00:00 ctrl-example CEF:0|Ubiquiti|UniFi Network|11.0.99|102|Internet Restored|1|UNIFIcategory=Internet UNIFIsite=Default UNIFIdeviceName=Example Gateway UNIFIdeviceIp=192.0.2.1 UNIFIwanId=WAN1 UNIFIutcTime=2026-11-12T10:09:00.000Z msg=Internet connection WAN1 is back.'
+[[tests.outputs]]
+extract_from = "unifi_events"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_kind, "event")
+assert_eq!(.event_action, "wan_up")
+assert_eq!(.event_outcome, "success")
+assert_eq!(.observer_hostname, "Example Gateway")
+assert_eq!(.ext."unifi.event.name", "Internet Restored")
+assert_eq!(.ext."unifi.wan_id", "WAN1")
+'''
+
+[[tests]]
+name = "unifi_events_wan_connected_and_wan_disconnected_stay_distinct"
+[[tests.inputs]]
+insert_at = "unifi_events"
+type = "raw"
+value = 'Nov 12 10:00:00 ctrl-example CEF:0|Ubiquiti|UniFi Network|11.0.99|105|WAN Disconnected|8|UNIFIcategory=Internet UNIFIdeviceName=Example Gateway'
+[[tests.outputs]]
+extract_from = "unifi_events"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "wan_down")
+assert_eq!(.event_kind, "alert")
+'''
+
+[[tests]]
+name = "unifi_events_device_back_online_maps_to_device_online_event"
+[[tests.inputs]]
+insert_at = "unifi_events"
+type = "raw"
+value = 'Nov 12 10:00:00 ctrl-example CEF:0|Ubiquiti|UniFi Network|11.0.99|513|Device Back Online|1|UNIFIcategory=System UNIFIsite=Default UNIFIdeviceName=Example Switch UNIFIdeviceIp=192.0.2.20 UNIFIutcTime=2026-11-12T10:10:00.000Z'
+[[tests.outputs]]
+extract_from = "unifi_events"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_kind, "event")
+assert_eq!(.event_action, "device_online")
+assert_eq!(.event_outcome, "success")
+assert_eq!(.source_ip, "192.0.2.20")
+assert_eq!(.observer_hostname, "")
+'''
+
+[[tests]]
+name = "unifi_events_device_offline_stays_an_alert"
+[[tests.inputs]]
+insert_at = "unifi_events"
+type = "raw"
+value = 'Nov 12 10:00:00 ctrl-example CEF:0|Ubiquiti|UniFi Network|11.0.99|512|Device Offline|7|UNIFIcategory=System UNIFIdeviceName=Example Switch UNIFIdeviceIp=192.0.2.20'
+[[tests.outputs]]
+extract_from = "unifi_events"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_kind, "alert")
+assert_eq!(.event_action, "device_offline")
+'''
+
+[[tests]]
+name = "unifi_events_still_drops_client_events_by_name_even_with_new_catch_all"
 no_outputs_from = ["unifi_events"]
 [[tests.inputs]]
 insert_at = "unifi_events"
 type = "raw"
-value = 'Nov 12 10:00:00 ctrl-example CEF:0|Ubiquiti|UniFi Network|11.0.99|546|Config Modified|5|UNIFIcategory=Audit msg=changed'
+value = 'Nov 12 10:00:00 ctrl-example CEF:0|Ubiquiti|UniFi Network|11.0.99|999|Client Device Restored|1|UNIFIcategory=Client Devices UNIFIclientMac=02:00:5e:00:00:50'
 
 [[tests]]
 name = "unifi_events_drops_gateway_syslog_noise"

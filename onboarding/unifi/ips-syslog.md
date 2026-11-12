@@ -76,8 +76,10 @@ this controller, per the header). M9 ingests IPS detections only.
 The `unifi_events` transform (vector.toml) keeps four more classes from the same
 controller CEF stream. It classifies by CEF **event name**, case-insensitive, because
 event ids and `UNIFIcategory` values differ between Network versions and sources.
-Anything not listed is dropped, in particular client connect/disconnect/roam events
-(ids 400-404) and the gateway's plain RFC3164 noise.
+Client connect/disconnect/roam events (ids 400-404, names starting `client`,
+`wifi client`, `wired client`) and the gateway's plain RFC3164 noise are dropped. Every
+other controller event that is not listed below is kept as a low-priority
+`unifi_other` row (see "Catch-all").
 
 | Class | Name match (case-insensitive) | `event_kind` / `event_action` | Status |
 |---|---|---|---|
@@ -88,14 +90,33 @@ Anything not listed is dropped, in particular client connect/disconnect/roam eve
 | WAN failover | contains `failover` | alert / `wan_failover` | documentation only |
 | Device offline | `Device(s) Offline\|Disconnected\|Unreachable`, `lost contact` | alert / `device_offline` | documentation only (ids 512, 515) |
 | IP conflict | `ip` and `conflict` in either order, `duplicate ip` | alert / `ip_conflict` | name is a guess; no source documents it |
+| WAN recovery | `Internet\|WAN` + `Up\|Restored\|Back Online\|Online\|Recovered\|Reconnected\|Connected` | event / `wan_up` (outcome `success`) | name is a guess; not seen live, not found in UniFi's public docs |
+| Device recovery | `Device(s)` + `Back Online\|Online\|Reconnected\|Restored`, or starting `Back Online` | event / `device_online` (outcome `success`) | name is a guess; not seen live |
+| Anything else (non-client) | none | event / `unifi_other` (outcome `unknown`) | catch-all; not a name match, so no event is "documented" here |
 
 Mapping: `flow_deny` rows carry `source_ip` (`src`, else `UNIFIsrcClientIp`),
 `destination_ip` (`dst`, else `UNIFIdstClientIp`, else `UNIFIdstDeviceIp`), ports,
 transport, `rule_name` (`UNIFIfirewallPolicy`, else `UNIFIpolicyName`), zones, and
 `event_outcome=failure`, like PAN-OS deny rows. Alert rows put the affected device
 address in `source_ip` when it is IPv4; IPv6 and MACs only ever go to `ext`. Every row
-has `ext['unifi.event.id'|'name'|'severity'|'category']`; alert rows also carry
-`ext['syslog.severity']='3'` so `recent_alerts` (default floor `high`) shows them.
+has `ext['unifi.event.id'|'name'|'severity'|'category']`. Alert rows no longer carry a
+`syslog.severity` shim: `recent_alerts` / `alert_counts` map `ext['unifi.event.severity']`
+(CEF 0-10: 0-3 low, 4-6 medium, 7-8 high, 9-10 critical), so **deploy mcp-query with
+that mapping before this Vector config**, or outage alerts rank `medium` (no key) and
+hide behind the default `high` floor. Recovery rows (`wan_up`, `device_online`) are
+`event_kind='event'`, so an outage has an end marker without raising an alert.
+
+### Catch-all (`unifi_other`)
+An unrecognised outage name must show up as a name and a count, not vanish. The row
+stores only `ext['unifi.event.id'|'name'|'severity'|'category']` (each length-capped;
+a name that contains an IPv4, MAC or `@` is stored as `redacted`) and a `raw` rebuilt
+from the CEF **header** (`CEF:0|Ubiquiti|UniFi Network|<ver>|<id>|<name>|<sev>`). It
+deliberately leaves out the CEF extension: no admin username or email, no `msg` body,
+no client MAC/alias, no addresses (`source_ip`/`destination_ip` stay null), no device
+name or observer (`observer_hostname` empty), and `user_name` is empty. Find
+unmatched names with `alert_counts` or
+`SELECT ext['unifi.event.name'], count() FROM ssdf.events WHERE event_action='unifi_other' GROUP BY 1`,
+then add a pattern for any that are really outages.
 
 Controller settings: Settings -> System -> Logging (SIEM / remote syslog, UDP 516) must
 export the **Security** (Firewall, Intrusion Prevention), **Internet** (Outage &
@@ -103,5 +124,5 @@ Failover) and **System/UniFi Devices** (Devices) log categories; the **Client De
 categories can stay on or off, they are dropped. A firewall policy only emits "Blocked
 by Firewall" when its Logging option is enabled.
 
-Not kept on purpose: `Internet Restored` / `Device Reconnected` (recovery notices),
-latency and packet-loss alerts, admin and audit events.
+Latency and packet-loss alerts and admin/audit events are not classified; they arrive
+as `unifi_other` with the minimal field set above.
