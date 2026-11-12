@@ -24,6 +24,29 @@ ALERT_KINDS = ("alert",)
 # if sev != "" { ext = set!(ext, ["panw.panos.severity"], sev) }
 PAN_SEVERITY_KEY = "panw.panos.severity"
 
+# normalize_severity as a ClickHouse expression, so the floor applies BEFORE the
+# LIMIT. Filtering only in Python let the newest rows below the floor (PAN-OS
+# informational system logs, thousands a day) use up the whole LIMIT and the tool
+# return nothing. Keep the two in step; normalize_severity still labels each row.
+SEVERITY_NUM_SQL = (
+    "multiIf("
+    "ext['unifi.ips.severity'] != '', "
+    "multiIf(ext['unifi.ips.severity'] = '1', 4, ext['unifi.ips.severity'] = '2', 3, 2), "
+    "ext['panw.panos.severity'] != '', "
+    "multiIf(lower(ext['panw.panos.severity']) = 'critical', 4, "
+    "lower(ext['panw.panos.severity']) = 'high', 3, "
+    "lower(ext['panw.panos.severity']) = 'medium', 2, "
+    "lower(ext['panw.panos.severity']) IN ('low', 'informational'), 1, 2), "
+    "ext['syslog.severity'] != '', "
+    "multiIf(toInt32OrZero(ext['syslog.severity']) <= 2, 4, "
+    "toInt32OrZero(ext['syslog.severity']) = 3, 3, "
+    "toInt32OrZero(ext['syslog.severity']) = 4, 2, 1), "
+    "2)"
+)
+
+# Junos screen (RT_SCREEN) rows carry this literal instead of a rule name.
+NO_RULE_NAMES = ("", "N/A")
+
 
 def normalize_severity(provider: str, event_kind: str, ext: dict) -> tuple[str, int] | None:
     """Return (severity_label, severity_num) or None if not an alert-class row.
@@ -81,14 +104,18 @@ def build_recent_alerts_sql(
 
     Args:
         since: relative or ISO-8601 time expression (parsed via parse_time)
-        min_severity: minimum severity label (unused in SQL — client filters post-normalize)
+        min_severity: minimum severity label, applied in SQL so LIMIT counts matching rows
         providers: comma-separated provider names, or empty for all
         limit: max rows to return (clamped to 2000)
 
     Returns:
         (sql, params) tuple ready for ClickHouseClient.run()
     """
-    params = {"since": parse_time(since), "limit": max(1, min(int(limit), 2000))}
+    params = {
+        "since": parse_time(since),
+        "limit": max(1, min(int(limit), 2000)),
+        "floor": SEVERITY_NUM.get(min_severity, 3),  # default to high if unknown
+    }
 
     # Alert-class gate: explicit event_kind IN (alert) OR has UniFi IPS signature
     # OR has PAN severity ext key (PAN THREAT logs keep event_kind='event')
@@ -102,6 +129,7 @@ def build_recent_alerts_sql(
     where = [
         "events.timestamp >= %(since)s",
         "(event_kind IN %(kinds)s OR ext['unifi.ips.signature'] != '' OR ext['panw.panos.severity'] != '')",
+        SEVERITY_NUM_SQL + " >= %(floor)s",
     ]
     params["kinds"] = tuple(ALERT_KINDS)
 
@@ -111,7 +139,7 @@ def build_recent_alerts_sql(
 
     sql = (
         "SELECT event_id, toString(timestamp) AS timestamp, event_provider, "
-        "event_kind, rule_name, source_ip, source_port, destination_ip, "
+        "event_kind, event_action, rule_name, source_ip, source_port, destination_ip, "
         "destination_port, observer_hostname, observer_ingress_zone, "
         "observer_egress_zone, ext "
         "FROM ssdf.events WHERE "
@@ -145,8 +173,8 @@ class AlertTools:
         Returns:
             {rows: [...], row_count: int, truncated: bool}
         """
-        floor = SEVERITY_NUM.get(min_severity, 3)  # default to high if unknown
         sql, params = build_recent_alerts_sql(since, min_severity, providers, limit)
+        floor = params["floor"]
         result = self._ch.run(sql, params)
 
         rows = []
@@ -158,7 +186,13 @@ class AlertTools:
                 continue
 
             # log-derived; wrapped as UntrustedText
-            sig = ext.get("unifi.ips.signature") or r.get("rule_name") or r.get("event_kind")
+            rule_name = r.get("rule_name") or ""
+            sig = (
+                ext.get("unifi.ips.signature")
+                or (rule_name if rule_name not in NO_RULE_NAMES else "")
+                or r.get("event_action")
+                or r.get("event_kind")
+            )
 
             rows.append(
                 {

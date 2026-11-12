@@ -40,6 +40,10 @@ def test_sql_filters_min_severity_and_providers():
     )
     assert "LIMIT" in sql and params["limit"] == 10
     assert "event_provider IN" in sql
+    # the floor is in the WHERE, so rows below it cannot use up the LIMIT
+    assert params["floor"] == 3
+    where = sql.split("WHERE", 1)[1].split("ORDER BY", 1)[0]
+    assert ">= %(floor)s" in where
 
 
 def test_sql_selects_pan_threat_via_ext_key():
@@ -218,3 +222,44 @@ def test_recent_alerts_window_uses_the_datetime_column_not_the_alias():
 def test_recent_alerts_ordering_uses_the_datetime_column_not_the_alias():
     sql, _ = build_recent_alerts_sql(since="now-1h", min_severity="high", providers="", limit=10)
     assert "ORDER BY events.timestamp DESC" in sql
+
+
+# --- Regression: the severity floor used to run in Python AFTER the LIMIT, so the
+# newest rows below it (PAN-OS informational system logs) filled the LIMIT and the
+# tool returned nothing while 74 medium/high PAN alerts sat in the window. ---
+
+
+def test_unknown_min_severity_floors_at_high():
+    _, params = build_recent_alerts_sql(
+        since="now-1h", min_severity="bogus", providers="", limit=10
+    )
+    assert params["floor"] == 3
+
+
+def test_junos_screen_signature_is_the_event_action_not_na():
+    """RT_SCREEN rows have rule_name 'N/A'; the screen name is in event_action."""
+    from ssdf_mcp_query.alerts import AlertTools
+
+    class FakeCH:
+        def run(self, sql, params):
+            assert "event_action" in sql.split("FROM", 1)[0]
+            return {
+                "columns": [],
+                "rows": [
+                    {
+                        "event_id": "s1",
+                        "timestamp": "2026-11-12T16:56:46+00:00",
+                        "event_provider": "juniper",
+                        "event_kind": "alert",
+                        "event_action": "screen_icmp_flood",
+                        "rule_name": "N/A",
+                        "observer_hostname": "srx-test",
+                        "ext": {},
+                    }
+                ],
+                "row_count": 1,
+            }
+
+    result = AlertTools(FakeCH()).recent_alerts(since="now-1h", min_severity="medium")
+    assert result["rows"][0]["signature"]["value"] == "screen_icmp_flood"
+    assert result["rows"][0]["severity"] == "medium"
