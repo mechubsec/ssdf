@@ -77,7 +77,7 @@ the nginx edge, not one server with a permission flag:
   `firewall_config` data (e.g. `enforcement_points`) stay sovereign-only even
   then, since `firewall_config` is not configurable. A fixed set — access/audit
   tools (`explain_access`, `configured_policies`, `observed_by`, `reidentify`,
-  `recent_alerts`, `rule_history`, `rule_usage`, `unused_rules`, `explain_rule`,
+  `recent_alerts`, `alert_counts`, `rule_history`, `rule_usage`, `unused_rules`, `explain_rule`,
   `change_impact`) and liveness tools (`ingest_status`, `fabric_status`) — is
   never constructed on the public process at all, not just filtered out. See
   `services/mcp-query/src/ssdf_mcp_query/classification.py` and `server.py` for

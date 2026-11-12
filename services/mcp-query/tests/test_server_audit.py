@@ -30,6 +30,7 @@ EXPECTED_TOOLS = {
     "fabric_status",
     "lab_topology_snapshot",
     "recent_alerts",
+    "alert_counts",
     "metric_timeseries",
     "top_series",
     "entity_metric_timeseries",
