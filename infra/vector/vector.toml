@@ -781,7 +781,8 @@ if action == "unifi_other" {
     # no addresses. raw is rebuilt from the CEF header; a name that looks like it
     # embeds an address or email is replaced.
     safe_name = slice!(name, 0, 128)
-    if match(safe_name, r'@|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|(?i)([0-9a-f]{2}[:-]){5}[0-9a-f]{2}') { safe_name = "redacted" }
+    # the last alternative is IPv6 (also catches a clock time; when unsure, redact)
+    if match(safe_name, r'@|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|(?i)([0-9a-f]{2}[:-]){5}[0-9a-f]{2}|[0-9a-f]{0,4}(:[0-9a-f]{0,4}){2,7}') { safe_name = "redacted" }
     event_id_text = slice!(string(doc.deviceEventClassId) ?? "", 0, 16)
     severity_text = slice!(string(doc.severity) ?? "", 0, 8)
     ev.event_kind = "event"
@@ -2465,6 +2466,22 @@ assert_eq!(.ext."unifi.event.name", "redacted")
 assert_eq!(.ext."unifi.event.id", "777")
 assert!(!contains(string!(.raw), "192.0.2.88"))
 assert!(!contains(string!(.raw), "example.invalid"))
+'''
+
+[[tests]]
+name = "unifi_events_unifi_other_redacts_a_name_that_embeds_an_ipv6_address"
+[[tests.inputs]]
+insert_at = "unifi_events"
+type = "raw"
+value = 'Nov 12 10:00:00 ctrl-example CEF:0|Ubiquiti|UniFi Network|11.0.99|778|Login from 2001:db8::88 by someone|3|UNIFIcategory=System msg=x'
+[[tests.outputs]]
+extract_from = "unifi_events"
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event_action, "unifi_other")
+assert_eq!(.ext."unifi.event.name", "redacted")
+assert!(!contains(string!(.raw), "2001:db8"))
 '''
 
 [[tests]]
