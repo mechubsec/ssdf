@@ -40,7 +40,7 @@ pytestmark = pytest.mark.contract
 clickhouse_connect = pytest.importorskip("clickhouse_connect")
 
 from ssdf_common.config import Secret  # noqa: E402
-from ssdf_mcp_query.alerts import build_recent_alerts_sql  # noqa: E402
+from ssdf_mcp_query.alerts import build_alert_counts_sql, build_recent_alerts_sql  # noqa: E402
 from ssdf_mcp_query.builders import (  # noqa: E402
     build_host_log_patterns,
     build_host_log_patterns_count,
@@ -377,6 +377,7 @@ ALL_BUILDERS = {
     "alerts_for_pair": lambda: build_alerts_for_pair_sql(_IPS, _SINCE_SAME_DAY, TENANT),
     "observers_for_ips": lambda: build_observers_for_ips_sql(_IPS, _SINCE_SAME_DAY, TENANT),
     "recent_alerts": lambda: build_recent_alerts_sql("now-24h", "low", "", 10),
+    "alert_counts": lambda: build_alert_counts_sql("now-24h", "low", ""),
     "recent_observer_hostnames": lambda: build_recent_observer_hostnames_sql(
         _SINCE_SAME_DAY, TENANT
     ),
@@ -527,3 +528,17 @@ def test_datetime_columns_come_back_as_strings_not_lexical_traps(ch):
     assert isinstance(last_seen, str)
     # "YYYY-MM-DD HH:MM:SS..." -- a space at offset 10, never a 'T'.
     assert last_seen[10] == " ", f"unexpected datetime rendering: {last_seen!r}"
+
+
+def test_severity_sql_matches_python_table(ch):
+    """SEVERITY_NUM_SQL must give the same number as normalize_severity for every case."""
+    from ssdf_mcp_query.alerts import SEVERITY_NUM_SQL
+    from tests.test_alerts import SEVERITY_PARITY_CASES
+
+    def literal(text):
+        return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+    for ext, expected in SEVERITY_PARITY_CASES:
+        pairs = ", ".join(f"{literal(k)}, {literal(v)}" for k, v in ext.items())
+        sql = f"SELECT {SEVERITY_NUM_SQL} AS sev FROM (SELECT CAST(map({pairs}), 'Map(String, String)') AS ext)"
+        assert ch.run(sql)["rows"][0]["sev"] == expected, ext

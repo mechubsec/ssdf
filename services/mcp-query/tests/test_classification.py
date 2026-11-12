@@ -31,6 +31,7 @@ EXPECTED = {
     "fabric_status": {"security_log"},
     "lab_topology_snapshot": {"topology"},
     "recent_alerts": {"security_log"},
+    "alert_counts": {"security_log"},
     "metric_timeseries": {"metrics"},
     "top_series": {"metrics"},
     "entity_metric_timeseries": {"metrics"},
