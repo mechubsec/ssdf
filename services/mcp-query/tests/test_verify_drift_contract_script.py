@@ -99,14 +99,16 @@ def test_cycle_does_not_raise():
     assert problems  # hashes no longer recompute; the point is that it returns
 
 
-def test_single_head_rule():
+def test_resolve_head_rule():
     ts = dt.datetime(2026, 11, 24, tzinfo=dt.timezone.utc)
-    assert script.single_head([]) == ("", None)
-    assert script.single_head([("a" * 64, ts)]) == ("a" * 64, ts)
-    # a duplicated tail is one head
-    assert script.single_head([("a" * 64, ts), ("a" * 64, ts)]) == ("a" * 64, ts)
+    one = ("a" * 64, ts)
+    assert script.resolve_head(0, []) == ("", None)
+    assert script.resolve_head(1, [one]) == one
+    assert script.resolve_head(2, [one, one]) == one  # a duplicated tail is one head
     with pytest.raises(SystemExit):
-        script.single_head([("a" * 64, ts), ("b" * 64, ts)])
+        script.resolve_head(2, [])  # rows but no head: a rootless cycle
+    with pytest.raises(SystemExit):
+        script.resolve_head(2, [one, ("b" * 64, ts)])
 
 
 def test_next_ts_clamps_a_clock_behind_the_head():

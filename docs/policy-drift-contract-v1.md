@@ -77,7 +77,9 @@ restarts, and must not start a second root:
 1. Read the head for its `server_id` as `ssdf_audit_verify` (the head is the
    row whose `row_hash` no other row in that `server_id` names as `prev_hash`).
    A failed read is not "nothing landed"; stop rather than insert blind.
-2. If there is no row, start at genesis: `prev_hash = ""`.
+2. Count the rows for the `server_id` (query below). Zero rows is an empty
+   chain: start at genesis, `prev_hash = ""`. Rows present but no head is not
+   genesis (see the table): stop.
 3. Otherwise set `prev_hash` to the head's `row_hash`, set `ts` per the clamp
    rule below, compute the new `row_hash`, and insert as `ssdf_drift`.
 4. A replay of a row that already landed is skipped by re-reading the head.
@@ -93,16 +95,23 @@ WHERE server_id = {sid:String}
   )
 ```
 
+**The count.** Run first, as the same identity:
+
+```sql
+SELECT count() FROM ssdf.policy_drift WHERE server_id = {sid:String}
+```
+
 The head is found by following links, never by sorting on `ts`. `DISTINCT`
 matters: an ambiguous-timeout duplicate of the tail is two identical rows
 (same `row_hash`, same `ts`), which is one head (the verifier reports it as
 `duplicate_row`), not a fork. Act on the number of *distinct* heads:
 
-| Distinct heads | Action |
-|----------------|--------|
-| 0 | Genesis, `prev_hash = ""` |
-| 1 | Continue from it |
-| more than 1 | The chain has already forked. Stop and alert; never pick one, since resuming from either deepens the fork |
+| Rows | Distinct heads | Action |
+|------|----------------|--------|
+| 0 | 0 | Empty chain: genesis, `prev_hash = ""` |
+| more than 0 | 0 | Corrupt: a rootless cycle (`a.prev = b`, `b.prev = a`) has no head. Stop and alert; a genesis insert would add a second root to corrupt data |
+| more than 0 | 1 | Continue from it |
+| more than 0 | more than 1 | The chain has already forked. Stop and alert; never pick one, since resuming from either deepens the fork |
 
 **Writer rules.**
 

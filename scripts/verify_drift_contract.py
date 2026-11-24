@@ -104,15 +104,22 @@ HEAD_SQL = (
 )
 
 
-def single_head(heads):
-    """Contract rule: no distinct head is genesis, one continues, more is a fork: stop.
+COUNT_SQL = "SELECT count() FROM ssdf.policy_drift WHERE server_id = {sid:String}"
+
+
+def resolve_head(count, heads):
+    """Contract rule: zero rows is genesis; rows but no head is corruption; one head continues.
 
     ``heads`` is a list of ``(row_hash, ts)``; returns ``(row_hash, ts)`` or ``("", None)``.
     """
+    if count == 0:
+        return ("", None)
     distinct = sorted(set(heads))
+    if not distinct:
+        sys.exit(f"FAIL: {count} rows but no chain head (rootless cycle), refusing to add a root")
     if len(distinct) > 1:
         sys.exit(f"FAIL: {len(distinct)} distinct chain heads (forked chain), refusing to pick one")
-    return distinct[0] if distinct else ("", None)
+    return distinct[0]
 
 
 def next_ts(now, head_ts):
@@ -203,16 +210,17 @@ def main() -> int:
     )
 
     def read_head():
-        out = ch(
-            host, port, *reader, HEAD_SQL + " FORMAT TSVRaw", settings={"param_sid": SERVER_ID}
-        )
+        settings = {"param_sid": SERVER_ID}
+        count = int(ch(host, port, *reader, COUNT_SQL + " FORMAT TSVRaw", settings=settings))
+        out = ch(host, port, *reader, HEAD_SQL + " FORMAT TSVRaw", settings=settings)
         # a TSV line is "<hash>\t<YYYY-MM-DD HH:MM:SS.mmm>"
         heads = [line.split("\t") for line in out.splitlines() if line]
-        return single_head(
+        return resolve_head(
+            count,
             [
                 (h, dt.datetime.strptime(t, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=dt.timezone.utc))
                 for h, t in heads
-            ]
+            ],
         )
 
     def insert(row, settings):
