@@ -17,7 +17,7 @@ pytestmark = pytest.mark.contract
 
 clickhouse_connect = pytest.importorskip("clickhouse_connect")
 
-from ssdf_mcp_query.drift_chain import dedup_token  # noqa: E402
+from ssdf_mcp_query.drift_chain import compute_row_hash, dedup_token  # noqa: E402
 from ssdf_mcp_query.verify_drift import _COLUMNS, verify_chains  # noqa: E402
 
 # The contract's head/count SQL lives in the stdlib-only script (single source of truth).
@@ -50,19 +50,36 @@ def raw():
     return client
 
 
-def _table_row(vector: dict) -> list:
-    row = dict(vector["row"])
-    row["ts"] = dt.datetime.fromisoformat(row["ts"].replace("Z", "+00:00"))
-    row["prev_hash"] = vector["prev_hash"]
-    row["row_hash"] = vector["row_hash"]
-    return [row[c] for c in _COLUMNS]
+# policy_drift has a 410-day TTL: fixed timestamps would be expired on insert once the
+# calendar passes them, so every contract row is stamped relative to now.
+_ROW_AGE = dt.timedelta(0)
+
+
+def _now_ms() -> dt.datetime:
+    """Current UTC time minus _ROW_AGE, truncated to milliseconds (the hash's resolution)."""
+    now = dt.datetime.now(dt.timezone.utc) - _ROW_AGE
+    return now.replace(microsecond=now.microsecond // 1000 * 1000)
+
+
+def _fresh_chain(count: int) -> list[list]:
+    """Table rows from the first ``count`` vectors' non-ts fields, re-stamped near now and
+    re-chained with compute_row_hash (the pinned vector bytes live in the offline tests)."""
+    end = _now_ms()
+    rows, prev_hash = [], ""
+    for index, vector in enumerate(_VECTORS[:count]):
+        row = dict(vector["row"])
+        row["ts"] = end - dt.timedelta(seconds=count - index)
+        row["prev_hash"] = prev_hash
+        row["row_hash"] = prev_hash = compute_row_hash(prev_hash, row)
+        rows.append([row[c] for c in _COLUMNS])
+    return rows
 
 
 def test_retried_block_with_same_token_collapses_and_reads_back(raw):
     server_ids = {v["row"]["server_id"] for v in _VECTORS}
     assert len(server_ids) == 1
     server_id = server_ids.pop()
-    block = [_table_row(v) for v in _VECTORS[:2]]
+    block = _fresh_chain(len(_VECTORS))  # includes the quote/newline/control-char devices
     # Unique per invocation: ALTER ... DELETE leaves MergeTree's dedup log intact, so a
     # fixed token makes a rerun against a long-lived ClickHouse insert nothing.
     token = dedup_token(server_id, uuid.uuid4().hex, 1)
@@ -85,13 +102,13 @@ def test_retried_block_with_same_token_collapses_and_reads_back(raw):
             "SELECT count() FROM ssdf.policy_drift WHERE server_id = {server_id:String}",
             parameters=where,
         ).result_rows[0][0]
-        assert count == 2
+        assert count == len(block)
 
         stored = raw.query(
             "SELECT row_hash FROM ssdf.policy_drift WHERE server_id = {server_id:String} ORDER BY ts",
             parameters=where,
         ).result_rows
-        assert [r[0] for r in stored] == [v["row_hash"] for v in _VECTORS[:2]]
+        assert [r[0] for r in stored] == [row[_COLUMNS.index("row_hash")] for row in block]
 
         # types must round-trip into compute_row_hash (ts, Array, UInt8)
         result = raw.query(
@@ -123,12 +140,7 @@ def test_build_drift_sql_runs_against_real_clickhouse(raw):
         settings={"mutations_sync": 2},
     )
     try:
-        now = dt.datetime.now(dt.timezone.utc)
-        rows = []
-        for vector in _VECTORS[:2]:
-            row = _table_row(vector)
-            row[0] = now  # inside the since_hours window
-            rows.append(row)
+        rows = _fresh_chain(2)  # inside the since_hours window
         raw.insert("ssdf.policy_drift", rows, column_names=_COLUMNS)
 
         tools = DriftTools(lambda: raw, {"max_execution_time": 10})
@@ -154,7 +166,7 @@ def _seed_and_read(raw, edges, *, duplicate_tail=False):
     run the contract's count and head SQL. Returns ``(count, heads, server_id)``."""
     server_id = f"head-{uuid.uuid4().hex}.example.com"
     where = {"sid": server_id}
-    base = dt.datetime(2026, 11, 24, 10, 0, tzinfo=dt.timezone.utc)
+    base = _now_ms() - dt.timedelta(seconds=len(edges) + 1)
     rows = [
         [base + dt.timedelta(seconds=i), server_id, "0123abc", "flow-1", "consistent",
          "fw1.example.com", [], "ev/1", 0, prev, row_hash]
