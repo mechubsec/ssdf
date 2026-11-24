@@ -34,6 +34,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 LOOPBACK = {"127.0.0.1", "localhost"}  # no ::1: the URL below would need brackets
 VERDICTS = frozenset({"consistent", "violating", "over_permissive", "unverifiable"})
@@ -237,7 +238,7 @@ def main() -> int:
             settings=settings,
         )
 
-    run_id = "verify-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+    run_id = "verify-" + uuid.uuid4().hex  # unique per run: a repeated token drops the insert
     token = {"insert_deduplication_token": dedup_token(SERVER_ID, run_id, 0)}
 
     print("[1/5] reading chain head as the verifier identity")
