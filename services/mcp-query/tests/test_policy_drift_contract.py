@@ -122,7 +122,7 @@ def test_build_drift_sql_runs_against_real_clickhouse(raw):
             rows.append(row)
         raw.insert("ssdf.policy_drift", rows, column_names=_COLUMNS)
 
-        tools = DriftTools(lambda: raw)
+        tools = DriftTools(lambda: raw, {"max_execution_time": 10})
         wanted = _VECTORS[0]["row"]["flow_or_isolation_id"]
         everything = tools.policy_drift(device=_VECTORS[0]["row"]["device"], limit=1)
         assert everything["truncated"] is True and everything["row_count"] == 1

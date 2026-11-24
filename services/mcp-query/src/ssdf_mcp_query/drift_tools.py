@@ -62,13 +62,13 @@ def build_drift_sql(
 class DriftTools:
     """policy_drift tool bound to a lazily built, per-thread read client."""
 
-    def __init__(self, client_factory: Callable[[], object] | None, settings: dict | None = None):
+    def __init__(self, client_factory: Callable[[], object] | None, settings: dict):
         """``client_factory`` returns a clickhouse_connect client, or is None when unconfigured.
 
         ``settings`` are the per-query limits from ``clickhouse.query_settings``.
         """
         self._factory = client_factory
-        self._settings = settings or {}
+        self._settings = settings
         # One driver client per thread: it rejects concurrent queries on one session
         # and FastMCP runs sync tools on a worker pool (see clickhouse.ClickHouseClient).
         self._local = threading.local()

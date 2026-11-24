@@ -45,7 +45,7 @@ def test_since_hours_is_clamped():
 
 @pytest.mark.parametrize("field", ["limit", "since_hours"])
 def test_non_numeric_argument_is_a_validation_error(field):
-    out = DriftTools(lambda: _FakeClient(1)).policy_drift(**{field: "abc"})
+    out = DriftTools(lambda: _FakeClient(1), {}).policy_drift(**{field: "abc"})
     assert out["error"] == "validation"
 
 
@@ -70,14 +70,14 @@ class _FakeClient:
 
 
 def test_truncated_when_cap_hit_and_rows_trimmed():
-    tools = DriftTools(lambda: _FakeClient(10))
+    tools = DriftTools(lambda: _FakeClient(10), {})
     out = tools.policy_drift(limit=3)
     assert out["truncated"] is True
     assert out["row_count"] == 3 and len(out["rows"]) == 3
 
 
 def test_not_truncated_when_under_cap_and_shapes_row():
-    out = DriftTools(lambda: _FakeClient(2)).policy_drift(limit=3)
+    out = DriftTools(lambda: _FakeClient(2), {}).policy_drift(limit=3)
     assert out["truncated"] is False and out["row_count"] == 2
     row = out["rows"][0]
     assert row["ts"] == "2026-11-24T01:02:03.456Z"
@@ -87,7 +87,7 @@ def test_not_truncated_when_under_cap_and_shapes_row():
 
 def test_client_built_lazily_once_per_thread():
     built = []
-    tools = DriftTools(lambda: built.append(1) or _FakeClient(0))
+    tools = DriftTools(lambda: built.append(1) or _FakeClient(0), {})
     assert built == []
     tools.policy_drift()
     tools.policy_drift()
@@ -99,11 +99,11 @@ def test_client_built_lazily_once_per_thread():
 
 
 def test_unconfigured_reader_returns_error_without_client():
-    assert DriftTools(None).policy_drift() == {"error": "drift_reader_unconfigured"}
+    assert DriftTools(None, {}).policy_drift() == {"error": "drift_reader_unconfigured"}
 
 
 def test_bad_verdict_is_a_validation_error_not_a_raise():
-    out = DriftTools(lambda: _FakeClient(0)).policy_drift(verdict="nope")
+    out = DriftTools(lambda: _FakeClient(0), {}).policy_drift(verdict="nope")
     assert out["error"] == "validation"
 
 
