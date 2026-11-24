@@ -41,6 +41,7 @@ EXPECTED = {
     "unused_rules": {"security_log", "firewall_config"},
     "explain_rule": {"security_log", "firewall_config"},
     "change_impact": {"security_log", "firewall_config"},
+    "policy_drift": {"firewall_config"},
 }
 
 

@@ -46,6 +46,7 @@ TOOL_DATA_CLASSES: dict[str, frozenset[str]] = {
     "top_series": frozenset({"metrics"}),
     "entity_metric_timeseries": frozenset({"metrics"}),
     "reidentify": frozenset({"identity"}),
+    "policy_drift": frozenset({"firewall_config"}),
     "rule_history": frozenset({"firewall_config"}),
     "rule_usage": frozenset({"security_log", "firewall_config"}),
     "unused_rules": frozenset({"security_log", "firewall_config"}),

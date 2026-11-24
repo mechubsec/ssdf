@@ -98,3 +98,41 @@ def test_retried_block_with_same_token_collapses_and_reads_back(raw):
             parameters=where,
             settings={"mutations_sync": 2},
         )
+
+
+def test_build_drift_sql_runs_against_real_clickhouse(raw):
+    """Fakes do not validate SQL: run the builder's query over two inserted rows."""
+    from ssdf_mcp_query.drift_tools import DriftTools
+
+    server_id = _VECTORS[0]["row"]["server_id"]
+    where = {"server_id": server_id}
+    raw.command(
+        "ALTER TABLE ssdf.policy_drift DELETE WHERE server_id = {server_id:String}",
+        parameters=where,
+        settings={"mutations_sync": 2},
+    )
+    try:
+        now = dt.datetime.now(dt.timezone.utc)
+        rows = []
+        for vector in _VECTORS[:2]:
+            row = _table_row(vector)
+            row[0] = now  # inside the since_hours window
+            rows.append(row)
+        raw.insert("ssdf.policy_drift", rows, column_names=_COLUMNS)
+
+        tools = DriftTools(lambda: raw)
+        wanted = _VECTORS[0]["row"]["flow_or_isolation_id"]
+        everything = tools.policy_drift(device=_VECTORS[0]["row"]["device"], limit=1)
+        assert everything["truncated"] is True and everything["row_count"] == 1
+        filtered = tools.policy_drift(flow_or_isolation_id=wanted, since_hours=1)
+        assert filtered["rows"] and all(
+            r["flow_or_isolation_id"] == wanted for r in filtered["rows"]
+        )
+        assert filtered["rows"][0]["ts"].endswith("Z")
+        assert isinstance(filtered["rows"][0]["labmode"], bool)
+    finally:
+        raw.command(
+            "ALTER TABLE ssdf.policy_drift DELETE WHERE server_id = {server_id:String}",
+            parameters=where,
+            settings={"mutations_sync": 2},
+        )
