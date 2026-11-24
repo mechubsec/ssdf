@@ -1,6 +1,7 @@
 """policy_drift tool: SQL building, truncation, unconfigured reader, run_sql refusal."""
 
 import datetime as dt
+import threading
 
 import pytest
 
@@ -72,13 +73,17 @@ def test_not_truncated_when_under_cap_and_shapes_row():
     assert row["row_hash"] == "h0" and out["as_of"].endswith("Z")
 
 
-def test_client_built_lazily_and_once():
+def test_client_built_lazily_once_per_thread():
     built = []
     tools = DriftTools(lambda: built.append(1) or _FakeClient(0))
     assert built == []
     tools.policy_drift()
     tools.policy_drift()
-    assert built == [1]
+    assert len(built) == 1
+    worker = threading.Thread(target=tools.policy_drift)
+    worker.start()
+    worker.join()
+    assert len(built) == 2
 
 
 def test_unconfigured_reader_returns_error_without_client():

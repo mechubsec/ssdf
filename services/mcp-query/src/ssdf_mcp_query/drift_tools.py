@@ -8,6 +8,7 @@ granted SELECT on the table), built lazily on first call.
 from __future__ import annotations
 
 import datetime as dt
+import threading
 from collections.abc import Callable
 
 from .audit_chain import ts_ms_iso
@@ -57,12 +58,14 @@ def build_drift_sql(
 
 
 class DriftTools:
-    """policy_drift tool bound to a lazily built read client."""
+    """policy_drift tool bound to a lazily built, per-thread read client."""
 
     def __init__(self, client_factory: Callable[[], object] | None):
         """``client_factory`` returns a clickhouse_connect client, or is None when unconfigured."""
         self._factory = client_factory
-        self._client = None
+        # One driver client per thread: it rejects concurrent queries on one session
+        # and FastMCP runs sync tools on a worker pool (see clickhouse.ClickHouseClient).
+        self._local = threading.local()
 
     def policy_drift(
         self,
@@ -90,9 +93,10 @@ class DriftTools:
         except ValueError as exc:
             return {"error": "validation", "detail": str(exc)}
         params["limit"] = cap + 1  # one extra row proves truncation
-        if self._client is None:
-            self._client = self._factory()
-        result = self._client.query(sql, parameters=params)
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = self._local.client = self._factory()
+        result = client.query(sql, parameters=params)
         records = [dict(zip(result.column_names, row)) for row in result.result_rows]
         rows = []
         for record in records[:cap]:
