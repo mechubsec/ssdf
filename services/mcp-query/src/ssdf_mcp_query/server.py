@@ -24,7 +24,7 @@ from .audit import Auditor, make_ch_auditor  # noqa: F401  (test patch seam)
 from .wrapper import audited_tool
 from .auth import current_caller_identity
 from .ratelimit import PrincipalLimiter
-from .clickhouse import ClickHouseClient
+from .clickhouse import ClickHouseClient, query_settings
 from .tools import Tools
 from .graphstore import ClickHouseGraphStore
 from .topo_tools import TopoTools
@@ -68,7 +68,8 @@ def build_app(tier: str = "sovereign") -> FastMCP:
         rule_tools = RuleTools(client, entity_store)
         change_impact_tools = ChangeImpactTools(client, entity_store)
         drift_tools = DriftTools(
-            (lambda: _make_client(config)) if config.ch_audit_verify_password else None
+            (lambda: _make_client(config)) if config.ch_audit_verify_password else None,
+            query_settings(config),
         )
 
     metrics_store = MetricsStore(client, tenant="t_main")

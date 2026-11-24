@@ -58,8 +58,9 @@ class _FakeClient:
         ]
         self.calls = []
 
-    def query(self, sql, parameters=None):
+    def query(self, sql, parameters=None, settings=None):
         self.calls.append(parameters)
+        self.settings = settings
         names = [
             "ts", "server_id", "intent_commit", "flow_or_isolation_id", "verdict", "device",
             "device_rule_ids", "evidence_ref", "labmode", "prev_hash", "row_hash",
@@ -109,3 +110,10 @@ def test_bad_verdict_is_a_validation_error_not_a_raise():
 def test_run_sql_refuses_policy_drift():
     with pytest.raises(GuardError):
         guard_sql("SELECT * FROM ssdf.policy_drift")
+
+
+def test_bounded_io_settings_reach_the_query():
+    client = _FakeClient(0)
+    settings = {"max_execution_time": 7, "max_result_rows": 9, "result_overflow_mode": "throw"}
+    DriftTools(lambda: client, settings).policy_drift()
+    assert client.settings == settings
