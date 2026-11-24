@@ -129,6 +129,8 @@ tamper-evident at rest and does not need this table to become so.
 If a per-call tier is ever wanted here, it should be a **separate table** with
 its own TTL and its own chain, not a tier in this one.
 
+Policy-drift verdicts are such a table: see the [policy-drift contract](policy-drift-contract-v1.md).
+
 ## Field Schema
 
 Evidence records populate the existing `ssdf.audit` columns as follows:
