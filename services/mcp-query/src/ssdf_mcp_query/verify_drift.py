@@ -52,7 +52,9 @@ def verify_chains(rows: list[dict]) -> dict:
         # Structure, not ts: tied timestamps come back from ClickHouse in any order.
         # Roots are rows with no predecessor in this chain; a real genesis wins,
         # then the earliest ts, then row_hash, so the choice is deterministic.
-        roots = [r for r in chain_rows if r["prev_hash"] == "" or r["prev_hash"] not in own_hashes]
+        roots = [
+            r for r in chain_rows if r["prev_hash"] == "" or r["prev_hash"] not in own_hashes
+        ] or chain_rows  # a prev_hash-edited cycle has no root; hash checks report it
         root = min(roots, key=lambda r: (r["prev_hash"] != "", r["ts"], r["row_hash"]))
         tips = [r for r in chain_rows if r["row_hash"] not in pointed_at] or chain_rows
         head = max(tips, key=lambda r: (r["ts"], r["row_hash"]))

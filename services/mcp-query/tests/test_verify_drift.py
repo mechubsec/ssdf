@@ -141,6 +141,23 @@ def test_tied_ts_does_not_change_root_or_head(dangling, reverse):
     assert chain["head"] == rows[2]["row_hash"]
 
 
+def test_two_row_cycle_is_reported_not_raised():
+    rows = _chain(count=2)
+    rows[0]["prev_hash"] = rows[1]["row_hash"]  # genesis edited to point at its successor
+    result = verify_chains(rows)
+    assert not result["ok"]
+    assert _types(result) == ["content_edit"]
+    assert result["issues"][0]["row_hash"] == rows[0]["row_hash"]
+
+
+def test_self_loop_is_reported_not_raised():
+    rows = _chain(count=1)
+    rows[0]["prev_hash"] = rows[0]["row_hash"]
+    result = verify_chains(rows)
+    assert not result["ok"]
+    assert _types(result) == ["content_edit"]
+
+
 @pytest.mark.parametrize("rows", [[]])
 def test_empty_is_ok(rows):
     assert verify_chains(rows) == {"chains": {}, "issues": [], "ok": True}
