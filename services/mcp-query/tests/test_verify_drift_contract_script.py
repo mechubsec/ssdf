@@ -45,3 +45,55 @@ def test_embedded_dedup_token_matches_package(args):
 def test_non_loopback_host_refused():
     with pytest.raises(SystemExit):
         script.require_loopback("198.51.100.7")
+
+
+def _chain(count, *, tied_ts=True, genesis_prev=""):
+    """Build a valid chain of ``count`` rows; tied timestamps unless asked otherwise."""
+    rows, prev = [], genesis_prev
+    for index in range(count):
+        ts = dt.datetime(2026, 11, 24, 10, 0, 0, 123000, tzinfo=dt.timezone.utc)
+        if not tied_ts:
+            ts += dt.timedelta(seconds=index)
+        row = {
+            **_row(VECTORS[0]["row"]),
+            "ts": ts,
+            "evidence_ref": f"ev/{index}",
+            "prev_hash": prev,
+        }
+        row["row_hash"] = script.compute_row_hash(prev, row)
+        rows.append(row)
+        prev = row["row_hash"]
+    return rows
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_tied_ts_chain_structural_root_and_head(reverse):
+    rows = _chain(3)
+    summary, problems = script.verify_chain(rows[::-1] if reverse else rows)
+    assert problems == []
+    assert summary["anchored"] is True
+    assert summary["head"] == rows[-1]["row_hash"]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_aged_out_genesis_is_unanchored_not_an_issue(reverse):
+    rows = _chain(3, genesis_prev="f" * 64)
+    summary, problems = script.verify_chain(rows[::-1] if reverse else rows)
+    assert problems == []
+    assert summary["anchored"] is False
+    assert summary["head"] == rows[-1]["row_hash"]
+
+
+def test_fork_is_reported():
+    rows = _chain(2)
+    sibling = {**rows[1], "evidence_ref": "ev/other"}
+    sibling["row_hash"] = script.compute_row_hash(sibling["prev_hash"], sibling)
+    _, problems = script.verify_chain([*rows, sibling])
+    assert {kind for kind, _ in problems} == {"fork"}
+
+
+def test_cycle_does_not_raise():
+    first, second = _chain(2)
+    first["prev_hash"], second["prev_hash"] = second["row_hash"], first["row_hash"]
+    _, problems = script.verify_chain([first, second])
+    assert problems  # hashes no longer recompute; the point is that it returns

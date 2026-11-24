@@ -35,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+LOOPBACK = {"127.0.0.1", "localhost"}  # no ::1: the URL below would need brackets
 VERDICTS = frozenset({"consistent", "violating", "over_permissive", "unverifiable"})
 SERVER_ID = "verify-script.example.com"
 COLUMNS = [
@@ -129,24 +129,42 @@ def read_rows(query):
 
 
 def verify_chain(rows):
-    """Per-server_id check: every hash recomputes, every non-root link resolves."""
+    """Per-server_id check, structural like verify_drift.py: root and head come from links, not ts.
+
+    Returns (summary, problems). An unknown prev_hash is tolerated only on the root
+    (genesis aged out, ``anchored`` false); anywhere else it is missing_predecessor.
+    """
     problems = []
-    hashes = {row["row_hash"] for row in rows}
+    own_hashes = {row["row_hash"] for row in rows}
+    pointed_at = {row["prev_hash"] for row in rows}
+    roots = [r for r in rows if r["prev_hash"] == "" or r["prev_hash"] not in own_hashes]
+    # a real genesis wins, then (ts, row_hash); a cycle has no root, so fall back to all rows
+    root = min(
+        roots or rows, key=lambda r: (r["prev_hash"] != "", r["ts"], r["row_hash"]), default=None
+    )
+    tips = [r for r in rows if r["row_hash"] not in pointed_at] or rows
+    head = max(tips, key=lambda r: (r["ts"], r["row_hash"]), default=None)
+
+    children = {}
     for row in rows:
+        children.setdefault(row["prev_hash"], set()).add(row["row_hash"])
         if row["verdict"] not in VERDICTS:
             problems.append(("invalid_verdict", row["row_hash"]))
         elif compute_row_hash(row["prev_hash"], row) != row["row_hash"]:
             problems.append(("content_edit", row["row_hash"]))
-        if row["prev_hash"] and row["prev_hash"] not in hashes and row is not rows[0]:
+        if row["prev_hash"] and row["prev_hash"] not in own_hashes and row is not root:
             problems.append(("missing_predecessor", row["row_hash"]))
-    if len({r["row_hash"] for r in rows}) != len(rows):
+    for siblings in children.values():
+        if len(siblings) > 1:
+            problems.extend(("fork", h) for h in sorted(siblings))
+    if len(own_hashes) != len(rows):
         problems.append(("duplicate_row", ""))
-    head = rows[-1]["row_hash"] if rows else ""
-    return {
+    summary = {
         "rows": len(rows),
-        "head": head,
-        "anchored": bool(rows) and rows[0]["prev_hash"] == "",
-    }, problems
+        "head": head["row_hash"] if head else "",
+        "anchored": root is not None and root["prev_hash"] == "",
+    }
+    return summary, problems
 
 
 def main() -> int:
@@ -160,6 +178,7 @@ def main() -> int:
     )
 
     def read_head():
+        # SERVER_ID is a module constant, never input, so interpolating it is safe
         sql = (
             "SELECT row_hash FROM ssdf.policy_drift WHERE server_id = "
             f"'{SERVER_ID}' AND row_hash NOT IN (SELECT prev_hash FROM ssdf.policy_drift "

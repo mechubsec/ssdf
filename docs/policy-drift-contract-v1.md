@@ -112,10 +112,10 @@ whose genesis has aged out starts with a row whose `prev_hash` names a row that
 no longer exists.
 
 The verifier reports that chain as **`anchored: false`**, and it is not an
-issue: the chain is intact from its earliest surviving row, but it can no
-longer be shown to start at genesis. `anchored: true` means the earliest row has
+issue: the chain is intact from its root row (the surviving row whose predecessor is missing), but it can no
+longer be shown to start at genesis. `anchored: true` means the root row has
 `prev_hash == ""`. The root and head are derived from the links, not from `ts`,
-so tied timestamps do not matter.
+so rows with equal timestamps cannot change the result.
 
 **Known limit (Decision 3).** Deleting a chain's genesis row is
 indistinguishable from TTL age-out: both leave an unknown `prev_hash` on the
