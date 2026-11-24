@@ -1,0 +1,73 @@
+[
+  {
+    "row": {
+      "ts": "2026-11-24T10:00:00.123Z",
+      "server_id": "srv-a.example.com",
+      "intent_commit": "0123abc",
+      "flow_or_isolation_id": "flow-1",
+      "verdict": "consistent",
+      "device": "fw1.example.com",
+      "device_rule_ids": [
+        "r1",
+        "r2"
+      ],
+      "evidence_ref": "ev/flow-1",
+      "labmode": 1
+    },
+    "prev_hash": "",
+    "canonical": "[\"2026-11-24T10:00:00.123Z\",\"srv-a.example.com\",\"0123abc\",\"flow-1\",\"consistent\",\"fw1.example.com\",[\"r1\",\"r2\"],\"ev/flow-1\",1]",
+    "row_hash": "71f5da0a406795f12c5c662d331acdd0e5440cbf9eba4b69f68110102804ca97"
+  },
+  {
+    "row": {
+      "ts": "2026-11-24T10:00:01.000Z",
+      "server_id": "srv-a.example.com",
+      "intent_commit": "0123abc",
+      "flow_or_isolation_id": "flow-2",
+      "verdict": "violating",
+      "device": "fw1.example.com",
+      "device_rule_ids": [
+        "r3"
+      ],
+      "evidence_ref": "ev/flow-2",
+      "labmode": 1
+    },
+    "prev_hash": "71f5da0a406795f12c5c662d331acdd0e5440cbf9eba4b69f68110102804ca97",
+    "canonical": "[\"2026-11-24T10:00:01.000Z\",\"srv-a.example.com\",\"0123abc\",\"flow-2\",\"violating\",\"fw1.example.com\",[\"r3\"],\"ev/flow-2\",1]",
+    "row_hash": "dae5677ac01c28060c9c7f4a41ed289f46c60d646f34927116c24f4194691cfd"
+  },
+  {
+    "row": {
+      "ts": "2026-11-24T10:00:02.456Z",
+      "server_id": "srv-a.example.com",
+      "intent_commit": "0123abc",
+      "flow_or_isolation_id": "flow-3",
+      "verdict": "unverifiable",
+      "device": "fw-é\"x\ny",
+      "device_rule_ids": [
+        "r4"
+      ],
+      "evidence_ref": "ev/flow-3",
+      "labmode": 1
+    },
+    "prev_hash": "dae5677ac01c28060c9c7f4a41ed289f46c60d646f34927116c24f4194691cfd",
+    "canonical": "[\"2026-11-24T10:00:02.456Z\",\"srv-a.example.com\",\"0123abc\",\"flow-3\",\"unverifiable\",\"fw-é\\\"x\\ny\",[\"r4\"],\"ev/flow-3\",1]",
+    "row_hash": "98e45f578982e3266e40b63572288cde74d02736aa5fb23cefe2f4a83a454568"
+  },
+  {
+    "row": {
+      "ts": "2026-11-24T10:00:03.789Z",
+      "server_id": "srv-a.example.com",
+      "intent_commit": "0123abc",
+      "flow_or_isolation_id": "iso-1",
+      "verdict": "over_permissive",
+      "device": "fw2.example.com",
+      "device_rule_ids": [],
+      "evidence_ref": "ev/iso-1",
+      "labmode": 0
+    },
+    "prev_hash": "98e45f578982e3266e40b63572288cde74d02736aa5fb23cefe2f4a83a454568",
+    "canonical": "[\"2026-11-24T10:00:03.789Z\",\"srv-a.example.com\",\"0123abc\",\"iso-1\",\"over_permissive\",\"fw2.example.com\",[],\"ev/iso-1\",0]",
+    "row_hash": "1c8d640bb216a513f3e3859ed1f9a6099948b3f80d2aaa9d340a584f2b5349e1"
+  }
+]
