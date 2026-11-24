@@ -82,6 +82,40 @@ restarts, and must not start a second root:
    `row_hash`, and insert as `ssdf_drift`.
 4. A replay of a row that already landed is skipped by re-reading the head.
 
+**The head read.** Exactly this query, as `ssdf_audit_verify`:
+
+```sql
+SELECT DISTINCT row_hash
+FROM ssdf.policy_drift
+WHERE server_id = {sid:String}
+  AND row_hash NOT IN (
+      SELECT prev_hash FROM ssdf.policy_drift WHERE server_id = {sid:String}
+  )
+```
+
+The head is found by following links, never by sorting on `ts`. `DISTINCT`
+matters: an ambiguous-timeout duplicate of the tail is two rows with one
+unreferenced `row_hash`, which is one head (the verifier reports it as
+`duplicate_row`), not a fork. Act on the number of *distinct* hashes:
+
+| Distinct heads | Action |
+|----------------|--------|
+| 0 | Genesis, `prev_hash = ""` |
+| 1 | Continue from it |
+| more than 1 | The chain has already forked. Stop and alert; never pick one, since resuming from either deepens the fork |
+
+**Writer rules.**
+
+- A writer MUST NOT decrease `ts` along its chain: each row has `ts >= prev.ts`.
+  TTL deletes per row by `ts`, so an out-of-order `ts` lets TTL remove a row in
+  the middle of the chain, and the verifier then reports `missing_predecessor`
+  on its successor, a false tamper alarm.
+- Even with a monotonic `ts`, TTL merges run per part, so a transient
+  `missing_predecessor` can appear briefly at the TTL boundary. A verifier
+  tolerance for that is a follow-up; the verifier does not have one today.
+- One writer per `server_id`, one run at a time. Two concurrent writers fork the
+  chain.
+
 **Retries and the dedup token.** The table sets
 `non_replicated_deduplication_window = 10000`. The head read cannot cover an
 insert whose outcome was never learned (a timeout), so every insert carries

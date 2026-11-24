@@ -95,6 +95,14 @@ def dedup_token(server_id: str, run_id: str, segment_seq: int) -> str:
     )
 
 
+def single_head(hashes):
+    """Contract rule: no distinct head is genesis (""), one continues, more is a fork: stop."""
+    distinct = sorted(set(hashes))
+    if len(distinct) > 1:
+        sys.exit(f"FAIL: {len(distinct)} distinct chain heads (forked chain), refusing to pick one")
+    return distinct[0] if distinct else ""
+
+
 def require_loopback(host: str) -> None:
     """Exit unless host is loopback: this script writes."""
     if host not in LOOPBACK:
@@ -178,13 +186,14 @@ def main() -> int:
     )
 
     def read_head():
-        # SERVER_ID is a module constant, never input, so interpolating it is safe
+        # the contract's head read; the server id travels as a bound parameter
         sql = (
-            "SELECT row_hash FROM ssdf.policy_drift WHERE server_id = "
-            f"'{SERVER_ID}' AND row_hash NOT IN (SELECT prev_hash FROM ssdf.policy_drift "
-            f"WHERE server_id = '{SERVER_ID}') ORDER BY ts DESC LIMIT 1 FORMAT TSVRaw"
+            "SELECT DISTINCT row_hash FROM ssdf.policy_drift WHERE server_id = {sid:String} "
+            "AND row_hash NOT IN (SELECT prev_hash FROM ssdf.policy_drift "
+            "WHERE server_id = {sid:String}) FORMAT TSVRaw"
         )
-        return ch(host, port, *reader, sql).strip()
+        out = ch(host, port, *reader, sql, settings={"param_sid": SERVER_ID})
+        return single_head(out.split())
 
     def insert(row, settings):
         line = {
@@ -224,7 +233,7 @@ def main() -> int:
     print("[2/5] inserting one row as the writer identity")
     insert(row, token)
 
-    print("[3/5] replaying: re-read the head, a sink would skip")
+    print("[3/5] re-reading the head: it must now be the inserted row, so a replay would skip")
     if read_head() != row["row_hash"]:
         sys.exit("FAIL: the head did not advance to the inserted row")
 
