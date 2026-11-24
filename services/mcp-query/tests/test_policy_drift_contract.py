@@ -8,6 +8,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import uuid
 
 import pytest
 
@@ -53,7 +54,9 @@ def test_retried_block_with_same_token_collapses_and_reads_back(raw):
     assert len(server_ids) == 1
     server_id = server_ids.pop()
     block = [_table_row(v) for v in _VECTORS[:2]]
-    token = dedup_token(server_id, "contract-run", 1)
+    # Unique per invocation: ALTER ... DELETE leaves MergeTree's dedup log intact, so a
+    # fixed token makes a rerun against a long-lived ClickHouse insert nothing.
+    token = dedup_token(server_id, uuid.uuid4().hex, 1)
     where = {"server_id": server_id}
 
     raw.command(
