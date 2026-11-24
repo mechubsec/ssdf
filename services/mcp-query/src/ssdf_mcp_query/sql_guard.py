@@ -28,6 +28,8 @@ _BLOCKED_TABLES = {
     "audit_checkpoints",
     "audit_evidence",
     "audit_ocsf_export",
+    # ssdf#104: drift verdicts are verifier/report data, never ad hoc SQL.
+    "policy_drift",
 }
 # ClickHouse's IN-family functions accept a bare table name as the set
 # (`globalNotIn(x, ssdf.t)`); sqlglot leaves them as Anonymous calls.

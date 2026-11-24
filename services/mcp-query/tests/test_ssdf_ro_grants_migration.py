@@ -49,7 +49,13 @@ def test_never_grants_audit_to_ssdf_ro():
 #  (see 022/023/024_audit_*.sql) -- stricter than ssdf.audit's own "defense in
 #  depth over a grant that exists for other tools" posture, since nothing
 #  about them needs a general-purpose reader in the first place.
-_NEVER_GRANTED_TO_SSDF_RO = {"audit", "audit_checkpoints", "audit_evidence", "audit_ocsf_export"}
+_NEVER_GRANTED_TO_SSDF_RO = {
+    "audit",
+    "audit_checkpoints",
+    "audit_evidence",
+    "audit_ocsf_export",
+    "policy_drift",  # ssdf#104
+}
 
 
 def test_blocked_tables_match_sql_guard_exclusions():

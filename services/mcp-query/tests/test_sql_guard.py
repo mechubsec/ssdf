@@ -95,6 +95,8 @@ BLOCKED_TABLES = [
     "audit_checkpoints",
     "audit_evidence",
     "audit_ocsf_export",
+    # ssdf#104
+    "policy_drift",
 ]
 
 
