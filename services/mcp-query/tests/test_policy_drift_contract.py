@@ -5,6 +5,7 @@ rows read back with the vector row_hash values."""
 from __future__ import annotations
 
 import datetime as dt
+import importlib.util
 import json
 import os
 import pathlib
@@ -18,6 +19,14 @@ clickhouse_connect = pytest.importorskip("clickhouse_connect")
 
 from ssdf_mcp_query.drift_chain import dedup_token  # noqa: E402
 from ssdf_mcp_query.verify_drift import _COLUMNS, verify_chains  # noqa: E402
+
+# The contract's head/count SQL lives in the stdlib-only script (single source of truth).
+_SPEC = importlib.util.spec_from_file_location(
+    "verify_drift_contract",
+    pathlib.Path(__file__).resolve().parents[3] / "scripts" / "verify_drift_contract.py",
+)
+script = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(script)
 
 _VECTORS = json.loads(
     (pathlib.Path(__file__).parent / "fixtures" / "drift_chain_vectors.json").read_text()
@@ -138,3 +147,71 @@ def test_build_drift_sql_runs_against_real_clickhouse(raw):
             parameters=where,
             settings={"mutations_sync": 2},
         )
+
+
+def _seed_and_read(raw, edges, *, duplicate_tail=False):
+    """Insert rows ``(row_hash, prev_hash)`` (ts ascending) under a fresh server_id, then
+    run the contract's count and head SQL. Returns ``(count, heads, server_id)``."""
+    server_id = f"head-{uuid.uuid4().hex}.example.com"
+    where = {"sid": server_id}
+    base = dt.datetime(2026, 11, 24, 10, 0, tzinfo=dt.timezone.utc)
+    rows = [
+        [base + dt.timedelta(seconds=i), server_id, "0123abc", "flow-1", "consistent",
+         "fw1.example.com", [], "ev/1", 0, prev, row_hash]
+        for i, (row_hash, prev) in enumerate(edges)
+    ]  # fmt: skip
+    try:
+        # distinct tokens: identical blocks would otherwise be dropped by block-hash dedup
+        for block in rows + (rows[-1:] if duplicate_tail else []):
+            raw.insert(
+                "ssdf.policy_drift",
+                [block],
+                column_names=_COLUMNS,
+                settings={"insert_deduplication_token": uuid.uuid4().hex},
+            )
+        count = raw.query(script.COUNT_SQL, parameters=where).result_rows[0][0]
+        heads = [  # the driver hands back naive UTC datetimes; the contract's ts is UTC
+            (h, t.replace(tzinfo=dt.timezone.utc))
+            for h, t in raw.query(script.HEAD_SQL, parameters=where).result_rows
+        ]
+        return count, heads, rows
+    finally:
+        raw.command(
+            "ALTER TABLE ssdf.policy_drift DELETE WHERE server_id = {sid:String}",
+            parameters=where,
+            settings={"mutations_sync": 2},
+        )
+
+
+def test_head_sql_empty_chain_is_genesis(raw):
+    count, heads, _ = _seed_and_read(raw, [])
+    assert (count, heads) == (0, [])
+    assert script.resolve_head(count, heads) == ("", None)
+
+
+def test_head_sql_single_chain_returns_tail_hash_and_ts(raw):
+    count, heads, rows = _seed_and_read(raw, [("h1", ""), ("h2", "h1"), ("h3", "h2")])
+    assert count == 3
+    assert [(h, t) for h, t in heads] == [("h3", rows[2][0])]
+    assert script.resolve_head(count, heads) == ("h3", rows[2][0])
+
+
+def test_head_sql_duplicated_tail_is_one_head(raw):
+    count, heads, rows = _seed_and_read(raw, [("h1", ""), ("h2", "h1")], duplicate_tail=True)
+    assert count == 3  # the tail really is stored twice
+    assert heads == [("h2", rows[1][0])]  # DISTINCT collapses it
+    assert script.resolve_head(count, heads) == ("h2", rows[1][0])
+
+
+def test_head_sql_fork_gives_two_distinct_heads(raw):
+    count, heads, _ = _seed_and_read(raw, [("h1", ""), ("ha", "h1"), ("hb", "h1")])
+    assert {h for h, _ in heads} == {"ha", "hb"}
+    with pytest.raises(SystemExit):
+        script.resolve_head(count, heads)
+
+
+def test_head_sql_rootless_cycle_has_rows_but_no_head(raw):
+    count, heads, _ = _seed_and_read(raw, [("ha", "hb"), ("hb", "ha")])
+    assert (count, heads) == (2, [])
+    with pytest.raises(SystemExit):
+        script.resolve_head(count, heads)
