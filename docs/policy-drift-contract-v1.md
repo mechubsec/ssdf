@@ -34,8 +34,18 @@ part of the hash, so a lab observation cannot be relabelled as production.
 
 The canonical form is a compact JSON array of the non-hash fields in this
 order, with no whitespace (`separators=(",",":")`) and UTF-8 emitted as-is
-(`ensure_ascii=False`), so non-ASCII is written literally and `"` and newline
-inside a field are escaped as JSON does:
+(`ensure_ascii=False`). String escaping is exactly this set:
+
+- `"` becomes `\"` and `\` becomes `\\`
+- `\b \f \n \r \t` use those short escapes
+- every other code point below U+0020 is `\u00xx` with lowercase hex
+- everything else is literal UTF-8, including U+007F and U+2028/U+2029
+
+This is Python `json.dumps(ensure_ascii=False)` and `serde_json`. `jq` is not an
+oracle for U+007F: it escapes it as `\u007f`, so a vector containing DEL cannot
+be generated with `jq`.
+
+The array is:
 
 ```
 [ts, server_id, intent_commit, flow_or_isolation_id, verdict, device,
@@ -56,7 +66,8 @@ the newline. `row_hash` carries no `sha256:` prefix. Known-answer vectors,
 computed with `jq` and `sha256sum` rather than this repository's code, are in
 `services/mcp-query/tests/fixtures/drift_chain_vectors.json`
 (`scripts/gen_drift_vectors.sh` regenerates them). They cover non-ASCII, a
-`"` and a newline in a field, and an empty `device_rule_ids`.
+`"` and a newline in a field, an empty `device_rule_ids`, and a tab, U+0001 and a
+backslash in a field.
 
 ## Seeding protocol
 

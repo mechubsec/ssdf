@@ -27,5 +27,7 @@ emit 2026-11-24T10:00:00.123Z srv-a.example.com 0123abc flow-1 consistent fw1.ex
 emit 2026-11-24T10:00:01.000Z srv-a.example.com 0123abc flow-2 violating fw1.example.com '["r3"]' 1
 emit 2026-11-24T10:00:02.456Z srv-a.example.com 0123abc flow-3 unverifiable $'fw-é"x\ny' '["r4"]' 1
 emit 2026-11-24T10:00:03.789Z srv-a.example.com 0123abc iso-1 over_permissive fw2.example.com '[]' 0
+# tab, U+0001 and a backslash: jq and Python agree on these (not on U+007F, which jq escapes)
+emit 2026-11-24T10:00:04.000Z srv-a.example.com 0123abc flow-5 consistent $'fw\t\x01\\z' '["r5"]' 1
 
 printf '%s\n' "${vectors[@]}" | jq -s .

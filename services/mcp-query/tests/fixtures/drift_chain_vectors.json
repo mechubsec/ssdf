@@ -69,5 +69,23 @@
     "prev_hash": "98e45f578982e3266e40b63572288cde74d02736aa5fb23cefe2f4a83a454568",
     "canonical": "[\"2026-11-24T10:00:03.789Z\",\"srv-a.example.com\",\"0123abc\",\"iso-1\",\"over_permissive\",\"fw2.example.com\",[],\"ev/iso-1\",0]",
     "row_hash": "1c8d640bb216a513f3e3859ed1f9a6099948b3f80d2aaa9d340a584f2b5349e1"
+  },
+  {
+    "row": {
+      "ts": "2026-11-24T10:00:04.000Z",
+      "server_id": "srv-a.example.com",
+      "intent_commit": "0123abc",
+      "flow_or_isolation_id": "flow-5",
+      "verdict": "consistent",
+      "device": "fw\t\u0001\\z",
+      "device_rule_ids": [
+        "r5"
+      ],
+      "evidence_ref": "ev/flow-5",
+      "labmode": 1
+    },
+    "prev_hash": "1c8d640bb216a513f3e3859ed1f9a6099948b3f80d2aaa9d340a584f2b5349e1",
+    "canonical": "[\"2026-11-24T10:00:04.000Z\",\"srv-a.example.com\",\"0123abc\",\"flow-5\",\"consistent\",\"fw\\t\\u0001\\\\z\",[\"r5\"],\"ev/flow-5\",1]",
+    "row_hash": "3d92423fc137659a5f64f30cd262d843ea897382fa1960e58a652140343ec6e0"
   }
 ]
