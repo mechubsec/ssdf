@@ -110,6 +110,7 @@ OCSF_DEFINER_PW=<password>
 EVENTS_OCSF_DEFINER_PW=<password>
 EVENTS_EXPORT_PW=<password>
 FLOWTUPLES_PW=<password>
+DRIFT_PW=<password>
 VIEW_PSEUDONYM_KEY_HI=<password>
 VIEW_PSEUDONYM_KEY_LO=<password>
 EOF
