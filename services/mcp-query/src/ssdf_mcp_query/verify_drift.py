@@ -47,13 +47,19 @@ def verify_chains(rows: list[dict]) -> dict:
     chains: dict[str, dict] = {}
     issues: list[dict] = []
     for server_id, chain_rows in sorted(by_server.items()):
-        chain_rows = sorted(chain_rows, key=lambda r: r["ts"])  # stable: ties keep input order
         own_hashes = {r["row_hash"] for r in chain_rows}
-        earliest = chain_rows[0]
+        pointed_at = {r["prev_hash"] for r in chain_rows}
+        # Structure, not ts: tied timestamps come back from ClickHouse in any order.
+        # Roots are rows with no predecessor in this chain; a real genesis wins,
+        # then the earliest ts, then row_hash, so the choice is deterministic.
+        roots = [r for r in chain_rows if r["prev_hash"] == "" or r["prev_hash"] not in own_hashes]
+        root = min(roots, key=lambda r: (r["prev_hash"] != "", r["ts"], r["row_hash"]))
+        tips = [r for r in chain_rows if r["row_hash"] not in pointed_at] or chain_rows
+        head = max(tips, key=lambda r: (r["ts"], r["row_hash"]))
         chains[server_id] = {
             "rows": len(chain_rows),
-            "head": chain_rows[-1]["row_hash"],
-            "anchored": earliest["prev_hash"] == "",
+            "head": head["row_hash"],
+            "anchored": root["prev_hash"] == "",
         }
 
         counts: dict[str, int] = defaultdict(int)
@@ -82,8 +88,8 @@ def verify_chains(rows: list[dict]) -> dict:
             if prev_hash == "" or prev_hash in own_hashes:
                 continue
             # Another writer's hash is always a break; an unknown one is only
-            # tolerated on the earliest row (genesis aged out by TTL).
-            if prev_hash in owner_of_hash or row is not earliest:
+            # tolerated on the chain's root (genesis aged out by TTL).
+            if prev_hash in owner_of_hash or row is not root:
                 issues.append(_issue("missing_predecessor", row))
 
     return {"chains": chains, "issues": issues, "ok": not issues}

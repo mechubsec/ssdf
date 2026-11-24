@@ -126,6 +126,21 @@ def test_main_reports_and_exit_code(monkeypatch, capsys):
     assert "content_edit" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("dangling", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_tied_ts_does_not_change_root_or_head(dangling, reverse):
+    rows = _chain(count=3, prev_hash="f" * 64 if dangling else "")
+    rows[1]["ts"] = rows[0]["ts"]  # tie; hashes must be recomputed with the new ts
+    rows[1]["row_hash"] = compute_row_hash(rows[1]["prev_hash"], rows[1])
+    rows[2]["prev_hash"] = rows[1]["row_hash"]
+    rows[2]["row_hash"] = compute_row_hash(rows[2]["prev_hash"], rows[2])
+    result = verify_chains(rows[::-1] if reverse else rows)
+    assert result["ok"], result["issues"]
+    chain = result["chains"]["srv-a.example.com"]
+    assert chain["anchored"] is (not dangling)
+    assert chain["head"] == rows[2]["row_hash"]
+
+
 @pytest.mark.parametrize("rows", [[]])
 def test_empty_is_ok(rows):
     assert verify_chains(rows) == {"chains": {}, "issues": [], "ok": True}
