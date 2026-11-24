@@ -78,14 +78,14 @@ restarts, and must not start a second root:
    row whose `row_hash` no other row in that `server_id` names as `prev_hash`).
    A failed read is not "nothing landed"; stop rather than insert blind.
 2. If there is no row, start at genesis: `prev_hash = ""`.
-3. Otherwise set `prev_hash` to the head's `row_hash`, compute the new
-   `row_hash`, and insert as `ssdf_drift`.
+3. Otherwise set `prev_hash` to the head's `row_hash`, set `ts` per the clamp
+   rule below, compute the new `row_hash`, and insert as `ssdf_drift`.
 4. A replay of a row that already landed is skipped by re-reading the head.
 
 **The head read.** Exactly this query, as `ssdf_audit_verify`:
 
 ```sql
-SELECT DISTINCT row_hash
+SELECT DISTINCT row_hash, ts
 FROM ssdf.policy_drift
 WHERE server_id = {sid:String}
   AND row_hash NOT IN (
@@ -94,9 +94,9 @@ WHERE server_id = {sid:String}
 ```
 
 The head is found by following links, never by sorting on `ts`. `DISTINCT`
-matters: an ambiguous-timeout duplicate of the tail is two rows with one
-unreferenced `row_hash`, which is one head (the verifier reports it as
-`duplicate_row`), not a fork. Act on the number of *distinct* hashes:
+matters: an ambiguous-timeout duplicate of the tail is two identical rows
+(same `row_hash`, same `ts`), which is one head (the verifier reports it as
+`duplicate_row`), not a fork. Act on the number of *distinct* heads:
 
 | Distinct heads | Action |
 |----------------|--------|
@@ -107,6 +107,10 @@ unreferenced `row_hash`, which is one head (the verifier reports it as
 **Writer rules.**
 
 - A writer MUST NOT decrease `ts` along its chain: each row has `ts >= prev.ts`.
+  The head read returns the head's `ts` for this. A writer whose clock reads
+  earlier than the head's `ts` MUST NOT append with that clock: it clamps, using
+  `ts = head.ts` (it does not wait). `ts` is inside the hash, so the clamped
+  value is what gets hashed.
   TTL deletes per row by `ts`, so an out-of-order `ts` lets TTL remove a row in
   the middle of the chain, and the verifier then reports `missing_predecessor`
   on its successor, a false tamper alarm.

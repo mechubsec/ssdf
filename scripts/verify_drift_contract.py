@@ -95,12 +95,29 @@ def dedup_token(server_id: str, run_id: str, segment_seq: int) -> str:
     )
 
 
-def single_head(hashes):
-    """Contract rule: no distinct head is genesis (""), one continues, more is a fork: stop."""
-    distinct = sorted(set(hashes))
+# The contract's head read (docs/policy-drift-contract-v1.md, "The head read"): the same
+# text the contract test runs against real ClickHouse. The server id is a bound parameter.
+HEAD_SQL = (
+    "SELECT DISTINCT row_hash, ts FROM ssdf.policy_drift WHERE server_id = {sid:String} "
+    "AND row_hash NOT IN (SELECT prev_hash FROM ssdf.policy_drift "
+    "WHERE server_id = {sid:String})"
+)
+
+
+def single_head(heads):
+    """Contract rule: no distinct head is genesis, one continues, more is a fork: stop.
+
+    ``heads`` is a list of ``(row_hash, ts)``; returns ``(row_hash, ts)`` or ``("", None)``.
+    """
+    distinct = sorted(set(heads))
     if len(distinct) > 1:
         sys.exit(f"FAIL: {len(distinct)} distinct chain heads (forked chain), refusing to pick one")
-    return distinct[0] if distinct else ""
+    return distinct[0] if distinct else ("", None)
+
+
+def next_ts(now, head_ts):
+    """Contract rule: ts must not decrease, so a clock behind the head clamps to head.ts."""
+    return now if head_ts is None else max(now, head_ts)
 
 
 def require_loopback(host: str) -> None:
@@ -186,14 +203,17 @@ def main() -> int:
     )
 
     def read_head():
-        # the contract's head read; the server id travels as a bound parameter
-        sql = (
-            "SELECT DISTINCT row_hash FROM ssdf.policy_drift WHERE server_id = {sid:String} "
-            "AND row_hash NOT IN (SELECT prev_hash FROM ssdf.policy_drift "
-            "WHERE server_id = {sid:String}) FORMAT TSVRaw"
+        out = ch(
+            host, port, *reader, HEAD_SQL + " FORMAT TSVRaw", settings={"param_sid": SERVER_ID}
         )
-        out = ch(host, port, *reader, sql, settings={"param_sid": SERVER_ID})
-        return single_head(out.split())
+        # a TSV line is "<hash>\t<YYYY-MM-DD HH:MM:SS.mmm>"
+        heads = [line.split("\t") for line in out.splitlines() if line]
+        return single_head(
+            [
+                (h, dt.datetime.strptime(t, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=dt.timezone.utc))
+                for h, t in heads
+            ]
+        )
 
     def insert(row, settings):
         line = {
@@ -213,11 +233,11 @@ def main() -> int:
     token = {"insert_deduplication_token": dedup_token(SERVER_ID, run_id, 0)}
 
     print("[1/5] reading chain head as the verifier identity")
-    head = read_head()
-    print(f"  head = {head!r} (empty means start at genesis)")
+    head, head_ts = read_head()
+    print(f"  head = {head!r} ts={head_ts} (empty means start at genesis)")
 
     row = {
-        "ts": dt.datetime.now(dt.timezone.utc).replace(microsecond=123000),
+        "ts": next_ts(dt.datetime.now(dt.timezone.utc).replace(microsecond=123000), head_ts),
         "server_id": SERVER_ID,
         "intent_commit": "0123abc",
         "flow_or_isolation_id": 'flow "1"\n',  # quote and newline are part of the contract
@@ -234,7 +254,7 @@ def main() -> int:
     insert(row, token)
 
     print("[3/5] re-reading the head: it must now be the inserted row, so a replay would skip")
-    if read_head() != row["row_hash"]:
+    if read_head()[0] != row["row_hash"]:
         sys.exit("FAIL: the head did not advance to the inserted row")
 
     print("[4/5] re-inserting a differing block under the same dedup token")

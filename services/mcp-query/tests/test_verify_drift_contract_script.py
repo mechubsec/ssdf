@@ -100,8 +100,19 @@ def test_cycle_does_not_raise():
 
 
 def test_single_head_rule():
-    assert script.single_head([]) == ""
-    assert script.single_head(["a" * 64]) == "a" * 64
-    assert script.single_head(["a" * 64, "a" * 64]) == "a" * 64  # a duplicated tail is one head
+    ts = dt.datetime(2026, 11, 24, tzinfo=dt.timezone.utc)
+    assert script.single_head([]) == ("", None)
+    assert script.single_head([("a" * 64, ts)]) == ("a" * 64, ts)
+    # a duplicated tail is one head
+    assert script.single_head([("a" * 64, ts), ("a" * 64, ts)]) == ("a" * 64, ts)
     with pytest.raises(SystemExit):
-        script.single_head(["a" * 64, "b" * 64])
+        script.single_head([("a" * 64, ts), ("b" * 64, ts)])
+
+
+def test_next_ts_clamps_a_clock_behind_the_head():
+    head = dt.datetime(2026, 11, 24, 10, 0, tzinfo=dt.timezone.utc)
+    behind = head - dt.timedelta(seconds=5)
+    ahead = head + dt.timedelta(seconds=5)
+    assert script.next_ts(behind, head) == head
+    assert script.next_ts(ahead, head) == ahead
+    assert script.next_ts(behind, None) == behind
