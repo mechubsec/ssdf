@@ -15,6 +15,7 @@ from .audit_chain import ts_ms_iso
 from .drift_chain import VERDICTS
 
 MAX_LIMIT = 500
+MAX_SINCE_HOURS = 410 * 24  # the table's TTL; older rows no longer exist
 _COLUMNS = (
     "ts, server_id, intent_commit, flow_or_isolation_id, verdict, device, "
     "device_rule_ids, evidence_ref, labmode, prev_hash, row_hash"
@@ -31,12 +32,13 @@ def build_drift_sql(
 ) -> tuple[str, dict]:
     """Parameterised SELECT over ssdf.policy_drift; raises ValueError on a bad verdict.
 
-    ``limit`` is clamped to [1, 500]. User text only ever travels in ``params``.
+    ``limit`` is clamped to [1, 500] and ``since_hours`` to [1, 410 days]; non-numeric
+    values raise ValueError. User text only ever travels in ``params``.
     """
     if verdict is not None and verdict not in VERDICTS:
         raise ValueError(f"verdict must be one of {sorted(VERDICTS)}, got {verdict!r}")
     params: dict = {
-        "since_hours": max(1, int(since_hours)),
+        "since_hours": max(1, min(int(since_hours), MAX_SINCE_HOURS)),
         "limit": max(1, min(int(limit), MAX_LIMIT)),
     }
     clauses = ["ts >= now64(3) - toIntervalHour({since_hours:UInt32})"]
@@ -85,8 +87,8 @@ class DriftTools:
         """
         if self._factory is None:
             return {"error": "drift_reader_unconfigured"}
-        cap = max(1, min(int(limit), MAX_LIMIT))
         try:
+            cap = max(1, min(int(limit), MAX_LIMIT))
             sql, params = build_drift_sql(
                 verdict, flow_or_isolation_id, device, intent_commit, since_hours, cap + 1
             )

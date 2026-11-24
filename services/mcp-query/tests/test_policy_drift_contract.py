@@ -16,23 +16,11 @@ pytestmark = pytest.mark.contract
 clickhouse_connect = pytest.importorskip("clickhouse_connect")
 
 from ssdf_mcp_query.drift_chain import dedup_token  # noqa: E402
+from ssdf_mcp_query.verify_drift import _COLUMNS, verify_chains  # noqa: E402
 
 _VECTORS = json.loads(
     (pathlib.Path(__file__).parent / "fixtures" / "drift_chain_vectors.json").read_text()
 )
-_COLUMNS = [
-    "ts",
-    "server_id",
-    "intent_commit",
-    "flow_or_isolation_id",
-    "verdict",
-    "device",
-    "device_rule_ids",
-    "evidence_ref",
-    "labmode",
-    "prev_hash",
-    "row_hash",
-]
 
 
 @pytest.fixture(scope="module")
@@ -92,6 +80,17 @@ def test_retried_block_with_same_token_collapses_and_reads_back(raw):
             parameters=where,
         ).result_rows
         assert [r[0] for r in stored] == [v["row_hash"] for v in _VECTORS[:2]]
+
+        # types must round-trip into compute_row_hash (ts, Array, UInt8)
+        result = raw.query(
+            f"SELECT {', '.join(_COLUMNS)} FROM ssdf.policy_drift "
+            "WHERE server_id = {server_id:String}",
+            parameters=where,
+        )
+        rows = [dict(zip(_COLUMNS, values)) for values in result.result_rows]
+        verdict = verify_chains(rows)
+        assert verdict["ok"], verdict["issues"]
+        assert verdict["chains"][server_id]["anchored"] is True
     finally:
         raw.command(
             "ALTER TABLE ssdf.policy_drift DELETE WHERE server_id = {server_id:String}",

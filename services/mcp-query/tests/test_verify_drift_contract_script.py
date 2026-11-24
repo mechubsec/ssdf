@@ -97,3 +97,11 @@ def test_cycle_does_not_raise():
     first["prev_hash"], second["prev_hash"] = second["row_hash"], first["row_hash"]
     _, problems = script.verify_chain([first, second])
     assert problems  # hashes no longer recompute; the point is that it returns
+
+
+def test_single_head_rule():
+    assert script.single_head([]) == ""
+    assert script.single_head(["a" * 64]) == "a" * 64
+    assert script.single_head(["a" * 64, "a" * 64]) == "a" * 64  # a duplicated tail is one head
+    with pytest.raises(SystemExit):
+        script.single_head(["a" * 64, "b" * 64])

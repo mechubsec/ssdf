@@ -38,6 +38,17 @@ def test_limit_is_clamped():
     assert _build(limit=10_000)[1]["limit"] == 500
 
 
+def test_since_hours_is_clamped():
+    assert _build(since_hours=10**9)[1]["since_hours"] == 410 * 24
+    assert _build(since_hours=-5)[1]["since_hours"] == 1
+
+
+@pytest.mark.parametrize("field", ["limit", "since_hours"])
+def test_non_numeric_argument_is_a_validation_error(field):
+    out = DriftTools(lambda: _FakeClient(1)).policy_drift(**{field: "abc"})
+    assert out["error"] == "validation"
+
+
 class _FakeClient:
     def __init__(self, count):
         ts = dt.datetime(2026, 11, 24, 1, 2, 3, 456000, tzinfo=dt.timezone.utc)
