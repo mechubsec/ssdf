@@ -119,6 +119,16 @@ def applied(base_url):
         "VALUES ('contract-test-edge-01', 't_contract_views', 'contract-test-node-01', "
         f"'contract-test-node-02', 'attaches_to', 'l2', now(), now(), 1.0, {{'note':'{_SECRET_ATTR}'}})"
     )
+    # a rerun on the same container must not accumulate duplicate seed rows
+    for table in ("graph_nodes", "graph_edges"):
+        clear = (
+            f"ALTER TABLE ssdf.{table} DELETE WHERE tenant_id = 't_contract_views' "
+            "SETTINGS mutations_sync = 2"
+        )
+        urllib.request.urlopen(
+            urllib.request.Request(base_url, data=clear.encode("utf-8"), method="POST"),
+            timeout=30,
+        ).read()
     urllib.request.urlopen(
         urllib.request.Request(base_url, data=node_row.encode("utf-8"), method="POST"), timeout=30
     ).read()
