@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Create the tables the SQL contract suite needs, in a throwaway ClickHouse.
 
-Applies ONLY the plain-DDL migrations -- between them they create every table
+Applies ONLY the table-DDL migrations (GRANT and CREATE USER statements inside them are skipped) -- between them they create every table
 the mcp-query query builders read (events, graph_nodes/graph_edges, entities/
 entity_edges). The rest of infra/clickhouse/ creates users, grants and views and
 needs `envsubst` with real passwords, none of which the contract suite touches.
@@ -37,6 +37,7 @@ MIGRATIONS = (
     "004_entities",
     "006_observer_hostname",
     "028_host_logs",
+    "029_policy_drift",
 )
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
@@ -63,8 +64,9 @@ def apply(host: str, port: int, repo_root: pathlib.Path) -> int:
             print(f"missing migration: {path}", file=sys.stderr)
             return 2
         for statement in statements(path.read_text()):
-            # The throwaway server has no ssdf_ro user; grants are access, not schema.
-            if statement.upper().startswith("GRANT "):
+            # The throwaway server has no ssdf_ro user and no ${X_PW} values; grants
+            # and users are access, not schema.
+            if statement.upper().startswith(("GRANT ", "CREATE USER")):
                 continue
             # POST with the statement as the body: over HTTP, GET implies
             # readonly mode and ClickHouse refuses DDL sent that way.

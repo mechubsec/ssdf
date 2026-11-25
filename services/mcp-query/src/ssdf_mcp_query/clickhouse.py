@@ -28,6 +28,16 @@ def jsonify(value: Any) -> Any:
     return str(value)
 
 
+def query_settings(config: Config) -> dict:
+    """The bounded-I/O settings every read query carries (services/AGENTS.md)."""
+    return {
+        "max_execution_time": config.max_execution_time,
+        "max_result_rows": config.max_result_rows,
+        "max_memory_usage": config.max_memory_usage,
+        "result_overflow_mode": "throw",
+    }
+
+
 class ClickHouseClient:
     """Thin read-only client. All queries run as the configured (read-only) CH user.
 
@@ -70,12 +80,7 @@ class ClickHouseClient:
         result = self._client_for_thread().query(
             sql,
             parameters=params or {},
-            settings={
-                "max_execution_time": self._config.max_execution_time,
-                "max_result_rows": self._config.max_result_rows,
-                "max_memory_usage": self._config.max_memory_usage,
-                "result_overflow_mode": "throw",
-            },
+            settings=query_settings(self._config),
         )
         columns = list(result.column_names)
         rows = [{col: jsonify(val) for col, val in zip(columns, row)} for row in result.result_rows]

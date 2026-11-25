@@ -40,6 +40,7 @@ EXPECTED_TOOLS = {
     "unused_rules",
     "explain_rule",
     "change_impact",
+    "policy_drift",
 }
 
 

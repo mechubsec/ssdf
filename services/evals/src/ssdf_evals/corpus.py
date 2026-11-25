@@ -55,6 +55,7 @@ SOVEREIGN_TOOLS = PUBLIC_TOOLS | frozenset(
         "unused_rules",
         "explain_rule",
         "change_impact",
+        "policy_drift",
     }
 )
 

@@ -32,13 +32,14 @@ This directory contains ClickHouse DDL and configuration for SSDF.
 - `026_events_ocsf_export.sql` - OCSF Network Activity export for events
 - `027_events_ocsf_authentication.sql` - OCSF Authentication export for events
 - `028_host_logs.sql` - Host logs table and per-minute sender liveness
+- `029_policy_drift.sql` - Hash-chained policy-drift verdicts and insert-only writer
 
 Run migrations with: `python3 ../scripts/run_migrations.py` (see
 `scripts/MIGRATION_RUNNER.md`). The `ssdf.migrations_applied` tracking table
 is created by the runner itself, not by a numbered migration file, so a
 fresh install always has somewhere to record migration 1's completion.
 Migrations that create `CREATE USER ... BY '${VAR}'` service accounts (003,
-005, 007, 008, 009, 011, 013, 015, 018, 019, 022-027) need the matching
+005, 007, 008, 009, 011, 013, 015, 018, 019, 022-027, 029) need the matching
 `*_PW` environment variable set; the runner substitutes `${VAR}` /
 `${VAR:-default}` placeholders itself and refuses to run if a required
 variable is unset or empty. The full set of required variables (every
@@ -46,7 +47,7 @@ placeholder with no `:-default` across `infra/clickhouse/*.sql`) is:
 
 ```
 ARCHIVER_PW, AUDIT_EXPORT_PW, AUDIT_PW, AUDIT_VERIFY_PW, CHECKPOINT_PW,
-DEFINER_PW, ENTITY_MAINT_PW, ENTITY_PW, EVENTS_EXPORT_PW,
+DEFINER_PW, DRIFT_PW, ENTITY_MAINT_PW, ENTITY_PW, EVENTS_EXPORT_PW,
 EVENTS_OCSF_DEFINER_PW, FLOWTUPLES_PW, HEALTH_PW, OCSF_DEFINER_PW, PUBLIC_PW,
 PUBMETRICS_PW, RO_PW, RULEUSAGE_PW, TOPO_PW, VIEW_PSEUDONYM_KEY_HI,
 VIEW_PSEUDONYM_KEY_LO
@@ -109,6 +110,7 @@ OCSF_DEFINER_PW=<password>
 EVENTS_OCSF_DEFINER_PW=<password>
 EVENTS_EXPORT_PW=<password>
 FLOWTUPLES_PW=<password>
+DRIFT_PW=<password>
 VIEW_PSEUDONYM_KEY_HI=<password>
 VIEW_PSEUDONYM_KEY_LO=<password>
 EOF
